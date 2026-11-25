@@ -1,0 +1,28 @@
+# Executables / build output
+*.exe
+*.xbe
+*.iso
+*.xiso
+*.dll
+*.obj
+*.o
+*.d
+*.lib
+*.a
+*.elf
+bin/
+build/
+# ROMs, BIOS, disc/HDD images (copyrighted)
+*.zip
+*.7z
+*.rar
+*.rom
+*.bin
+*.chd
+*.img
+*.qcow2
+roms/
+bios/
+mcpx*.bin
+ddonpach*
+nxdk/
