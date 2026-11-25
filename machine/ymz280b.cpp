@@ -315,7 +315,7 @@ void Ymz280b::RunTo(uint64_t cycles, uint64_t cpuHz) {
     }
     m_lastCycles = cycles;
     const uint64_t want = tickCycles > 0 ? (cycles < tickOffset ? 0 : static_cast<uint64_t>((cycles - tickOffset) / tickCycles))
-                                         : static_cast<uint64_t>(static_cast<unsigned __int128>(cycles) * (sampleRate * 2ull) / cpuHz);
+                                         : MulDivFloor(cycles, sampleRate * 2ull, cpuHz);
     while (m_made < want) {
         Tick();
         m_made++;
@@ -329,7 +329,7 @@ uint64_t Ymz280b::NextIrq(uint64_t limit, uint64_t cpuHz) const {
     }
     const uint64_t rate = sampleRate * 2ull;
     const uint64_t last = tickCycles > 0 ? (limit < tickOffset ? 0 : static_cast<uint64_t>((limit - tickOffset) / tickCycles))
-                                         : static_cast<uint64_t>(static_cast<unsigned __int128>(limit) * rate / cpuHz);
+                                         : MulDivFloor(limit, rate, cpuHz);
     struct V {
         bool play, on, hold;
         uint8_t mode, looping, keyon;
@@ -380,7 +380,7 @@ uint64_t Ymz280b::NextIrq(uint64_t limit, uint64_t cpuHz) const {
                             const double at = tickOffset + (k + 1) * tickCycles + irqDelay + irqDelayPerVoice * n + slot;
                             return static_cast<uint64_t>(at) + (at > static_cast<uint64_t>(at) ? 1 : 0);
                         }
-                        return static_cast<uint64_t>((static_cast<unsigned __int128>(k + 1) * cpuHz + rate - 1) / rate);
+                        return MulDivCeil(k + 1, cpuHz, rate);
                     }
                 }
             }

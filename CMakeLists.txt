@@ -26,6 +26,7 @@ add_library(spelunk_machine STATIC
   machine/ymz770.cpp
   machine/amm_decoder.cpp
   runtime/romset.cpp
+  runtime/romset_files.cpp
   runtime/dispatch.cpp
   runtime/timeline.cpp
   # Cave's 68000 boards

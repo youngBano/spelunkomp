@@ -8,6 +8,8 @@
 // THIRD_PARTY_NOTICES.md.
 #pragma once
 
+#include "wide_math.h"
+
 #include <cstdint>
 #include <vector>
 
@@ -36,7 +38,7 @@ public:
     void UseCrystal(uint64_t cycles, uint64_t cpuHz) {
         tickCycles = 0;
         endPast = 0;
-        m_made = static_cast<uint64_t>(static_cast<unsigned __int128>(cycles) * (sampleRate * 2ull) / cpuHz);
+        m_made = MulDivFloor(cycles, sampleRate * 2ull, cpuHz);
     }
     // When (in CPU cycles) a voice will next end with its interrupt let through, if before `limit` and nothing is
     // written to the chip meanwhile; ~0 if none (or the line is already up)

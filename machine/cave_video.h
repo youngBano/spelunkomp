@@ -89,6 +89,9 @@ struct CaveVideo {
     bool rasterize = true;
 
 private:
+    // Per-instance scratch keeps Draw reentrant across boards without requiring platform TLS destructors.
+    mutable std::vector<uint32_t> paletteColours;
+
     uint16_t Word(const std::vector<uint8_t> &memory, uint32_t at) const {
         return static_cast<uint16_t>((memory[at] << 8) | memory[at + 1]);
     }

@@ -25,7 +25,8 @@ namespace {
 CaveVideo::CaveVideo()
     : spriteRam(0x10000, 0)
     , paletteRam(0x10000, 0)
-    , spriteBuffer(kBufferSize * kBufferSize, 0) {
+    , spriteBuffer(kBufferSize * kBufferSize, 0)
+    , paletteColours(0x8000) {
     for (auto &ram : layerRam) {
         ram.assign(0x8000, 0);
     }
@@ -186,7 +187,7 @@ void CaveVideo::Draw(uint32_t *out) const {
         return;
     }
     // The palette as it is now
-    static thread_local std::vector<uint32_t> colours(0x8000);
+    auto &colours = paletteColours;
     for (uint32_t n = 0; n < 0x8000; n++) {
         const uint16_t c = Word(paletteRam, n * 2);
         const uint32_t g = (c >> 10) & 31, r = (c >> 5) & 31, b = c & 31;

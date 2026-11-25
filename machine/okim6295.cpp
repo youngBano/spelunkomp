@@ -3,6 +3,7 @@
 // The commands, the decoding, the volumes and the paging are as MAME's okim6295.cpp, okiadpcm.cpp and nmk112.cpp have
 // them (BSD-3-Clause; Mirko Buffoni, Aaron Giles, Alex W. Jackson).
 #include "okim6295.h"
+#include "wide_math.h"
 
 #include "../runtime/state.h"
 
@@ -187,12 +188,12 @@ void OkiPair::RunTo(uint64_t cycles, uint64_t cpuHz) {
     if (held) {
         return;
     }
-    const uint64_t want = static_cast<uint64_t>(static_cast<unsigned __int128>(cycles) * sampleRate / cpuHz);
+    const uint64_t want = MulDivFloor(cycles, sampleRate, cpuHz);
     while (m_made < want) {
         m_made++;
         // (each chip brought up to the time of this sample)
         for (int which = 0; which < 2; which++) {
-            const uint64_t due = static_cast<uint64_t>(static_cast<unsigned __int128>(m_made) * kClock * (which + 1) / (kDivider * sampleRate));
+            const uint64_t due = MulDivFloor(m_made, kClock * (which + 1), kDivider * sampleRate);
             while (m_chips[which].made < due) {
                 Tick(which);
                 m_chips[which].made++;

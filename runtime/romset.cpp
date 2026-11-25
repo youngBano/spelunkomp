@@ -9,10 +9,8 @@
 
 #include <zlib.h>
 
-#include <dirent.h>
 #include <fstream>
 #include <sstream>
-#include <sys/stat.h>
 
 namespace spelunk {
 

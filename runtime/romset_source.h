@@ -5,13 +5,12 @@
 #pragma once
 
 #include "../machine/zip.h"
+#include "romset_files.h"
 
 #include <zlib.h>
 
-#include <dirent.h>
 #include <sstream>
 #include <string>
-#include <sys/stat.h>
 #include <utility>
 #include <vector>
 
@@ -32,22 +31,20 @@ struct Source {
     std::vector<Source> parents;
 
     bool Open(const std::string &where) {
-        struct stat st;
-        if (stat(where.c_str(), &st) != 0) {
+        const PathKind kind = GetPathKind(where);
+        if (kind == PathKind::Missing) {
             return false;
         }
-        if (!S_ISDIR(st.st_mode)) {
+        if (kind == PathKind::RegularFile) {
             isZip = true;
             return zip.Open(where);
         }
-        if (DIR *d = opendir(where.c_str())) {
-            while (const dirent *e = readdir(d)) {
-                const std::string path = where + "/" + e->d_name;
-                if (stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode)) {
-                    files.push_back({path, static_cast<uint64_t>(st.st_size)});
-                }
-            }
-            closedir(d);
+        std::vector<FileInfo> entries;
+        if (!ListRegularFiles(where, entries)) {
+            return false;
+        }
+        for (FileInfo &entry : entries) {
+            files.push_back({std::move(entry.path), entry.size});
         }
         return true;
     }
@@ -89,8 +86,7 @@ struct Source {
         if (place != where) {
             folders.push_back(where); // (where/<set>.zip or where/<set>: the parents beside it in `where`)
         } else {
-            struct stat st;
-            if (stat(where.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+            if (GetPathKind(where) == PathKind::Directory) {
                 folders.push_back(where); // (a folder of the set's files, perhaps its parents' too or their zips)
             }
             folders.push_back(folderOf(where)); // (the set's own zip or folder, chosen: its parents beside it)
