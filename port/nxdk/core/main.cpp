@@ -291,16 +291,20 @@ int main(void) {
         spelunk_xbox::PadState pad{};
         input.Poll(pad);
 
+        bool displayChanged = false;
         if (pad.black && !prevRb) {
             tateMode = !tateMode;
+            displayChanged = true;
         }
         prevRb = pad.black;
         if (pad.white && !prevLb) {
             bilinear = !bilinear;
+            displayChanged = true;
         }
         prevLb = pad.white;
         if (pad.l3 && !prevL3) {
             integerScale = !integerScale;
+            displayChanged = true;
         }
         prevL3 = pad.l3;
         if (pad.r3 && !prevR3) {
@@ -329,12 +333,8 @@ int main(void) {
         board.inputs[0] = p1;
         board.system = sys;
 
-        pb_wait_for_vbl();
-        pb_reset();
-        pb_target_back_buffer();
-
-        // Pace Cave 68000 execution to exact 57.44485 Hz arcade timing via Xbox MCPX hardware timer
-        // and profile per-stage CPU vs NV2A timing lag against Cave's 17,408 us budget.
+        // Overlap 68000 CPU emulation of frame N with NV2A GPU rasterization of frame N-1.
+        // Pace Cave 68000 execution to exact 57.44485 Hz arcade timing via Xbox MCPX hardware timer.
         uint64_t cpuTicks = 0;
         bool stepped = false;
         uint32_t prevPictures = board.pictures;
@@ -352,29 +352,38 @@ int main(void) {
             ++frameNum;
         }
 
-        const uint64_t tRen0 = spelunk_xbox::XboxTimer::NowTicks();
-        renderer.Render(board.video, nativeFrame, tateMode, bilinear, integerScale);
-        const uint64_t renTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
+        if (stepped || displayChanged) {
+            // Only wait for previous GPU frame right before overwriting atlas/pushbuffer (usually 0 us!).
+            const uint64_t tGpu0 = spelunk_xbox::XboxTimer::NowTicks();
+            while (pb_busy()) {
+            }
+            const uint64_t gpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tGpu0;
 
-        const uint64_t tGpu0 = spelunk_xbox::XboxTimer::NowTicks();
-        while (pb_busy()) {
-        }
-        while (pb_finished()) {
-        }
-        const uint64_t gpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tGpu0;
+            pb_reset();
+            pb_target_back_buffer();
 
-        if (stepped) {
-            spelunk_xbox::g_xboxPerf.RecordFrame(
-                static_cast<uint32_t>(timer.TicksToMicros(cpuTicks)),
-                static_cast<uint32_t>(timer.TicksToMicros(renTicks)),
-                static_cast<uint32_t>(timer.TicksToMicros(gpuTicks)),
-                spelunk_xbox::DdpFakePlay::Mode(board),
-                spelunk_xbox::DdpFakePlay::Stage(board),
-                spelunk_xbox::DdpFakePlay::Loop(board),
-                static_cast<uint32_t>(nativeFrame.sprites.size()),
-                static_cast<uint32_t>(renderer.LastQuadCount()),
-                board.pictures != prevPictures);
+            const uint64_t tRen0 = spelunk_xbox::XboxTimer::NowTicks();
+            renderer.Render(board.video, nativeFrame, tateMode, bilinear, integerScale);
+            while (pb_finished()) {
+            }
+            const uint64_t renTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
+
+            if (stepped) {
+                spelunk_xbox::g_xboxPerf.RecordFrame(
+                    static_cast<uint32_t>(timer.TicksToMicros(cpuTicks)),
+                    static_cast<uint32_t>(timer.TicksToMicros(renTicks)),
+                    static_cast<uint32_t>(timer.TicksToMicros(gpuTicks)),
+                    spelunk_xbox::DdpFakePlay::Mode(board),
+                    spelunk_xbox::DdpFakePlay::Stage(board),
+                    spelunk_xbox::DdpFakePlay::Loop(board),
+                    static_cast<uint32_t>(nativeFrame.sprites.size()),
+                    static_cast<uint32_t>(renderer.LastQuadCount()),
+                    board.pictures != prevPictures);
+            }
         }
+
+        // Wait for VBlank AFTER kicking NV2A so GPU rasterizes in parallel with VBL wait.
+        pb_wait_for_vbl();
     }
 
     renderer.Shutdown();

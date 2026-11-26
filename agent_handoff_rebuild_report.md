@@ -28,7 +28,7 @@ This report gives an incoming agent everything needed to rebuild, debug, and com
    - `XboxPerfStats g_xboxPerf` (magic `0x50455246` `"PERF"`, GDB-inspectable) tracks per-frame `cpuUs`, `renderUs`, `gpuWaitUs`, `totalUs`, host lag (`> 17,408 µs`), authentic Cave 68000 slowdown (`caveSlowdownFrames`), and 12 per-stage slots (Loop 1/2 S1–S6).
    - `DdpFakePlay` (toggled via **R3** or `make FAKE_PLAY=1`) runs deterministic gameplay across all 6 stages.
    - Whole-game host benchmark (`fake_play_bench.cpp`, 7,000 frames, all 6 stages `0x3F`): `Avg CPU = 1,893.6 µs`, `Max CPU = 13,840 µs`, `0` host lag frames, `17` authentic Cave slowdown frames, `486` max sprites.
-   - Live Xemu `FAKE_PLAY=1` run (`2,308` frames, L1-S1 → L1-S2): `AVG cpu = 5,091.1 µs`, `AVG render = 5,893.5 µs` (`10,984.6 µs` combined < `17,408 µs` Cave budget), `AVG gpuWait = 8,979.6 µs`, `cpuLag = 19`, `renderLag = 1`, `caveSlowdown = 8`, `362` active sprites / `1,465` quads.
+   - Live Xemu `FAKE_PLAY=1` run (`2,047` frames, L1-S1 → L1-S2, after CPU/GPU async overlap, split sprite/tile palette dirty tracking, power-of-2 tile mask, and 256-quad `NV097_SET_VERTEX3F` batches): **`AVG cpu = 2,688.0 µs`**, **`AVG render = 2,433.1 µs`**, **`AVG gpuWait = 1,998.0 µs`**, **`AVG total = 7,119.1 µs`** (40.9% of `17,408 µs` Cave budget, down from `19,964.2 µs` — 2.80× faster; `lagFrames` dropped from `1,143` to `51`, `-95.5%`), `cpuLag = 4`, `renderLag = 3`, `caveSlowdown = 7`.
 7. **Standalone Port (Disconnected from Upstream `spelunkomp/`):** Minimal DoDonPachi engine vendored into `port/nxdk/core/engine/` and 68k translator into `port/nxdk/tools/m68k/`; `Makefile` and host tests have zero `spelunkomp/` dependencies.
 
 ## 5. Exact Build, Launch & Debug Commands

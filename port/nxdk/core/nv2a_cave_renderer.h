@@ -42,7 +42,7 @@ public:
     static constexpr int kSpriteAreaY = 512;
     static constexpr uint32_t kSpriteHashSlots = 2048; // power of 2 (>= 2x max 1024 sprites/frame)
     static constexpr uint32_t kSpriteHashMask = kSpriteHashSlots - 1;
-    static constexpr int kMaxQuadsPerBatch = 48;
+    static constexpr int kMaxQuadsPerBatch = 256;
 
     bool Init() {
         atlas_ = static_cast<uint32_t *>(
@@ -66,7 +66,8 @@ public:
 
         paletteEpoch_ = 1;
         spriteEpoch_ = 1;
-        lastPaletteHash_ = 0;
+        lastSpritePalHash_ = 0;
+        lastTilePalHash_ = 0;
         stateInitialized_ = false;
         filterInitialized_ = false;
         geomInitialized_ = false;
@@ -283,17 +284,25 @@ private:
     }
 
     void UpdatePalette(const std::vector<uint8_t> &palRam) {
-        const uint32_t hash = xbox_hash_palette_64k_asm(
-            reinterpret_cast<const uint32_t *>(palRam.data()), 0x4000u);
-        if (hash == lastPaletteHash_) {
+        // Cave 68000 (ddonpach) splits palette RAM cleanly:
+        //   0x0000..0x3FFF (lower 32 KB) = sprites
+        //   0x4000..0x7FFF (upper 32 KB) = tile layers (colourBase = 0x4000)
+        // Hash each half independently so sprite palette animations never flush the 8,192-slot tileCache_.
+        const uint32_t *palWords = reinterpret_cast<const uint32_t *>(palRam.data());
+        const uint32_t spriteHash = xbox_hash_palette_64k_asm(palWords, 0x2000u);
+        const uint32_t tileHash = xbox_hash_palette_64k_asm(palWords + 0x2000u, 0x2000u);
+        if (spriteHash == lastSpritePalHash_ && tileHash == lastTilePalHash_) {
             return;
         }
-        lastPaletteHash_ = hash;
-        paletteEpoch_ = (paletteEpoch_ + 1u) & 0x7FFFu; // 15-bit epoch fits in packed 64-bit tileCache_ key.
-        if (paletteEpoch_ == 0) {
-            paletteEpoch_ = 1;
-            std::memset(tileCache_.data(), 0, tileCache_.size() * sizeof(uint64_t));
+        if (tileHash != lastTilePalHash_) {
+            lastTilePalHash_ = tileHash;
+            paletteEpoch_ = (paletteEpoch_ + 1u) & 0x7FFFu; // 15-bit epoch fits in packed 64-bit tileCache_ key.
+            if (paletteEpoch_ == 0) {
+                paletteEpoch_ = 1;
+                std::memset(tileCache_.data(), 0, tileCache_.size() * sizeof(uint64_t));
+            }
         }
+        lastSpritePalHash_ = spriteHash;
         xbox_convert_palette_32k_mmx(reinterpret_cast<const uint16_t *>(palRam.data()), paletteLut_.data());
         std::memcpy(paletteLut_.data() + 0x8000, paletteLut_.data(), 256 * sizeof(uint32_t));
     }
@@ -435,6 +444,8 @@ private:
         if (tileCount == 0) {
             return;
         }
+        const bool pow2Tiles = (tileCount & (tileCount - 1)) == 0;
+        const uint32_t tileMask = static_cast<uint32_t>(tileCount - 1);
         const uint8_t *tilePixels = kind.pixels.data();
         const uint32_t *lutBase = paletteLut_.data();
         const uint64_t layerEpochPrefix = (static_cast<uint64_t>(paletteEpoch_) << 36) |
@@ -477,7 +488,7 @@ private:
                 }
 
                 const int tilePrio = static_cast<int>(tileWord >> 30);
-                const uint32_t tileIdx = static_cast<uint32_t>(code % tileCount);
+                const uint32_t tileIdx = pow2Tiles ? (code & tileMask) : static_cast<uint32_t>(code % tileCount);
                 const uint32_t colourIdx = (tileWord >> 24) & kind.colourMask;
                 const uint64_t key = layerEpochPrefix | (static_cast<uint64_t>(colourIdx) << 20) | tileIdx;
                 const uint32_t slotIdx = static_cast<uint32_t>((key ^ (key >> 13) ^ (key >> 27)) & kTileMask);
@@ -524,7 +535,7 @@ private:
                 const Quad &q = qPtr[i];
                 for (int v = 0; v < 4; ++v) {
                     p = pb_push2(p, NV097_SET_VERTEX_DATA2F_M + 9 * 8, q.u[v], q.v[v]);
-                    p = pb_push4(p, NV097_SET_VERTEX4F, q.x[v], q.y[v], kFloatZeroBits, kFloatOneBits);
+                    p = pb_push3(p, NV097_SET_VERTEX3F, q.x[v], q.y[v], kFloatZeroBits);
                 }
             }
             p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
@@ -612,7 +623,8 @@ private:
 
     uint32_t paletteEpoch_ = 1;
     uint16_t spriteEpoch_ = 1;
-    uint32_t lastPaletteHash_ = 0;
+    uint32_t lastSpritePalHash_ = 0;
+    uint32_t lastTilePalHash_ = 0;
     size_t lastQuadCount_ = 0;
     int spriteShelfX_ = 0;
     int spriteShelfY_ = kSpriteAreaY;
