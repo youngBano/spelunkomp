@@ -54,6 +54,7 @@ public:
         atlasPhys_ = static_cast<uint32_t>(MmGetPhysicalAddress(atlas_));
 
         tileCache_.assign(kTileSlots, 0ULL);
+        tileFrame_.assign(kTileSlots, 0u);
         spriteHash_.assign(kSpriteHashSlots, {});
         // +256 mirrored tail allows bounds-safe unmasked palBase[px] indexing in assembly.
         paletteLut_.assign(0x8000 + 256, 0xFF000000u);
@@ -65,6 +66,7 @@ public:
         }
 
         paletteEpoch_ = 1;
+        tileFrameEpoch_ = 1;
         spriteEpoch_ = 1;
         lastSpritePalHash_ = 0;
         lastTilePalHash_ = 0;
@@ -82,6 +84,7 @@ public:
             atlasPhys_ = 0;
         }
         tileCache_.clear();
+        tileFrame_.clear();
         spriteHash_.clear();
         paletteLut_.clear();
         for (int p = 0; p < 4; ++p) {
@@ -131,6 +134,10 @@ public:
         if (++spriteEpoch_ == 0) {
             spriteEpoch_ = 1;
             std::memset(spriteHash_.data(), 0, spriteHash_.size() * sizeof(SpriteHashSlot));
+        }
+        if (++tileFrameEpoch_ == 0) {
+            tileFrameEpoch_ = 1;
+            std::memset(tileFrame_.data(), 0, tileFrame_.size() * sizeof(uint16_t));
         }
 
         // 4. Single linear pass over frame.sprites -> distributes into spriteQuads_[0..3].
@@ -255,25 +262,24 @@ private:
         clipX1_ = std::min(static_cast<int>(screenW), static_cast<int>(vpX0 + quadW + 0.5f));
         clipY1_ = std::min(static_cast<int>(screenH), static_cast<int>(vpY0 + quadH + 0.5f));
 
-        // Precompute affine Arcade -> NDC transform (zero float divisions per vertex!).
-        const float invScreenW2 = 2.0f / screenW;
-        const float invScreenH2 = 2.0f / screenH;
+        // Direct screen-space affine transform (NV097 composite = identity, viewport offset = 0).
+        // Avoids 1/480 NDC round-trip float rounding error so adjacent 8x8 tile quads share bit-exact edges.
         if (!tateMode) {
             // YOKO 90 deg CCW:
-            // ndcX = (vpX0 + ay * (quadW / 240)) * (2 / screenW) - 1
-            // ndcY = 1 - (vpY0 + (320 - ax) * (quadH / 320)) * (2 / screenH)
-            ndcScaleX_ = (quadW / static_cast<float>(kSrcHeight)) * invScreenW2;
-            ndcOffsetX_ = vpX0 * invScreenW2 - 1.0f;
-            ndcScaleY_ = (quadH / static_cast<float>(kSrcWidth)) * invScreenH2;
-            ndcOffsetY_ = 1.0f - (vpY0 + quadH) * invScreenH2;
+            // screenX = vpX0 + ay * (quadW / 240)
+            // screenY = vpY0 + (320 - ax) * (quadH / 320) = (vpY0 + quadH) - ax * (quadH / 320)
+            scrScaleX_ = quadW / static_cast<float>(kSrcHeight);
+            scrOffsetX_ = vpX0;
+            scrScaleY_ = -(quadH / static_cast<float>(kSrcWidth));
+            scrOffsetY_ = vpY0 + quadH;
         } else {
             // TATE native:
-            // ndcX = (vpX0 + ax * (quadW / 320)) * (2 / screenW) - 1
-            // ndcY = 1 - (vpY0 + ay * (quadH / 240)) * (2 / screenH)
-            ndcScaleX_ = (quadW / static_cast<float>(kSrcWidth)) * invScreenW2;
-            ndcOffsetX_ = vpX0 * invScreenW2 - 1.0f;
-            ndcScaleY_ = -(quadH / static_cast<float>(kSrcHeight)) * invScreenH2;
-            ndcOffsetY_ = 1.0f - vpY0 * invScreenH2;
+            // screenX = vpX0 + ax * (quadW / 320)
+            // screenY = vpY0 + ay * (quadH / 240)
+            scrScaleX_ = quadW / static_cast<float>(kSrcWidth);
+            scrOffsetX_ = vpX0;
+            scrScaleY_ = quadH / static_cast<float>(kSrcHeight);
+            scrOffsetY_ = vpY0;
         }
 
         cachedScreenW_ = screenW;
@@ -320,20 +326,20 @@ private:
         const uint32_t fu1 = FloatBits(u1), fv1 = FloatBits(v1);
 
         if (!cachedTate_) {
-            // YOKO: ndcX depends only on ay, ndcY depends only on ax -> only 4 float ops total!
-            const uint32_t xA = FloatBits(ay0 * ndcScaleX_ + ndcOffsetX_);
-            const uint32_t xB = FloatBits(ay1 * ndcScaleX_ + ndcOffsetX_);
-            const uint32_t yA = FloatBits(ax0 * ndcScaleY_ + ndcOffsetY_);
-            const uint32_t yB = FloatBits(ax1 * ndcScaleY_ + ndcOffsetY_);
+            // YOKO: screenX depends only on ay, screenY depends only on ax -> bit-exact 1.5x tile edges!
+            const uint32_t xA = FloatBits(ay0 * scrScaleX_ + scrOffsetX_);
+            const uint32_t xB = FloatBits(ay1 * scrScaleX_ + scrOffsetX_);
+            const uint32_t yA = FloatBits(ax0 * scrScaleY_ + scrOffsetY_);
+            const uint32_t yB = FloatBits(ax1 * scrScaleY_ + scrOffsetY_);
             q.x[0] = xA; q.y[0] = yA; q.u[0] = fu0; q.v[0] = fv0;
             q.x[1] = xA; q.y[1] = yB; q.u[1] = fu1; q.v[1] = fv0;
             q.x[2] = xB; q.y[2] = yB; q.u[2] = fu1; q.v[2] = fv1;
             q.x[3] = xB; q.y[3] = yA; q.u[3] = fu0; q.v[3] = fv1;
         } else {
-            const uint32_t xA = FloatBits(ax0 * ndcScaleX_ + ndcOffsetX_);
-            const uint32_t xB = FloatBits(ax1 * ndcScaleX_ + ndcOffsetX_);
-            const uint32_t yA = FloatBits(ay0 * ndcScaleY_ + ndcOffsetY_);
-            const uint32_t yB = FloatBits(ay1 * ndcScaleY_ + ndcOffsetY_);
+            const uint32_t xA = FloatBits(ax0 * scrScaleX_ + scrOffsetX_);
+            const uint32_t xB = FloatBits(ax1 * scrScaleX_ + scrOffsetX_);
+            const uint32_t yA = FloatBits(ay0 * scrScaleY_ + scrOffsetY_);
+            const uint32_t yB = FloatBits(ay1 * scrScaleY_ + scrOffsetY_);
             q.x[0] = xA; q.y[0] = yA; q.u[0] = fu0; q.v[0] = fv0;
             q.x[1] = xB; q.y[1] = yA; q.u[1] = fu1; q.v[1] = fv0;
             q.x[2] = xB; q.y[2] = yB; q.u[2] = fu1; q.v[2] = fv1;
@@ -354,14 +360,18 @@ private:
             if (s.width <= 0 || s.height <= 0) {
                 continue;
             }
-            const float dx = static_cast<float>(s.width * s.zoomX) * (1.0f / 256.0f);
-            const float dy = static_cast<float>(s.height * s.zoomY) * (1.0f / 256.0f);
-            const float x0 = static_cast<float>(s.x) * (1.0f / 256.0f);
-            const float y0 = static_cast<float>(s.y) * (1.0f / 256.0f);
-            if (x0 + dx <= 0.0f || x0 >= static_cast<float>(kSrcWidth) ||
-                y0 + dy <= 0.0f || y0 >= static_cast<float>(kSrcHeight)) {
+            // Exact integer pixel bounds matching CaveVideo::DrawSprite ((pos + n*zoom) >> 8).
+            const int ix0 = s.x >> 8;
+            const int iy0 = s.y >> 8;
+            const int ix1 = ((s.x + (s.width - 1) * s.zoomX) >> 8) + 1;
+            const int iy1 = ((s.y + (s.height - 1) * s.zoomY) >> 8) + 1;
+            if (ix1 <= 0 || ix0 >= kSrcWidth || iy1 <= 0 || iy0 >= kSrcHeight || ix1 <= ix0 || iy1 <= iy0) {
                 continue;
             }
+            const float x0 = static_cast<float>(ix0);
+            const float y0 = static_cast<float>(iy0);
+            const float x1 = static_cast<float>(ix1);
+            const float y1 = static_cast<float>(iy1);
 
             const int spPrio = static_cast<int>((s.attributes >> 14) & 3u);
             const bool flipX = (s.attributes & (1u << 16)) != 0;
@@ -369,16 +379,18 @@ private:
             const uint32_t colourBank = (s.attributes >> 8) & 0x3Fu;
             const uint32_t palBase = (colourBank * video.spriteColourStep) & 0x7FFFu;
 
+            // Mask s.code to spritePixels size so wrapped addresses share exact keys with zero bit truncation.
+            const uint32_t codeMasked = s.code & spMask;
             const uint64_t key = (static_cast<uint64_t>(colourBank) << 48) |
-                                 (static_cast<uint64_t>(s.width & 0x3FF) << 38) |
-                                 (static_cast<uint64_t>(s.height & 0x3FF) << 28) |
-                                 (s.code & 0x0FFFFFFFu);
+                                 (static_cast<uint64_t>((s.width >> 4) & 0x3F) << 40) |
+                                 (static_cast<uint64_t>((s.height >> 4) & 0x3F) << 32) |
+                                 static_cast<uint64_t>(codeMasked);
 
             // O(1) open-addressed hash lookup (epoch-tagged, 2 slots per 32-byte cache line).
             uint32_t idx = static_cast<uint32_t>((key ^ (key >> 17) ^ (key >> 33)) & kSpriteHashMask);
             SpriteHashSlot *slot = nullptr;
             bool hit = false;
-            for (uint32_t probe = 0; probe < 16; ++probe) {
+            for (uint32_t probe = 0; probe < 64; ++probe) {
                 SpriteHashSlot &cand = spriteHash_[(idx + probe) & kSpriteHashMask];
                 if (cand.epoch != spriteEpoch_) {
                     slot = &cand;
@@ -414,7 +426,7 @@ private:
                 const uint32_t *palPtr = lutBase + palBase;
                 for (int sy = 0; sy < s.height; ++sy) {
                     uint32_t *dstRow = atlas_ + static_cast<size_t>(dstY + sy) * kAtlasW + dstX;
-                    const uint32_t srcOff = s.code + static_cast<uint32_t>(sy * s.width);
+                    const uint32_t srcOff = codeMasked + static_cast<uint32_t>(sy * s.width);
                     anyOpaque |= xbox_unpack_sprite_row_asm(
                         spData, srcOff, spMask, static_cast<uint32_t>(s.width), dstRow, palPtr);
                 }
@@ -432,7 +444,7 @@ private:
             const float u1 = flipX ? static_cast<float>(slot->u0) : static_cast<float>(slot->u0 + s.width);
             const float v0 = flipY ? static_cast<float>(slot->v0 + s.height) : static_cast<float>(slot->v0);
             const float v1 = flipY ? static_cast<float>(slot->v0) : static_cast<float>(slot->v0 + s.height);
-            PushArcadeQuad(spriteQuads_[spPrio], x0, y0, x0 + dx, y0 + dy, u0, v0, u1, v1);
+            PushArcadeQuad(spriteQuads_[spPrio], x0, y0, x1, y1, u0, v0, u1, v1);
         }
     }
 
@@ -461,8 +473,11 @@ private:
 
         for (int ty = 0; ty <= endTy; ++ty) {
             const int screenY = ty * 8 - subOffY;
-            const int sampleY = std::clamp(screenY + 4, 0, kSrcHeight - 1);
-            const int line = flipY ? (kSrcHeight - 1 - sampleY) : sampleY;
+            if (screenY + 8 <= 0 || screenY >= kSrcHeight) {
+                continue;
+            }
+            // Exact unclamped tile-aligned map Y (py & 7 == 0 when unflipped, == 7 when flipped).
+            const int line = flipY ? (kSrcHeight - 1 - screenY) : screenY;
             const int py = (line + scrollY) & 0x1FF;
             const uint32_t rowBaseBig = static_cast<uint32_t>((py >> 4) * 32) * 4u;
             const uint32_t rowBaseSmall = 0x4000u + static_cast<uint32_t>((py >> 3) * 64) * 4u;
@@ -470,8 +485,10 @@ private:
 
             for (int tx = 0; tx <= endTx; ++tx) {
                 const int screenX = tx * 8 - subOffX;
-                const int sampleX = std::clamp(screenX + 4, 0, kSrcWidth - 1);
-                const int px = ((flipX ? (kSrcWidth - 1 - sampleX) : (sampleX + video.left)) + scrollX) & 0x1FF;
+                if (screenX + 8 <= 0 || screenX >= kSrcWidth) {
+                    continue;
+                }
+                const int px = ((flipX ? (kSrcWidth - 1 - screenX) : (screenX + video.left)) + scrollX) & 0x1FF;
 
                 uint32_t tileWord, code;
                 if (big) {
@@ -491,13 +508,34 @@ private:
                 const uint32_t tileIdx = pow2Tiles ? (code & tileMask) : static_cast<uint32_t>(code % tileCount);
                 const uint32_t colourIdx = (tileWord >> 24) & kind.colourMask;
                 const uint64_t key = layerEpochPrefix | (static_cast<uint64_t>(colourIdx) << 20) | tileIdx;
-                const uint32_t slotIdx = static_cast<uint32_t>((key ^ (key >> 13) ^ (key >> 27)) & kTileMask);
-                uint64_t entry = tileCache_[slotIdx];
 
-                const int slotX = static_cast<int>(slotIdx & (kTileCols - 1)) * 8;
-                const int slotY = static_cast<int>(slotIdx >> 7) * 8;
-
-                if ((entry & kTileKeyMask) != key) {
+                // Frame-pinned open-addressed tile cache: never evicts a tile already emitted this frame,
+                // eliminating same-frame hash collisions that previously overwrote atlas tiles before GPU draw.
+                const uint32_t baseSlot = static_cast<uint32_t>((key ^ (key >> 13) ^ (key >> 27)) & kTileMask);
+                uint32_t slotIdx = baseSlot;
+                uint32_t freeSlot = UINT32_MAX;
+                bool hit = false;
+                uint64_t entry = 0;
+                for (uint32_t probe = 0; probe < 32; ++probe) {
+                    const uint32_t cand = (baseSlot + probe) & kTileMask;
+                    const uint64_t e = tileCache_[cand];
+                    if ((e & kTileKeyMask) == key) {
+                        slotIdx = cand;
+                        entry = e;
+                        hit = true;
+                        break;
+                    }
+                    if (freeSlot == UINT32_MAX && tileFrame_[cand] != tileFrameEpoch_) {
+                        freeSlot = cand;
+                    }
+                }
+                if (!hit) {
+                    if (freeSlot == UINT32_MAX) {
+                        continue; // Atlas full for this frame; never overwrite an in-flight tile.
+                    }
+                    slotIdx = freeSlot;
+                    const int slotX = static_cast<int>(slotIdx & (kTileCols - 1)) * 8;
+                    const int slotY = static_cast<int>(slotIdx >> 7) * 8;
                     const uint32_t palBase = (kind.colourBase + colourIdx * kind.colourStep) & 0x7FFFu;
                     const uint8_t *srcTile = tilePixels + static_cast<size_t>(tileIdx) * 64;
                     uint32_t *dstTile = atlas_ + static_cast<size_t>(slotY) * kAtlasW + slotX;
@@ -506,11 +544,14 @@ private:
                     entry = key | (anyOpaque == 0 ? kTileEmptyBit : 0ULL);
                     tileCache_[slotIdx] = entry;
                 }
+                tileFrame_[slotIdx] = tileFrameEpoch_;
 
                 if ((entry & kTileEmptyBit) != 0) {
                     continue;
                 }
 
+                const int slotX = static_cast<int>(slotIdx & (kTileCols - 1)) * 8;
+                const int slotY = static_cast<int>(slotIdx >> 7) * 8;
                 const float u0 = flipX ? static_cast<float>(slotX + 8) : static_cast<float>(slotX);
                 const float u1 = flipX ? static_cast<float>(slotX) : static_cast<float>(slotX + 8);
                 const float v0 = flipY ? static_cast<float>(slotY + 8) : static_cast<float>(slotY);
@@ -550,10 +591,10 @@ private:
         const uint32_t texAddr = 3u | (3u << 8) | (3u << 16);
 
         const float kComposite[16] = {
-            screenW * 0.5f, 0.0f,            0.0f, 0.0f,
-            0.0f,           -screenH * 0.5f, 0.0f, 0.0f,
-            0.0f,           0.0f,            1.0f, 0.0f,
-            0.0f,           0.0f,            0.0f, 1.0f
+            1.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 1.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 1.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 1.0f
         };
 
         p = pb_push1(p, NV097_SET_DEPTH_TEST_ENABLE, 0);
@@ -585,10 +626,10 @@ private:
         p += 16;
 
         p = pb_push4(p, NV097_SET_VIEWPORT_OFFSET,
-                     FloatBits(screenW * 0.5f), FloatBits(screenH * 0.5f),
+                     kFloatZeroBits, kFloatZeroBits,
                      kFloatZeroBits, kFloatZeroBits);
         p = pb_push4(p, NV097_SET_VIEWPORT_SCALE,
-                     FloatBits(screenW * 0.5f), FloatBits(-screenH * 0.5f),
+                     kFloatOneBits, kFloatOneBits,
                      kFloatOneBits, kFloatOneBits);
 
         p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, atlasPhys_);
@@ -616,12 +657,14 @@ private:
     uint32_t atlasPhys_ = 0;
 
     std::vector<uint64_t> tileCache_;
+    std::vector<uint16_t> tileFrame_;
     std::vector<SpriteHashSlot> spriteHash_;
     std::vector<uint32_t> paletteLut_;
     std::vector<Quad> spriteQuads_[4];
     std::vector<Quad> tileQuads_[4];
 
     uint32_t paletteEpoch_ = 1;
+    uint16_t tileFrameEpoch_ = 1;
     uint16_t spriteEpoch_ = 1;
     uint32_t lastSpritePalHash_ = 0;
     uint32_t lastTilePalHash_ = 0;
@@ -630,7 +673,7 @@ private:
     int spriteShelfY_ = kSpriteAreaY;
     int spriteShelfRowH_ = 0;
 
-    float ndcScaleX_ = 0.0f, ndcOffsetX_ = 0.0f, ndcScaleY_ = 0.0f, ndcOffsetY_ = 0.0f;
+    float scrScaleX_ = 0.0f, scrOffsetX_ = 0.0f, scrScaleY_ = 0.0f, scrOffsetY_ = 0.0f;
     int clipX0_ = 140, clipY0_ = 0, clipX1_ = 500, clipY1_ = 480;
     float cachedScreenW_ = 0.0f, cachedScreenH_ = 0.0f;
     bool stateInitialized_ = false;
