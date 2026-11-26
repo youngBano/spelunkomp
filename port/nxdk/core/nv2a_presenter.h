@@ -69,6 +69,12 @@ public:
         const float x1 = x0 + quadW;
         const float y1 = y0 + quadH;
 
+        // Convert screen-space pixel coordinates to NDC [-1, 1].
+        const float ndcX0 = (x0 / screenW) * 2.0f - 1.0f;
+        const float ndcX1 = (x1 / screenW) * 2.0f - 1.0f;
+        const float ndcY0 = 1.0f - (y0 / screenH) * 2.0f;
+        const float ndcY1 = 1.0f - (y1 / screenH) * 2.0f;
+
         // Linear NV2A textures use unnormalized texel coordinates.
         float u0, v0, u1, v1, u2, v2, u3, v3;
         if (!tateMode) {
@@ -85,7 +91,7 @@ public:
             u3 = 0.0f;   v3 = 240.0f;
         }
 
-        const uint32_t texPhys = reinterpret_cast<uint32_t>(tex_) & 0x03FFFFFFu;
+        const uint32_t texPhys = static_cast<uint32_t>(MmGetPhysicalAddress(tex_));
         const uint32_t texFmt =
             1u |                                                              // DMA context A
             (1u << 3) |                                                       // Border source color
@@ -96,34 +102,72 @@ public:
         const uint32_t filterMode = bilinear ? 2u : 1u;                       // 1=nearest, 2=linear
         const uint32_t texFilter = (filterMode << 16) | (filterMode << 24);
 
+        // NV2A fixed-function applies COMPOSITE_MATRIX and adds VIEWPORT_OFFSET (does not multiply VIEWPORT_SCALE).
+        const float kComposite[16] = {
+            screenW * 0.5f, 0.0f,            0.0f, 0.0f,
+            0.0f,           -screenH * 0.5f, 0.0f, 0.0f,
+            0.0f,           0.0f,            1.0f, 0.0f,
+            0.0f,           0.0f,            0.0f, 1.0f
+        };
+
+        // Flush write-combined CPU writes to tex_ before NV2A DMA read.
+        __asm__ volatile("sfence" ::: "memory");
+
         uint32_t *p = pb_begin();
         p = pb_push1(p, NV097_SET_DEPTH_TEST_ENABLE, 0);
+        p = pb_push1(p, NV097_SET_DEPTH_MASK, 0);
         p = pb_push1(p, NV097_SET_CULL_FACE_ENABLE, 0);
         p = pb_push1(p, NV097_SET_BLEND_ENABLE, 0);
 
-        // Bind linear ABGR8888 texture to stage 0.
+        // Fixed-function transform state with identity composite matrix.
+        p = pb_push1(p, NV097_SET_TRANSFORM_EXECUTION_MODE, 0);
+        p = pb_push1(p, NV097_SET_TRANSFORM_PROGRAM_CXT_WRITE_EN, 0);
+        p = pb_push1(p, NV097_SET_LIGHTING_ENABLE, 0);
+        p = pb_push1(p, NV097_SET_ALPHA_TEST_ENABLE, 0);
+        p = pb_push1(p, NV097_SET_TEXTURE_MATRIX_ENABLE, 0);
+        p = pb_push1(p, NV097_SET_COLOR_MASK, 0x01010101u);
+
+        pb_push(p, NV097_SET_COMPOSITE_MATRIX, 16);
+        p++;
+        std::memcpy(p, kComposite, sizeof(kComposite));
+        p += 16;
+
+        p = pb_push4(p, NV097_SET_VIEWPORT_OFFSET,
+                     FloatBits(screenW * 0.5f), FloatBits(screenH * 0.5f),
+                     FloatBits(0.0f), FloatBits(0.0f));
+        p = pb_push4(p, NV097_SET_VIEWPORT_SCALE,
+                     FloatBits(screenW * 0.5f), FloatBits(-screenH * 0.5f),
+                     FloatBits(1.0f), FloatBits(1.0f));
+
+        // Bind linear ABGR8888 texture to stage 0 and disable stages 1-3.
         p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, texPhys);
         p = pb_push1(p, NV097_SET_TEXTURE_FORMAT, texFmt);
         p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS, texAddr);
-        p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0, NV097_SET_TEXTURE_CONTROL0_ENABLE);
+        p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0, NV097_SET_TEXTURE_CONTROL0_ENABLE | (0xFFFu << 6));
         p = pb_push1(p, NV097_SET_TEXTURE_CONTROL1, (kSrcWidth * 4u) << 16);
         p = pb_push1(p, NV097_SET_TEXTURE_FILTER, texFilter);
         p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT, (kSrcWidth << 16) | kSrcHeight);
+        for (uint32_t stage = 1; stage < 4; ++stage) {
+            p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0 + stage * 0x40u, 0);
+        }
 
         // Stage 0 = 2D projective texture, stages 1-3 disabled.
         p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_2D_PROJECTIVE);
+        p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
 
-        // Final combiner: RGB = tex0 (source 0x8 in D), Alpha = 1.0 (inverted zero in G).
+        // Stage 0 combiner discards (leaves TEX0 untouched); final combiner outputs RGB = tex0, Alpha = 1.0.
         p = pb_push1(p, NV097_SET_COMBINER_CONTROL, NV097_SET_COMBINER_CONTROL_ITERATION_COUNT_ONE);
+        p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW, 0);
+        p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW, 0);
         p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0, 0x00000008u);
         p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1, 0x00002000u);
 
-        // Emit screen-space textured quad.
+        // Emit NDC textured quad.
         p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_QUADS);
-        p = EmitVertex(p, x0, y0, u0, v0);
-        p = EmitVertex(p, x1, y0, u1, v1);
-        p = EmitVertex(p, x1, y1, u2, v2);
-        p = EmitVertex(p, x0, y1, u3, v3);
+        p = EmitVertex(p, ndcX0, ndcY0, u0, v0);
+        p = EmitVertex(p, ndcX1, ndcY0, u1, v1);
+        p = EmitVertex(p, ndcX1, ndcY1, u2, v2);
+        p = EmitVertex(p, ndcX0, ndcY1, u3, v3);
         p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
         pb_end(p);
     }
