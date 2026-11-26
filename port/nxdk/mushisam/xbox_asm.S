@@ -6,7 +6,7 @@
 
 // -----------------------------------------------------------------------------
 // void xbox_copy_u16_row_asm(const uint16_t *src, uint16_t *dst, uint32_t pixelCount)
-// Fast DWORD/WORD streaming copy into write-combined NV2A A1R5G5B5 atlas.
+// MMX non-temporal 64-bit write-combining streaming copy (32 B/iter burst into NV2A atlas).
 // -----------------------------------------------------------------------------
 .globl _xbox_copy_u16_row_asm
 .align 16
@@ -14,8 +14,33 @@ _xbox_copy_u16_row_asm:
     pushl   %esi
     pushl   %edi
     movl    12(%esp), %esi      // src
-    movl    16(%esp), %edi      // dst
+    movl    16(%esp), %edi      // dst (WC NV2A atlas)
     movl    20(%esp), %ecx      // pixelCount (16-bit pixels)
+    cmpl    $16, %ecx
+    jb      .Lcopy_tail_dw
+
+    // 4x unrolled MMX movq + movntq = 32 bytes (1 full PIII WC line) per iteration.
+    movl    %ecx, %eax
+    shrl    $4, %ecx            // 16 pixels (32 bytes) per iteration
+.align 16
+.Lcopy_mmx32:
+    movq    0(%esi), %mm0
+    movq    8(%esi), %mm1
+    movq    16(%esi), %mm2
+    movq    24(%esi), %mm3
+    movntq  %mm0, 0(%edi)
+    movntq  %mm1, 8(%edi)
+    movntq  %mm2, 16(%edi)
+    movntq  %mm3, 24(%edi)
+    addl    $32, %esi
+    addl    $32, %edi
+    decl    %ecx
+    jnz     .Lcopy_mmx32
+    emms
+    movl    %eax, %ecx
+    andl    $15, %ecx
+
+.Lcopy_tail_dw:
     movl    %ecx, %eax
     shrl    $1, %ecx            // DWORD pairs (2 pixels per DWORD)
     cld

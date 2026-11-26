@@ -15,11 +15,13 @@ namespace spelunk_xbox {
 class XboxAudio {
 public:
     static constexpr uint32_t kNumBuffers = 4;
-    static constexpr uint32_t kBufFrames48k = 512;
+    // 2048 stereo frames @ 48 kHz = 42.67 ms per DMA buffer (170.7 ms total cushion):
+    // prevents nxdk hal/audio.c analogDrained latchup during boot/stage-load spikes!
+    static constexpr uint32_t kBufFrames48k = 2048;
     static constexpr uint32_t kBufBytes = kBufFrames48k * 2 * sizeof(int16_t);
-    static constexpr uint32_t kRingSize = 16384;
+    static constexpr uint32_t kRingSize = 32768;
     static constexpr uint32_t kRingMask = kRingSize - 1;
-    static constexpr uint32_t kMaxQueued = 8192;
+    static constexpr uint32_t kMaxQueued = 16384;
 
     bool Init(uint32_t srcRate = 16000u) {
         SetSampleRate(srcRate);
@@ -27,6 +29,7 @@ public:
         ringWrite_ = 0;
         phase16_ = 0;
         lastSample_ = 0;
+        playing_ = false;
         std::memset(ring_, 0, sizeof(ring_));
 
         for (uint32_t i = 0; i < kNumBuffers; ++i) {
@@ -43,7 +46,6 @@ public:
         for (uint32_t i = 0; i < kNumBuffers; ++i) {
             XAudioProvideSamples(reinterpret_cast<unsigned char *>(dmaBufs_[i]), kBufBytes, 0);
         }
-        XAudioPlay();
         initialized_ = true;
         return true;
     }
@@ -88,6 +90,11 @@ public:
         }
         __asm__ volatile("" ::: "memory");
         ringWrite_ = w;
+        // Start AC'97 DMA once we have ~25 ms of audio buffered so startup never starves hal/audio.c.
+        if (!playing_ && (w - r) >= 400u) {
+            playing_ = true;
+            XAudioPlay();
+        }
     }
 
 private:
@@ -109,16 +116,19 @@ private:
             &phase16_, &lastSample_, dstStereo, frames, step16_);
     }
 
-    alignas(32) volatile uint32_t ringRead_ = 0;
+    volatile uint32_t ringRead_ = 0;
     uint32_t phase16_ = 0;
     int16_t lastSample_ = 0;
     uint32_t nextBuf_ = 0;
     volatile uint32_t step16_ = 21845u; // 16000 / 48000 in 16.16
+    uint8_t padLine1_[16] = {};
 
-    alignas(32) volatile uint32_t ringWrite_ = 0;
+    volatile uint32_t ringWrite_ = 0;
     bool initialized_ = false;
+    bool playing_ = false;
     int16_t *dmaBufs_[kNumBuffers] = {};
-    alignas(32) int16_t ring_[kRingSize] = {};
+    uint8_t padLine2_[12] = {};
+    int16_t ring_[kRingSize] = {};
 };
 
 } // namespace spelunk_xbox

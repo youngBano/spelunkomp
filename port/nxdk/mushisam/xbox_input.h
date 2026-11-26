@@ -137,9 +137,11 @@ private:
     }
 
     static inline XboxInput *s_instance = nullptr;
-    // Separate USB OHCI interrupt-written packet from game-thread pointer on 32-byte Pentium III cache lines.
-    alignas(32) xid_dev_t *padDev_ = nullptr;
-    alignas(32) volatile bool hasPacket_ = false;
+    // Separate USB OHCI interrupt-written packet from game-thread pointer using explicit padding (no alignas(32) heap movaps).
+    xid_dev_t *padDev_ = nullptr;
+    uint8_t padLine1_[28] = {};
+    volatile bool hasPacket_ = false;
+    uint8_t padLine2_[31] = {};
     volatile xid_gamepad_in raw_{};
 };
 

@@ -23,7 +23,29 @@ public:
         maxAccumTicks_ = ticksPerArcadeFrame_ * 2ULL;
         lastTick_ = NowTicks();
         accumTicks_ = ticksPerArcadeFrame_;
+
+        // Calibrate RDTSC ticks per millisecond against MCPX hardware timer (~10 ms window).
+        const uint64_t qpc0 = NowTicks();
+        const uint64_t tsc0 = ReadRdtsc();
+        const uint64_t targetDelta = freq_ / 100ULL; // ~10 ms
+        while (NowTicks() - qpc0 < targetDelta) {
+        }
+        const uint64_t qpc1 = NowTicks();
+        const uint64_t tsc1 = ReadRdtsc();
+        const uint64_t dtQpc = (qpc1 > qpc0) ? (qpc1 - qpc0) : 1ULL;
+        const uint64_t dtTsc = (tsc1 > tsc0) ? (tsc1 - tsc0) : 7330000ULL;
+        const uint64_t dtUs = (dtQpc * 1000000ULL) / freq_;
+        rdtscPerUs_ = (dtUs > 0) ? (dtTsc / dtUs) : 733ULL;
+        if (rdtscPerUs_ == 0) {
+            rdtscPerUs_ = 733ULL;
+        }
     }
+
+    uint64_t RdtscToMicros(uint64_t tscDelta) const {
+        return tscDelta / rdtscPerUs_;
+    }
+
+    uint64_t RdtscPerUs() const { return rdtscPerUs_; }
 
     static inline uint64_t NowTicks() {
         return static_cast<uint64_t>(KeQueryPerformanceCounter());
@@ -63,6 +85,7 @@ private:
     uint64_t maxAccumTicks_ = 119282ULL;
     uint64_t lastTick_ = 0;
     uint64_t accumTicks_ = 0;
+    uint64_t rdtscPerUs_ = 733ULL;
 };
 
 } // namespace spelunk_xbox

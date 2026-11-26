@@ -247,6 +247,10 @@ int main(int argc, char **argv) {
     uint64_t totalDraws = 0;
     uint64_t totalUploads = 0;
     uint64_t totalUploadPx = 0;
+    uint64_t midFrameUploadsAfterDraws = 0;
+    uint64_t offscreenDraws = 0;
+    uint64_t farOffscreenDraws = 0;
+    uint64_t scrollDiffClipFrames = 0;
     uint64_t sumSh3Tsc = 0, sumAudTsc = 0, sumBlitTsc = 0;
     bool dumpedRam = false;
 
@@ -262,6 +266,37 @@ int main(int argc, char **argv) {
         totalDraws += nl.draws.size();
         totalUploads += nl.uploads.size();
         totalUploadPx += nl.pixels.size();
+        {
+            bool seenDraw = false;
+            const int scrX = static_cast<int>(board.blitter.clipX & 0x1FFFu);
+            const int scrY = static_cast<int>(board.blitter.clipY & 0x0FFFu);
+            if (board.blitter.scrollX != board.blitter.clipX || board.blitter.scrollY != board.blitter.clipY) {
+                ++scrollDiffClipFrames;
+            }
+            for (const auto &st : nl.steps) {
+                if (st.upload) {
+                    if (seenDraw) ++midFrameUploadsAfterDraws;
+                } else {
+                    seenDraw = true;
+                    for (uint32_t i = 0; i < st.count; ++i) {
+                        const auto &d = nl.draws[st.first + i];
+                        const int dx0 = d.x0 - scrX, dy0 = d.y0 - scrY;
+                        const int w = d.x1 - d.x0 + 1, h = d.y1 - d.y0 + 1;
+                        if (dx0 + w <= 0 || dx0 >= 320 || dy0 + h <= 0 || dy0 >= 240) {
+                            ++offscreenDraws;
+                            if (dx0 + w < -64 || dx0 > 384 || dy0 + h < -64 || dy0 > 304) {
+                                if (farOffscreenDraws < 12) {
+                                    std::printf("  [FarOff f=%d] scr=(%u,%u) clip=(%d,%d) d=(%d..%d, %d..%d) src=(%d,%d) flg=0x%X\n",
+                                                f, board.blitter.scrollX, board.blitter.scrollY, scrX, scrY,
+                                                d.x0, d.x1, d.y0, d.y1, d.sx + d.x0, d.sy + d.y0, d.flags);
+                                }
+                                ++farOffscreenDraws;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         sumSh3Tsc += board.profSh3Tsc;
         sumAudTsc += board.profAudioTsc;
         sumBlitTsc += board.profBlitterTsc;
@@ -298,12 +333,16 @@ int main(int argc, char **argv) {
                 totalTsc > 0 ? 100.0 * sumSh3Tsc / totalTsc : 0.0,
                 totalTsc > 0 ? 100.0 * sumAudTsc / totalTsc : 0.0,
                 totalTsc > 0 ? 100.0 * sumBlitTsc / totalTsc : 0.0);
-    std::printf("  Avg dispatches/frame: %.1f (interp=%llu) | Avg draws/frame: %.1f | Uploads: %llu (%llu px)\n",
+    std::printf("  Avg dispatches/frame: %.1f (interp=%llu) | Avg draws/frame: %.1f | Uploads: %llu (%llu px) | MidFrameUpAfterDraw: %llu | Offscreen: %llu (FarOffscreen: %llu, scroll!=clip: %llu)\n",
                 static_cast<double>(board.cpu.nativeBlocks) / frames,
                 (unsigned long long)board.cpu.interpretedBlocks,
                 static_cast<double>(totalDraws) / frames,
                 (unsigned long long)totalUploads,
-                (unsigned long long)totalUploadPx);
+                (unsigned long long)totalUploadPx,
+                (unsigned long long)midFrameUploadsAfterDraws,
+                (unsigned long long)offscreenDraws,
+                (unsigned long long)farOffscreenDraws,
+                (unsigned long long)scrollDiffClipFrames);
     if (!dumpBlocksPath.empty()) {
         board.cpu.SaveRecording(dumpBlocksPath.c_str());
         std::printf("Saved block recording to %s\n", dumpBlocksPath.c_str());

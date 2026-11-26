@@ -38,16 +38,17 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 768; // 768 * 32 KB = 24 MB hot RAM pool on 64 MB retail Xbox (eliminates Z:\ swaps!)
+    static constexpr int kRetailMaxAllocPages = 704; // 704 * 32 KB = 22 MB hot RAM pool on 64 MB retail Xbox
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
-    // 1024x(1024+4) A1R5G5B5 dynamic per-frame NV2A atlas (2 MB + 8 KB).
+    // 1024x(2048+4) A1R5G5B5 NV2A shelf atlas (4 MB + 8 KB) + 8,192-slot Mix64 hash table:
+    // Holds pre-upload AND post-upload rects in a single frame without ever overwriting queued quads!
     static constexpr int kAtlasW = 1024;
-    static constexpr int kAtlasH = 1024;
+    static constexpr int kAtlasH = 2048;
     static constexpr int kAtlasGuardRows = 4;
     static constexpr int kAtlasAllocH = kAtlasH + kAtlasGuardRows;
     static constexpr size_t kAtlasBytes = static_cast<size_t>(kAtlasW) * kAtlasAllocH * sizeof(uint16_t);
-    static constexpr uint32_t kRectHashSlots = 4096;
+    static constexpr uint32_t kRectHashSlots = 8192;
     static constexpr uint32_t kRectHashMask = kRectHashSlots - 1;
 
     // Double-buffered write-combined NV2A hardware DMA vertex buffer:
@@ -168,90 +169,54 @@ public:
         // while the display scans out the previous buffer at (scrollX, scrollY).
         const int scrX = static_cast<int>(blitter.clipX & 0x1FFFu);
         const int scrY = static_cast<int>(blitter.clipY & 0x0FFFu);
+        const int dispX = static_cast<int>(blitter.scrollX & 0x1FFFu);
+        const int dispY = static_cast<int>(blitter.scrollY & 0x0FFFu);
 
-        // 1. Flip double-buffered hardware VB; keep persistent multi-frame A1R5G5B5 atlas warm across frames!
+        // 1. Cycle 4-row texture offset & flip double-buffered VB UP FRONT (zero WC readbacks!).
+        // Keep the 1024x2048 (4 MB) atlas persistent across frames; only recycle at frame start when >75% full
+        // (safe because pb_busy() already completed before Render() is entered!).
+        atlasPhase_ = (atlasPhase_ + 1u) & 3u;
+        atlasVBias_ = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
         vbPhase_ ^= 1u;
         vbCur_ = vbAlloc_ + (vbPhase_ ? kMaxVertsPerFrame : 0u);
         vbCount_ = 0;
+        if (shelfY_ > (kAtlasH * 3) / 4) {
+            shelfX_ = 0;
+            shelfY_ = 0;
+            shelfRowH_ = 0;
+            InvalidateRectHash();
+        }
         batches_.clear();
         lastDrawCount_ = list.draws.size();
         lastUploadCount_ = static_cast<uint32_t>(list.uploads.size());
         lastStateChanges_ = 0;
-        bool atlasMutated = false;
+        frameHeaderPushed_ = false;
+        curScreenW_ = screenW;
+        curScreenH_ = screenH;
+        curBilinear_ = bilinear;
 
-        // 2. Process all blitter steps in exact game order (writes vertices straight to WC hardware VB).
+        // 2. Process all blitter steps in exact game order:
+        //    - Uploads & off-screen VRAM composite draws update sparse VRAM pages and invalidate ONLY the hash epoch
+        //      (NEVER resetting shelfX_/shelfY_ mid-frame on top of already-emitted quads!).
         for (const auto &step : list.steps) {
             if (step.upload) {
                 ApplyUpload(list.uploads[step.first], list.pixels);
-                // Any upload may mutate source VRAM regions; reset persistent shelf atlas safely.
-                ResetAtlasCache();
-                atlasMutated = true;
+                InvalidateRectHash();
             } else {
                 for (uint32_t i = 0; i < step.count; ++i) {
-                    if (ProcessDraw(list.draws[step.first + i], scrX, scrY)) {
-                        atlasMutated = true;
-                    }
+                    ProcessDraw(list.draws[step.first + i], scrX, scrY, dispX, dispY, bilinear);
                 }
             }
         }
         list.Clear();
 
-        // Only cycle 4-row texture offset when atlas pixels actually changed (preserves NV2A L1 tex cache on static frames!).
-        if (atlasMutated) {
-            atlasPhase_ = (atlasPhase_ + 1u) & 3u;
-            const float newBias = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
-            const float deltaBias = newBias - atlasVBias_;
-            atlasVBias_ = newBias;
-            if (deltaBias != 0.0f && vbCount_ > 0u) {
-                for (uint32_t i = 0; i < vbCount_; ++i) {
-                    vbCur_[i].v += deltaBias;
-                }
-            }
-        }
-
         // 3. Flush write-combined A1R5G5B5 atlas & hardware vertex buffer writes before NV2A DMA.
         _mm_sfence();
 
-        // 4. Single fused pushbuffer frame header: NV097 hardware clear + static/dynamic texture & VB DMA pointers.
-        const uint32_t activeTexPhys =
-            atlasPhysBase_ + atlasPhase_ * static_cast<uint32_t>(kAtlasW * sizeof(uint16_t));
-        const uint32_t activeTexH = static_cast<uint32_t>(kAtlasAllocH) - atlasPhase_;
-        const uint32_t activeVbPhys = vbPhysBase_ + (vbPhase_ ? static_cast<uint32_t>(kVbFrameBytes) : 0u);
-        uint32_t *p = pb_begin();
-        if (clearFramesRemaining_ > 0) {
-            const uint32_t sw = static_cast<uint32_t>(screenW);
-            const uint32_t sh = static_cast<uint32_t>(screenH);
-            p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, ((sw - 1u) << 16) | 0u);
-            p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, ((sh - 1u) << 16) | 0u);
-            p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, 0xFF000000u);
-            p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
-            --clearFramesRemaining_;
+        // 4. Push frame header (if not already pushed by a mid-frame overflow flush) & submit hardware batches.
+        if (!frameHeaderPushed_) {
+            PushFrameHeader(screenW, screenH, bilinear);
         }
-        p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, (static_cast<uint32_t>(clipX1_ - 1) << 16) | static_cast<uint32_t>(clipX0_));
-        p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, (static_cast<uint32_t>(clipY1_ - 1) << 16) | static_cast<uint32_t>(clipY0_));
-        p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, 0xFF000000u);
-        p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
-
-        if (!stateInitialized_) {
-            p = PushStaticState(p, screenW, screenH, activeTexPhys, activeTexH, activeVbPhys);
-            stateInitialized_ = true;
-            filterInitialized_ = false;
-        } else {
-            p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, activeTexPhys);
-            p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT, (kAtlasW << 16) | activeTexH);
-            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, activeVbPhys + 0u);
-            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, activeVbPhys + 12u);
-            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 9 * 4, activeVbPhys + 4u);
-        }
-        if (!filterInitialized_ || bilinear != cachedBilinear_) {
-            const uint32_t filterMode = bilinear ? 2u : 1u;
-            p = pb_push1(p, NV097_SET_TEXTURE_FILTER, (filterMode << 16) | (filterMode << 24));
-            cachedBilinear_ = bilinear;
-            filterInitialized_ = true;
-        }
-        pb_end(p);
-
-        // 5. Submit hardware NV2A DMA vertex-array batches (NV097_DRAW_ARRAYS).
         SubmitDraws();
     }
 
@@ -312,14 +277,227 @@ private:
         return (v << 2) | (v >> 4);
     }
 
-    void ResetAtlasCache() {
-        shelfX_ = 0;
-        shelfY_ = 0;
-        shelfRowH_ = 0;
+    void InvalidateRectHash() {
         if (++rectEpoch_ == 0) {
             rectEpoch_ = 1;
             std::memset(rectHash_.data(), 0, rectHash_.size() * sizeof(RectHashSlot));
         }
+    }
+
+    void PushFrameHeader(float screenW, float screenH, bool bilinear) {
+        const uint32_t activeTexPhys =
+            atlasPhysBase_ + atlasPhase_ * static_cast<uint32_t>(kAtlasW * sizeof(uint16_t));
+        const uint32_t activeTexH = static_cast<uint32_t>(kAtlasAllocH) - atlasPhase_;
+        const uint32_t activeVbPhys = vbPhysBase_ + (vbPhase_ ? static_cast<uint32_t>(kVbFrameBytes) : 0u);
+        uint32_t *p = pb_begin();
+        if (clearFramesRemaining_ > 0) {
+            const uint32_t sw = static_cast<uint32_t>(screenW);
+            const uint32_t sh = static_cast<uint32_t>(screenH);
+            p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, ((sw - 1u) << 16) | 0u);
+            p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, ((sh - 1u) << 16) | 0u);
+            p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, 0xFF000000u);
+            p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
+            --clearFramesRemaining_;
+        }
+        p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, (static_cast<uint32_t>(clipX1_ - 1) << 16) | static_cast<uint32_t>(clipX0_));
+        p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, (static_cast<uint32_t>(clipY1_ - 1) << 16) | static_cast<uint32_t>(clipY0_));
+        p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, 0xFF000000u);
+        p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
+
+        if (!stateInitialized_) {
+            p = PushStaticState(p, screenW, screenH, activeTexPhys, activeTexH, activeVbPhys);
+            stateInitialized_ = true;
+            filterInitialized_ = false;
+        } else {
+            p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, activeTexPhys);
+            p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT, (kAtlasW << 16) | activeTexH);
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, activeVbPhys + 0u);
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, activeVbPhys + 12u);
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 9 * 4, activeVbPhys + 4u);
+        }
+        if (!filterInitialized_ || bilinear != cachedBilinear_) {
+            const uint32_t filterMode = bilinear ? 2u : 1u;
+            p = pb_push1(p, NV097_SET_TEXTURE_FILTER, (filterMode << 16) | (filterMode << 24));
+            cachedBilinear_ = bilinear;
+            filterInitialized_ = true;
+        }
+        pb_end(p);
+        frameHeaderPushed_ = true;
+    }
+
+    // Safety net: if a single extreme frame ever fills the 1024x2048 atlas or 2048-quad VB,
+    // submit queued quads and wait for PGRAPH completion before recycling shelf (0, 0).
+    void FlushMidFrameAndResetShelf() {
+        _mm_sfence();
+        if (!frameHeaderPushed_) {
+            PushFrameHeader(curScreenW_, curScreenH_, curBilinear_);
+        }
+        SubmitDraws();
+        while (pb_busy()) {
+        }
+        batches_.clear();
+        vbCount_ = 0;
+        shelfX_ = 0;
+        shelfY_ = 0;
+        shelfRowH_ = 0;
+        InvalidateRectHash();
+        atlasPhase_ = (atlasPhase_ + 1u) & 3u;
+        atlasVBias_ = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
+        const uint32_t activeTexPhys =
+            atlasPhysBase_ + atlasPhase_ * static_cast<uint32_t>(kAtlasW * sizeof(uint16_t));
+        const uint32_t activeTexH = static_cast<uint32_t>(kAtlasAllocH) - atlasPhase_;
+        uint32_t *p = pb_begin();
+        p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, activeTexPhys);
+        p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT, (kAtlasW << 16) | activeTexH);
+        pb_end(p);
+    }
+
+    static inline uint8_t Mul5(uint8_t x, uint8_t y) {
+        const unsigned v = (static_cast<unsigned>(x) * static_cast<unsigned>(y)) / 31u;
+        return static_cast<uint8_t>(v > 31u ? 31u : v);
+    }
+    static inline uint8_t SrcBlendTerm(int sm, uint8_t s, uint8_t d, uint8_t alpha) {
+        switch (sm & 7) {
+            case 0: return Mul5(s, alpha);
+            case 1: return Mul5(s, s);
+            case 2: return Mul5(s, d);
+            case 4: return Mul5(s, alpha ^ 31u);
+            case 5: return Mul5(s, s ^ 31u);
+            case 6: return Mul5(s, d ^ 31u);
+            default: return s;
+        }
+    }
+    static inline uint8_t DstBlendTerm(int dm, uint8_t s, uint8_t d, uint8_t alpha) {
+        switch (dm & 7) {
+            case 0: return Mul5(d, alpha);
+            case 1: return Mul5(d, s);
+            case 2: return Mul5(d, d);
+            case 4: return Mul5(d, alpha ^ 31u);
+            case 5: return Mul5(d, s ^ 31u);
+            case 6: return Mul5(d, d ^ 31u);
+            default: return d;
+        }
+    }
+
+    // Executes off-screen VRAM-to-VRAM tilemap/sprite-map composite blits (e.g. Mushihimesama's x=7456..8191
+    // background scroll ring buffer) directly in the sparse 128x128 A1R5G5B5 page pool!
+    void BlitVramToVram(const spelunk::NativeDraw &d) {
+        const int w = d.x1 - d.x0 + 1;
+        const int h = d.y1 - d.y0 + 1;
+        if (w <= 0 || h <= 0) return;
+
+        const bool flipX = (d.flags & spelunk::NativeDraw::kFlipX) != 0;
+        const bool flipY = (d.flags & spelunk::NativeDraw::kFlipY) != 0;
+        const bool trans = (d.flags & spelunk::NativeDraw::kTransparent) != 0;
+        const bool tinted = (d.flags & spelunk::NativeDraw::kTinted) != 0;
+        const int mode = d.flags & 0x7F; // 0..63 blend, 64 = no blend
+        const bool blendOn = (mode < 64);
+
+        const uint8_t sAlpha = static_cast<uint8_t>(d.colours & 0x1F);
+        const uint8_t dAlpha = static_cast<uint8_t>((d.colours >> 5) & 0x1F);
+        const uint8_t tr = static_cast<uint8_t>((d.colours >> 10) & 0x3F);
+        const uint8_t tg = static_cast<uint8_t>((d.colours >> 16) & 0x3F);
+        const uint8_t tb = static_cast<uint8_t>((d.colours >> 22) & 0x3F);
+
+        // Read source rect first into a stack/scratch buffer so overlapping VRAM-to-VRAM blits never alias.
+        if (static_cast<size_t>(w) * static_cast<size_t>(h) > vramBlitScratch_.size()) {
+            vramBlitScratch_.resize(static_cast<size_t>(w) * static_cast<size_t>(h));
+        }
+        for (int ry = 0; ry < h; ++ry) {
+            const int dy = d.y0 + ry;
+            const int sy = (flipY ? (d.sy - dy) : (d.sy + dy)) & (kVramH - 1);
+            const int spy = sy >> kPageShift;
+            const int sly = sy & kPageMask;
+            uint16_t *rowBuf = vramBlitScratch_.data() + static_cast<size_t>(ry) * w;
+            if (!flipX) {
+                int col = 0;
+                while (col < w) {
+                    const int sx = (d.sx + d.x0 + col) & (kVramW - 1);
+                    const int spx = sx >> kPageShift;
+                    const int slx = sx & kPageMask;
+                    const int span = std::min(w - col, kPageSize - slx);
+                    const uint16_t *spg = GetPageRead(spx, spy);
+                    if (spg) {
+                        std::memcpy(rowBuf + col, spg + static_cast<size_t>(sly) * kPageSize + slx,
+                                    static_cast<size_t>(span) * sizeof(uint16_t));
+                    } else {
+                        std::memset(rowBuf + col, 0, static_cast<size_t>(span) * sizeof(uint16_t));
+                    }
+                    col += span;
+                }
+            } else {
+                for (int rx = 0; rx < w; ++rx) {
+                    const int sx = (d.sx - (d.x0 + rx)) & (kVramW - 1);
+                    const uint16_t *spg = GetPageRead(sx >> kPageShift, spy);
+                    rowBuf[rx] = spg ? spg[static_cast<size_t>(sly) * kPageSize + (sx & kPageMask)] : 0u;
+                }
+            }
+        }
+
+        // Write composited pixels into destination VRAM pages.
+        for (int ry = 0; ry < h; ++ry) {
+            const int vy = (d.y0 + ry) & (kVramH - 1);
+            const int dpy = vy >> kPageShift;
+            const int dly = vy & kPageMask;
+            const uint16_t *srcRow = vramBlitScratch_.data() + static_cast<size_t>(ry) * w;
+
+            if (!trans && !tinted && !blendOn) {
+                int col = 0;
+                while (col < w) {
+                    const int vx = (d.x0 + col) & (kVramW - 1);
+                    const int dpx = vx >> kPageShift;
+                    const int dlx = vx & kPageMask;
+                    const int span = std::min(w - col, kPageSize - dlx);
+                    uint16_t *dpg = GetPageWrite(dpx, dpy);
+                    std::memcpy(dpg + static_cast<size_t>(dly) * kPageSize + dlx, srcRow + col,
+                                static_cast<size_t>(span) * sizeof(uint16_t));
+                    col += span;
+                }
+                continue;
+            }
+
+            int col = 0;
+            while (col < w) {
+                const int vx0 = (d.x0 + col) & (kVramW - 1);
+                const int dpx = vx0 >> kPageShift;
+                const int dlx0 = vx0 & kPageMask;
+                const int span = std::min(w - col, kPageSize - dlx0);
+                uint16_t *dpg = GetPageWrite(dpx, dpy);
+                uint16_t *dstPtr = dpg + static_cast<size_t>(dly) * kPageSize + dlx0;
+                for (int i = 0; i < span; ++i) {
+                    const uint16_t pen = srcRow[col + i];
+                    if (trans && !(pen & 0x8000u)) {
+                        continue;
+                    }
+                    if (!tinted && !blendOn) {
+                        dstPtr[i] = pen;
+                        continue;
+                    }
+                    uint8_t r = (pen >> 10) & 0x1Fu;
+                    uint8_t g = (pen >> 5) & 0x1Fu;
+                    uint8_t b = pen & 0x1Fu;
+                    if (tinted) {
+                        r = Mul5(r, tr);
+                        g = Mul5(g, tg);
+                        b = Mul5(b, tb);
+                    }
+                    if (blendOn) {
+                        const uint16_t under = dstPtr[i];
+                        const uint8_t dr = (under >> 10) & 0x1Fu;
+                        const uint8_t dg = (under >> 5) & 0x1Fu;
+                        const uint8_t db = under & 0x1Fu;
+                        const int sm = mode & 7;
+                        const int dm = (mode >> 3) & 7;
+                        r = std::min<uint8_t>(31u, SrcBlendTerm(sm, r, dr, sAlpha) + DstBlendTerm(dm, r, dr, dAlpha));
+                        g = std::min<uint8_t>(31u, SrcBlendTerm(sm, g, dg, sAlpha) + DstBlendTerm(dm, g, dg, dAlpha));
+                        b = std::min<uint8_t>(31u, SrcBlendTerm(sm, b, db, sAlpha) + DstBlendTerm(dm, b, db, dAlpha));
+                    }
+                    dstPtr[i] = static_cast<uint16_t>((pen & 0x8000u) | (r << 10) | (g << 5) | b);
+                }
+                col += span;
+            }
+        }
+        InvalidateRectHash();
     }
 
     void OpenSwapFile() {
@@ -501,20 +679,28 @@ private:
         }
     }
 
-    bool ProcessDraw(const spelunk::NativeDraw &d, int scrX, int scrY) {
+    void ProcessDraw(const spelunk::NativeDraw &d, int scrX, int scrY, int dispX, int dispY, bool bilinear) {
         const int w = d.x1 - d.x0 + 1;
         const int h = d.y1 - d.y0 + 1;
         if (w <= 0 || h <= 0) {
-            return false;
+            return;
         }
 
-        // Convert VRAM destination rect to screen-relative coordinates (320x240 window at scrollX, scrollY).
+        // Convert VRAM destination rect to screen-relative coordinates (320x240 active buffer at clipX, clipY).
         const int dx0 = d.x0 - scrX;
         const int dy0 = d.y0 - scrY;
         const int dx1 = dx0 + w;
         const int dy1 = dy0 + h;
         if (dx1 <= 0 || dx0 >= kSrcWidth || dy1 <= 0 || dy0 >= kSrcHeight) {
-            return false;
+            // If this draw targets an off-screen VRAM cache (outside both +/-32px screen margins, e.g. x=7456..8191
+            // background tilemap ring buffer), composite it into sparse VRAM pages so later screen draws see fresh tiles!
+            const bool nearActive = !(dx1 <= -32 || dx0 >= kSrcWidth + 32 || dy1 <= -32 || dy0 >= kSrcHeight + 32);
+            const int sdx0 = d.x0 - dispX, sdy0 = d.y0 - dispY;
+            const bool nearDisplay = !(sdx0 + w <= -32 || sdx0 >= kSrcWidth + 32 || sdy0 + h <= -32 || sdy0 >= kSrcHeight + 32);
+            if (!nearActive && !nearDisplay) {
+                BlitVramToVram(d);
+            }
+            return;
         }
 
         const bool flipX = (d.flags & spelunk::NativeDraw::kFlipX) != 0;
@@ -523,18 +709,18 @@ private:
         const int srcY0 = flipY ? (d.sy - d.y1) : (d.sy + d.y0);
 
         if (w > kAtlasW || h > kAtlasH) {
-            return false;
+            return;
         }
 
-        // O(1) persistent multi-frame rect dedup in 2 MB A1R5G5B5 atlas.
-        const uint64_t key = (static_cast<uint64_t>(w & 0x3FF) << 44) |
-                             (static_cast<uint64_t>(h & 0x3FF) << 34) |
-                             (static_cast<uint64_t>(srcX0 & 0x1FFF) << 16) |
-                             static_cast<uint64_t>(srcY0 & 0x0FFF);
+        // Collision-free 64-bit rect key: 12b w (0..4095) | 12b h (0..4095) | 13b srcX0 (0..8191) | 12b srcY0 (0..4095).
+        const uint64_t key = (static_cast<uint64_t>(w & 0xFFFu) << 40) |
+                             (static_cast<uint64_t>(h & 0xFFFu) << 28) |
+                             (static_cast<uint64_t>(srcX0 & 0x1FFFu) << 13) |
+                             static_cast<uint64_t>(srcY0 & 0x0FFFu);
         const uint32_t hBase = Mix64(key) & kRectHashMask;
         RectHashSlot *slot = nullptr;
         bool hit = false;
-        for (uint32_t pr = 0; pr < 64; ++pr) {
+        for (uint32_t pr = 0; pr < 128; ++pr) {
             RectHashSlot &cand = rectHash_[(hBase + pr) & kRectHashMask];
             if (cand.epoch != rectEpoch_) {
                 slot = &cand;
@@ -547,33 +733,45 @@ private:
             }
         }
         if (!slot) {
-            ResetAtlasCache();
+            // Hash probe full: bump ONLY the hash epoch (do NOT reset shelfX_/shelfY_ on top of queued quads!).
+            InvalidateRectHash();
             slot = &rectHash_[hBase];
         }
-        bool copiedToAtlas = false;
         if (!hit) {
-            if (shelfX_ + w > kAtlasW) {
+            const int padW = std::min(kAtlasW, w + 1); // 1px gutter prevents adjacent shelf UV bleed
+            const int padH = std::min(kAtlasH, h + 1);
+            if (shelfX_ + padW > kAtlasW) {
                 shelfX_ = 0;
                 shelfY_ += shelfRowH_;
                 shelfRowH_ = 0;
             }
-            if (shelfY_ + h > kAtlasH) {
-                // Shelf full across frames: reset persistent cache cleanly and place at (0, 0).
-                ResetAtlasCache();
+            if (shelfY_ + padH > kAtlasH) {
+                // Flush queued quads to GPU and wait before recycling shelf (0, 0) — zero mid-frame overwrites!
+                FlushMidFrameAndResetShelf();
                 slot = &rectHash_[hBase];
             }
             const int dstX = shelfX_;
             const int dstY = shelfY_;
-            shelfX_ += w;
-            if (h > shelfRowH_) {
-                shelfRowH_ = h;
+            shelfX_ += padW;
+            if (padH > shelfRowH_) {
+                shelfRowH_ = padH;
             }
             CopyVramRectToAtlas(srcX0, srcY0, w, h, dstX, dstY);
+            // Zero the 1px right/bottom gutter texels to prevent bilinear edge bleed into neighbor sprites.
+            if (dstX + w < kAtlasW) {
+                uint16_t *gPtr = atlas_ + static_cast<size_t>(dstY) * kAtlasW + (dstX + w);
+                for (int r = 0; r < h; ++r, gPtr += kAtlasW) {
+                    *gPtr = 0u;
+                }
+            }
+            if (dstY + h < kAtlasH) {
+                std::memset(atlas_ + static_cast<size_t>(dstY + h) * kAtlasW + dstX, 0,
+                            static_cast<size_t>(padW) * sizeof(uint16_t));
+            }
             slot->key = key;
             slot->u0 = static_cast<uint16_t>(dstX);
             slot->v0 = static_cast<uint16_t>(dstY);
             slot->epoch = rectEpoch_;
-            copiedToAtlas = true;
         }
 
         // Compute tint & blend state for NV2A Stage-0 SHIFTLEFTBY1 (2x overdrive) Register Combiner:
@@ -617,16 +815,16 @@ private:
         }
 
         if (vbCount_ + 4u > kMaxVertsPerFrame) {
-            return copiedToAtlas;
+            FlushMidFrameAndResetShelf();
         }
 
         // Emit compact 16-byte integer-position quad directly into write-combined NV2A hardware vertex buffer.
-        // NV2A hardware NV097_SET_COMPOSITE_MATRIX performs YOKO 90 deg CCW / TATE transform & viewport scaling!
-        constexpr float kUvEps = 0.001f;
-        const float uMin = static_cast<float>(slot->u0) + kUvEps;
-        const float uMax = static_cast<float>(slot->u0 + w) - kUvEps;
-        const float vMin = static_cast<float>(slot->v0) + atlasVBias_ + kUvEps;
-        const float vMax = static_cast<float>(slot->v0 + h) + atlasVBias_ - kUvEps;
+        // Sub-texel inset >= 1/64 texel (0.02f nearest, 0.25f bilinear) prevents NV2A fixed-point UV rounding bleed!
+        const float uvEps = bilinear ? 0.25f : 0.02f;
+        const float uMin = static_cast<float>(slot->u0) + uvEps;
+        const float uMax = static_cast<float>(slot->u0 + w) - uvEps;
+        const float vMin = static_cast<float>(slot->v0) + atlasVBias_ + uvEps;
+        const float vMax = static_cast<float>(slot->v0 + h) + atlasVBias_ - uvEps;
         const float fu0 = flipX ? uMax : uMin;
         const float fu1 = flipX ? uMin : uMax;
         const float fv0 = flipY ? vMax : vMin;
@@ -650,12 +848,11 @@ private:
                 (!bOn || (b.sFactor == sFactor && b.dFactor == dFactor && b.blendColor == blendColor))) {
                 b.vertexCount += 4u;
                 vbCount_ += 4u;
-                return copiedToAtlas;
+                return;
             }
         }
         batches_.push_back({vbCount_, 4u, blendColor, sFactor, dFactor, bOn, aTest});
         vbCount_ += 4u;
-        return copiedToAtlas;
     }
 
     // Direct NV097_DRAW_ARRAYS hardware DMA submission: ~2 DWORDs per 64 quads instead of 28 DWORDs/quad!
@@ -901,6 +1098,7 @@ private:
 
     std::vector<RectHashSlot> rectHash_;
     std::vector<DrawBatch> batches_;
+    std::vector<uint16_t> vramBlitScratch_;
     uint16_t rectEpoch_ = 1;
     int shelfX_ = 0, shelfY_ = 0, shelfRowH_ = 0;
     int maxAllocPages_ = kRetailMaxAllocPages;
@@ -910,6 +1108,9 @@ private:
     size_t lastDrawCount_ = 0;
 
     float scrScaleX_ = 0.0f, scrOffsetX_ = 0.0f, scrScaleY_ = 0.0f, scrOffsetY_ = 0.0f;
+    float curScreenW_ = 640.0f, curScreenH_ = 480.0f;
+    bool curBilinear_ = false;
+    bool frameHeaderPushed_ = false;
     int clipX0_ = 140, clipY0_ = 0, clipX1_ = 500, clipY1_ = 480;
     float cachedScreenW_ = 0.0f, cachedScreenH_ = 0.0f;
     bool stateInitialized_ = false;
