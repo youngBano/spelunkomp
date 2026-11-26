@@ -27,7 +27,11 @@ public:
     static constexpr int kSrcHeight = spelunk::CaveVideo::kHeight; // 240
     static constexpr int kAtlasW = 1024;
     static constexpr int kAtlasH = 1024;
-    static constexpr size_t kAtlasBytes = static_cast<size_t>(kAtlasW) * kAtlasH * sizeof(uint32_t); // 4 MB
+    // +1 extra top guard row (4 KB): alternating NV097_SET_TEXTURE_OFFSET between +0 (vBias=+1)
+    // and +4096 (vBias=0) guarantees NV097_SET_TEXTURE_OFFSET changes value every frame, forcing
+    // both real NV2A hardware and Xemu's texture cache to re-fetch modified atlas texels.
+    static constexpr int kAtlasAllocH = kAtlasH + 1;
+    static constexpr size_t kAtlasBytes = static_cast<size_t>(kAtlasW) * kAtlasAllocH * sizeof(uint32_t); // 4 MB + 4 KB
 
     // Top half (1024x512): 128x64 = 8,192 cached 8x8 tile slots.
     // Each slot is a single packed uint64_t (8 bytes): bit 63 = empty, bits 62..0 = key -> 64 KB total (half of L2).
@@ -45,13 +49,16 @@ public:
     static constexpr int kMaxQuadsPerBatch = 256;
 
     bool Init() {
-        atlas_ = static_cast<uint32_t *>(
+        atlasAlloc_ = static_cast<uint32_t *>(
             MmAllocateContiguousMemoryEx(kAtlasBytes, 0, 0x3ffb000, 0, PAGE_READWRITE | PAGE_WRITECOMBINE));
-        if (!atlas_) {
+        if (!atlasAlloc_) {
             return false;
         }
-        std::memset(atlas_, 0, kAtlasBytes);
-        atlasPhys_ = static_cast<uint32_t>(MmGetPhysicalAddress(atlas_));
+        std::memset(atlasAlloc_, 0, kAtlasBytes);
+        atlas_ = atlasAlloc_ + kAtlasW; // Logical row 0 starts at physical row 1 (+4096 bytes)
+        atlasPhys0_ = static_cast<uint32_t>(MmGetPhysicalAddress(atlasAlloc_));
+        atlasPhys1_ = atlasPhys0_ + static_cast<uint32_t>(kAtlasW * sizeof(uint32_t));
+        atlasPhase_ = 0;
 
         tileCache_.assign(kTileSlots, 0ULL);
         tileFrame_.assign(kTileSlots, 0u);
@@ -78,10 +85,12 @@ public:
     }
 
     void Shutdown() {
-        if (atlas_) {
-            MmFreeContiguousMemory(atlas_);
+        if (atlasAlloc_) {
+            MmFreeContiguousMemory(atlasAlloc_);
+            atlasAlloc_ = nullptr;
             atlas_ = nullptr;
-            atlasPhys_ = 0;
+            atlasPhys0_ = 0;
+            atlasPhys1_ = 0;
         }
         tileCache_.clear();
         tileFrame_.clear();
@@ -123,7 +132,9 @@ public:
         const uint32_t bgArgb = (bgAbgr & 0xFF00FF00u) | ((bgAbgr & 0xFFu) << 16) | ((bgAbgr >> 16) & 0xFFu);
         pb_fill(clipX0_, clipY0_, clipX1_ - clipX0_, clipY1_ - clipY0_, bgArgb);
 
-        // 3. Reset priority buckets & O(1) sprite cache epoch (zero memset, zero heap allocs).
+        // 3. Reset priority buckets, O(1) sprite cache epoch, and toggle 4 KB texture offset phase.
+        atlasPhase_ ^= 1u;
+        atlasVBias_ = (atlasPhase_ == 0u) ? 1.0f : 0.0f;
         for (int p = 0; p < 4; ++p) {
             spriteQuads_[p].clear();
             tileQuads_[p].clear();
@@ -180,12 +191,19 @@ public:
         // 6. Flush write-combined VRAM atlas writes before NV2A DMA read.
         _mm_sfence();
 
-        // 7. Push invariant NV2A state once + filter on change.
+        // 7. Push invariant NV2A state once, and alternate NV097_SET_TEXTURE_OFFSET every frame
+        //    (atlasPhys0_ <-> atlasPhys1_) after _mm_sfence() so NV2A hardware & Xemu ALWAYS
+        //    invalidate their texture cache and fetch newly unpacked tile/sprite texels.
+        const uint32_t activeTexPhys = (atlasPhase_ == 0u) ? atlasPhys0_ : atlasPhys1_;
+        const uint32_t activeTexH = (atlasPhase_ == 0u) ? kAtlasAllocH : kAtlasH;
         uint32_t *p = pb_begin();
         if (!stateInitialized_) {
-            p = PushStaticState(p, screenW, screenH);
+            p = PushStaticState(p, screenW, screenH, activeTexPhys, activeTexH);
             stateInitialized_ = true;
             filterInitialized_ = false;
+        } else {
+            p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, activeTexPhys);
+            p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT, (kAtlasW << 16) | activeTexH);
         }
         if (!filterInitialized_ || bilinear != cachedBilinear_) {
             const uint32_t filterMode = bilinear ? 2u : 1u;
@@ -232,6 +250,15 @@ private:
 
     static inline uint16_t ReadWordBE(const std::vector<uint8_t> &mem, uint32_t at) {
         return static_cast<uint16_t>((mem[at] << 8) | mem[at + 1]);
+    }
+
+    static inline uint32_t Mix64(uint64_t k) {
+        uint32_t h = static_cast<uint32_t>(k) ^ static_cast<uint32_t>(k >> 32);
+        h ^= h >> 16;
+        h *= 0x7FEB352Du;
+        h ^= h >> 15;
+        h *= 0x846CA68Bu;
+        return h ^ (h >> 16);
     }
 
     void ComputeViewport(float screenW, float screenH, bool tateMode, bool integerScale) {
@@ -387,10 +414,10 @@ private:
                                  static_cast<uint64_t>(codeMasked);
 
             // O(1) open-addressed hash lookup (epoch-tagged, 2 slots per 32-byte cache line).
-            uint32_t idx = static_cast<uint32_t>((key ^ (key >> 17) ^ (key >> 33)) & kSpriteHashMask);
+            uint32_t idx = Mix64(key) & kSpriteHashMask;
             SpriteHashSlot *slot = nullptr;
             bool hit = false;
-            for (uint32_t probe = 0; probe < 64; ++probe) {
+            for (uint32_t probe = 0; probe < 128; ++probe) {
                 SpriteHashSlot &cand = spriteHash_[(idx + probe) & kSpriteHashMask];
                 if (cand.epoch != spriteEpoch_) {
                     slot = &cand;
@@ -440,10 +467,16 @@ private:
             if (slot->empty) {
                 continue;
             }
-            const float u0 = flipX ? static_cast<float>(slot->u0 + s.width) : static_cast<float>(slot->u0);
-            const float u1 = flipX ? static_cast<float>(slot->u0) : static_cast<float>(slot->u0 + s.width);
-            const float v0 = flipY ? static_cast<float>(slot->v0 + s.height) : static_cast<float>(slot->v0);
-            const float v1 = flipY ? static_cast<float>(slot->v0) : static_cast<float>(slot->v0 + s.height);
+            // Inset UVs by 0.001 texel so flipped/scaled quads never sample a neighboring sprite in the atlas.
+            constexpr float kUvEps = 0.001f;
+            const float uMin = static_cast<float>(slot->u0) + kUvEps;
+            const float uMax = static_cast<float>(slot->u0 + s.width) - kUvEps;
+            const float vMin = static_cast<float>(slot->v0) + atlasVBias_ + kUvEps;
+            const float vMax = static_cast<float>(slot->v0 + s.height) + atlasVBias_ - kUvEps;
+            const float u0 = flipX ? uMax : uMin;
+            const float u1 = flipX ? uMin : uMax;
+            const float v0 = flipY ? vMax : vMin;
+            const float v1 = flipY ? vMin : vMax;
             PushArcadeQuad(spriteQuads_[spPrio], x0, y0, x1, y1, u0, v0, u1, v1);
         }
     }
@@ -509,14 +542,14 @@ private:
                 const uint32_t colourIdx = (tileWord >> 24) & kind.colourMask;
                 const uint64_t key = layerEpochPrefix | (static_cast<uint64_t>(colourIdx) << 20) | tileIdx;
 
-                // Frame-pinned open-addressed tile cache: never evicts a tile already emitted this frame,
-                // eliminating same-frame hash collisions that previously overwrote atlas tiles before GPU draw.
-                const uint32_t baseSlot = static_cast<uint32_t>((key ^ (key >> 13) ^ (key >> 27)) & kTileMask);
+                // Frame-pinned open-addressed tile cache with Mix64 avalanche hash (0 drops, <=7 probes):
+                // never evicts a tile already emitted this frame.
+                const uint32_t baseSlot = Mix64(key) & kTileMask;
                 uint32_t slotIdx = baseSlot;
                 uint32_t freeSlot = UINT32_MAX;
                 bool hit = false;
                 uint64_t entry = 0;
-                for (uint32_t probe = 0; probe < 32; ++probe) {
+                for (uint32_t probe = 0; probe < 256; ++probe) {
                     const uint32_t cand = (baseSlot + probe) & kTileMask;
                     const uint64_t e = tileCache_[cand];
                     if ((e & kTileKeyMask) == key) {
@@ -552,10 +585,17 @@ private:
 
                 const int slotX = static_cast<int>(slotIdx & (kTileCols - 1)) * 8;
                 const int slotY = static_cast<int>(slotIdx >> 7) * 8;
-                const float u0 = flipX ? static_cast<float>(slotX + 8) : static_cast<float>(slotX);
-                const float u1 = flipX ? static_cast<float>(slotX) : static_cast<float>(slotX + 8);
-                const float v0 = flipY ? static_cast<float>(slotY + 8) : static_cast<float>(slotY);
-                const float v1 = flipY ? static_cast<float>(slotY) : static_cast<float>(slotY + 8);
+                // Inset UVs by 0.001 texel so flipped tiles (flipX/flipY = true in ddonpach) never bleed
+                // across the 8x8 boundary into slotIdx+1 / slotIdx+128 in the atlas.
+                constexpr float kUvEps = 0.001f;
+                const float uMin = static_cast<float>(slotX) + kUvEps;
+                const float uMax = static_cast<float>(slotX + 8) - kUvEps;
+                const float vMin = static_cast<float>(slotY) + atlasVBias_ + kUvEps;
+                const float vMax = static_cast<float>(slotY + 8) + atlasVBias_ - kUvEps;
+                const float u0 = flipX ? uMax : uMin;
+                const float u1 = flipX ? uMin : uMax;
+                const float v0 = flipY ? vMax : vMin;
+                const float v1 = flipY ? vMin : vMax;
                 PushArcadeQuad(tileQuads_[tilePrio],
                                static_cast<float>(screenX), static_cast<float>(screenY),
                                static_cast<float>(screenX + 8), static_cast<float>(screenY + 8),
@@ -584,7 +624,8 @@ private:
         }
     }
 
-    uint32_t *PushStaticState(uint32_t *p, float screenW, float screenH) const {
+    uint32_t *PushStaticState(uint32_t *p, float screenW, float screenH,
+                              uint32_t texPhys, uint32_t texH) const {
         const uint32_t texFmt =
             1u | (1u << 3) | (2u << 4) |
             (NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8 << 8) | (1u << 16);
@@ -632,12 +673,12 @@ private:
                      kFloatOneBits, kFloatOneBits,
                      kFloatOneBits, kFloatOneBits);
 
-        p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, atlasPhys_);
+        p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, texPhys);
         p = pb_push1(p, NV097_SET_TEXTURE_FORMAT, texFmt);
         p = pb_push1(p, NV097_SET_TEXTURE_ADDRESS, texAddr);
         p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0, NV097_SET_TEXTURE_CONTROL0_ENABLE | (0xFFFu << 6));
         p = pb_push1(p, NV097_SET_TEXTURE_CONTROL1, (kAtlasW * 4u) << 16);
-        p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT, (kAtlasW << 16) | kAtlasH);
+        p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT, (kAtlasW << 16) | texH);
         for (uint32_t stage = 1; stage < 4; ++stage) {
             p = pb_push1(p, NV097_SET_TEXTURE_CONTROL0 + stage * 0x40u, 0);
         }
@@ -653,8 +694,12 @@ private:
         return p;
     }
 
+    uint32_t *atlasAlloc_ = nullptr;
     uint32_t *atlas_ = nullptr;
-    uint32_t atlasPhys_ = 0;
+    uint32_t atlasPhys0_ = 0;
+    uint32_t atlasPhys1_ = 0;
+    uint32_t atlasPhase_ = 0;
+    float atlasVBias_ = 0.0f;
 
     std::vector<uint64_t> tileCache_;
     std::vector<uint16_t> tileFrame_;

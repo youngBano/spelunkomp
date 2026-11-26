@@ -313,32 +313,31 @@ int main(void) {
         }
         prevR3 = pad.r3;
 
-        uint32_t p1 = 0;
-        uint32_t sys = 0;
-        if (fakePlay.enabled) {
-            fakePlay.Update(board, p1, sys);
-        } else {
-            if (pad.up) p1 |= spelunk::kInUp;
-            if (pad.down) p1 |= spelunk::kInDown;
-            if (pad.left) p1 |= spelunk::kInLeft;
-            if (pad.right) p1 |= spelunk::kInRight;
-            if (pad.a) p1 |= spelunk::kInButton1;
-            if (pad.b) p1 |= spelunk::kInButton2;
-            if (pad.x) p1 |= spelunk::kInButton3;
-            if (pad.y) p1 |= spelunk::kInButton4;
-            if (pad.back) sys |= spelunk::kSysCoin1;
-            if (pad.start) sys |= spelunk::kSysStart1;
-        }
-
-        board.inputs[0] = p1;
-        board.system = sys;
-
         // Overlap 68000 CPU emulation of frame N with NV2A GPU rasterization of frame N-1.
         // Pace Cave 68000 execution to exact 57.44485 Hz arcade timing via Xbox MCPX hardware timer.
         uint64_t cpuTicks = 0;
         bool stepped = false;
         uint32_t prevPictures = board.pictures;
         if (timer.ConsumeArcadeFrame()) {
+            uint32_t p1 = 0;
+            uint32_t sys = 0;
+            if (fakePlay.enabled) {
+                fakePlay.Update(board, p1, sys);
+            } else {
+                if (pad.up) p1 |= spelunk::kInUp;
+                if (pad.down) p1 |= spelunk::kInDown;
+                if (pad.left) p1 |= spelunk::kInLeft;
+                if (pad.right) p1 |= spelunk::kInRight;
+                if (pad.a) p1 |= spelunk::kInButton1;
+                if (pad.b) p1 |= spelunk::kInButton2;
+                if (pad.x) p1 |= spelunk::kInButton3;
+                if (pad.y) p1 |= spelunk::kInButton4;
+                if (pad.back) sys |= spelunk::kSysCoin1;
+                if (pad.start) sys |= spelunk::kSysStart1;
+            }
+            board.inputs[0] = p1;
+            board.system = sys;
+
             const uint64_t tCpu0 = spelunk_xbox::XboxTimer::NowTicks();
             board.RunFrame();
             auto &pcm = board.SoundOut();
