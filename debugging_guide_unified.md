@@ -43,7 +43,7 @@ Set environment variables as needed (`NXDK_DIR`, `XEMU_BIN`, `MSYS2_BIN`).
 - [x] Verify `ddonpach/` ROM files are packaged inside `spelunkomp-cave68k-core.iso`.
 - [x] `board.SetBoard("ddonpach")` and `LoadDdonpachRoms(board)` (`D:\ddonpach\` via `ReadFileBytes`) succeed (verified via GDB backtrace + live `frameNum` progression in Xemu).
 - [x] `pb_init()` and `presenter.Init()` succeed without hanging.
-- [ ] Main loop sustains 60 Hz via `pb_wait_for_vbl()` with no freeze, crash, or pushbuffer stall (`pb_busy()` / `pb_finished()`) *(no freeze/crash/stall through frame 313+; currently ~8 FPS in unoptimized `-O0` interpreter build — add `-O2` to `Makefile`)*.
+- [x] Main loop sustains **locked 60.0 Hz** via `pb_wait_for_vbl()` with no freeze, crash, or pushbuffer stall (`frameNum` at `0x626058` verified `742 -> 862` = 120 frames in 2.0s in Xemu with native statically-recompiled 68k blocks and zero SDL2).
 
 ### 2. NV2A Textured-Quad Presentation (`nv2a_presenter.h`)
 - [ ] Serial framebuffer flush (`FB frame=... nonBlack=... hash=0x...` + 32x12 ASCII luminance preview) confirms non-black, changing frames in `xemu_com1.log` without relying on screenshots *(COM1 silent under retail BIOS; verified directly via live NV2A VRAM dump to `xemu_screen.png`)*.
@@ -54,16 +54,16 @@ Set environment variables as needed (`NXDK_DIR`, `XEMU_BIN`, `MSYS2_BIN`).
 - [ ] **LB** toggles **Nearest / Bilinear** filtering (`NV097_SET_TEXTURE_FILTER`).
 - [ ] **L3** toggles **Aspect-Fill / Integer Scaling** (`240x320` in YOKO, `640x480` 2x in TATE).
 
-### 3. SDL 2 Controller Input (`main.cpp`)
-- [ ] Hotplug / initial open detects controller (`SDL_INIT_GAMECONTROLLER`).
+### 3. Native Xbox USB XID Controller Input (`xbox_input.h`, zero SDL2)
+- [ ] Hotplug / initial open detects controller (`usbh_core_init` + `usbh_xid_init`).
 - [ ] **Back** inserts coin (`kSysCoin1`), **Start** starts P1 (`kSysStart1`).
 - [ ] **D-pad / Left Stick** (`+/-8000` deadzone) moves ship in all 8 directions.
-- [ ] **A / B / X / Y** map to `kInButton1..4` (shot, bomb, etc.).
+- [ ] **A / B / X / Y** map to `kInButton1..4` (shot, bomb, etc.), **Black (RB)** / **White (LB)** / **L3** toggle TATE / Bilinear / Integer scale.
 
-### 4. SDL 2 PCM Audio (`main.cpp`)
-- [ ] `SDL_OpenAudioDevice` opens at 44,100 Hz, `AUDIO_S16LSB`, mono (`samples = 1024`).
+### 4. Native Xbox AC'97 `XAudio` PCM Audio (`xbox_audio.h`, zero SDL2)
+- [x] `XAudioInit(16, 2, ...)` + `XAudioPlay()` initialize cleanly on Xemu with zero hangs/crashes (integer 16.16 fixed-point 44.1 kHz mono → 48 kHz stereo resampler in DPC, FPU/SSE-safe).
 - [ ] Audio is audible with accurate pitch and no distortion/crackling.
-- [ ] Queue cap (`44100 * sizeof(int16_t) / 4`, 250 ms) prevents latency drift and `pcm.clear()` prevents RAM growth.
+- [x] Lock-free SPSC ring buffer with 250 ms cap (`kMaxQueued = 11025`) prevents latency drift and `pcm.clear()` prevents RAM growth.
 
 ## Ranked Hypotheses (NV2A Textured Quad)
 1. **Unnormalized UVs for Linear (`LU_IMAGE`) Textures:** `NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8B8G8R8` requires pixel-space UVs (`0.0f..320.0f`, `0.0f..240.0f`) in `NV097_SET_TEXCOORD0_2F`, not `0.0f..1.0f`. Normalized UVs sample only the top-left 1x1 pixel (often black). Also verify `NV097_SET_TEXTURE_CONTROL1` (pitch `<< 16`) and `NV097_SET_TEXTURE_IMAGE_RECT` (`(w << 16) | h`).

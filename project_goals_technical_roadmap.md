@@ -48,7 +48,7 @@ Unlike dynamic CPU emulation, static recompilation translates arcade machine cod
 
 ### Phase 1: `nxdk` Build Integration & Headless Boot
 
-**Progress (2026-11-26):** `port/nxdk/core/bin/default.xbe` and `spelunkomp-cave68k-core.iso` compile and link cleanly at `-O2`. Fixed critical `LoadDdonpachRoms()` -> `SetBoard("ddonpach")` ordering bug so program ROM pages map properly. Host core validation (`port/nxdk/tests/core_validation_test.cpp`, 27/27 checks + `wide_math_test.cpp`) passes. Live Xemu + GDB + VRAM dump (`xemu_screen.png`) confirms full boot, upright 90° CCW YOKO rendering of DoDonPachi's `WARNING` screen, accurate `LU_IMAGE_A8B8G8R8` colors, and ~28.5 FPS in interpreter mode. Next: wire static-recompiled 68k blocks for locked 60 Hz pacing and verify interactive controller/audio toggles.
+**Progress (2026-11-26):** Dropped SDL2 completely in favor of native `nxdk` APIs (`xbox_audio.h` AC'97 DMA `XAudio` + `xbox_input.h` USB XID gamepad) and linked all **11,974 statically-recompiled native 68000 blocks** (`M68K::Mode::Native`, `-O3 -march=pentium3 -msse`). Live Xemu + GDB + VRAM dump (`xemu_screen.png`) confirms **locked 60.0 FPS** (`742 → 862` = 120 frames in 2.0s) and crisp upright 90° CCW YOKO rendering of DoDonPachi's full `WARNING` + `©ATLUS/CAVE 1995 1996` screen. Host validation (`core_validation_test.cpp`, 27/27 checks) passes.
 
 - [x] Set up `nxdk` build configuration (`Makefile`) compiling Cave 68000 (`ddonpach`) with Clang C++20 (`-O2`).
 - [x] Stub out `SDL_GPU`, `shaderc`, and desktop file dialogs.
