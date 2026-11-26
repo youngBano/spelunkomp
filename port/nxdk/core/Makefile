@@ -52,7 +52,7 @@ XBOX_ARCH_FLAGS := -O3 -march=pentium3 -mtune=pentium3 -mmmx -msse -mfpmath=sse 
 NXDK_CXXFLAGS += $(XBOX_ARCH_FLAGS) -std=c++20 -DGAME_ddonpach=1 -DHEADLESS_BUILD=1 \
   -I$(CORE_ROOT) -I$(CORE_ROOT)/machine -I$(CORE_ROOT)/runtime -I$(CORE_ROOT)/third_party -I$(GEN_DIR)
 
-$(CURDIR)/main.obj: $(CURDIR)/nv2a_presenter.h $(CURDIR)/xbox_audio.h $(CURDIR)/xbox_input.h
+$(CURDIR)/main.obj: $(CURDIR)/nv2a_cave_renderer.h $(CURDIR)/nv2a_presenter.h $(CURDIR)/xbox_audio.h $(CURDIR)/xbox_input.h $(CURDIR)/xbox_timer.h
 main.exe: $(CORE_OBJS)
 
 $(CORE_OBJ_DIR)/%.obj: $(CORE_ROOT)/%.cpp

@@ -57,7 +57,7 @@ Unlike dynamic CPU emulation, static recompilation translates arcade machine cod
 
 ### Phase 2: Low-Level NV2A Presenter (`pbkit` + `xgu`)
 
-**Progress (2026-11-26):** `spelunk_xbox::Nv2aPresenter` in `port/nxdk/core/nv2a_presenter.h` is **visually verified in Xemu** (`xemu_screen.png`): upright 360×480 YOKO quad centered on 640×480, accurate `LU_IMAGE_A8B8G8R8` colors, `NV097_SET_DEPTH_MASK = 0`, `MAX_LOD_CLAMP = 0xFFF`, stages 1–3 disabled, and stage 0 combiner OCW zeroed.
+**Progress (2026-11-26):** Replaced CPU software rasterization and desktop `gpu.cpp`/`gpu_base.cpp` with [`port/nxdk/core/nv2a_cave_renderer.h`](port/nxdk/core/nv2a_cave_renderer.h) (`board.video.rasterize = false`): renders Cave 68000 sprites and tile layers directly as NV2A hardware `QUADS` primitives from a 4 MB VRAM `1024×1024` `LU_IMAGE_A8B8G8R8` tile-cache + sprite-shelf atlas with hardware alpha-test (`TEX0.a > 0`) and hardware scissor clipping, paced by native Xbox MCPX hardware timers ([`xbox_timer.h`](port/nxdk/core/xbox_timer.h)). Visually verified in Xemu (`xemu_screen.png`, `40,677` lit pixels, 15 colors).
 
 - [x] Implement `pbkit` initialization, framebuffer clearing, and VSync frame presentation.
 - [x] Verify dynamic texture upload (`LU_IMAGE_A8B8G8R8`) and non-black quad rendering in **Xemu** *(verified via `xemu_screen.png`)* .

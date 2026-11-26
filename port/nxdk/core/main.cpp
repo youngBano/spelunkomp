@@ -1,8 +1,11 @@
-// Native Original Xbox runner for the statically-recompiled Cave 68000 core (zero SDL2).
+// Native Original Xbox runner for the statically-recompiled Cave 68000 core:
+// zero SDL2, zero CPU software rasterizer (direct NV2A primitives), native XAudio,
+// native USB XID gamepad, and native Xbox MCPX hardware timer pacing (57.44485 Hz).
 #include "machine/cave68k.h"
-#include "nv2a_presenter.h"
+#include "nv2a_cave_renderer.h"
 #include "xbox_audio.h"
 #include "xbox_input.h"
+#include "xbox_timer.h"
 
 #include <hal/debug.h>
 #include <hal/video.h>
@@ -220,8 +223,11 @@ int main(void) {
     SerialPrintf("Cave 68000 core: ROMs loaded (prog=%uKB sprites=%uKB)\n",
              static_cast<unsigned>(board.program.size() / 1024),
              static_cast<unsigned>(board.video.spritePixels.size() / 1024));
-    // Run native statically-recompiled x86 Pentium III blocks (with automatic interpreter fallback
-    // only for any rare unreached dynamic target).
+    // Run native statically-recompiled x86 Pentium III blocks with native NV2A primitive rendering
+    // (disables CPU software CaveVideo::Draw() rasterizer completely).
+    spelunk::NativeFrame68k nativeFrame;
+    board.video.rasterize = false;
+    board.video.native = &nativeFrame;
     board.mode = spelunk::M68K::Mode::Native;
     board.Reset();
 
@@ -250,13 +256,16 @@ int main(void) {
         debugPrint("Cave 68000 core: XboxAudio init failed\n");
     }
 
-    spelunk_xbox::Nv2aPresenter presenter;
-    if (!presenter.Init()) {
-        debugPrint("Cave 68000 core: NV2A presenter init failed\n");
+    spelunk_xbox::Nv2aCaveRenderer renderer;
+    if (!renderer.Init()) {
+        debugPrint("Cave 68000 core: NV2A Cave renderer init failed\n");
         while (true) {
             Sleep(1000);
         }
     }
+
+    spelunk_xbox::XboxTimer timer;
+    timer.Init();
 
     bool tateMode = false;
     bool bilinear = false;
@@ -302,51 +311,26 @@ int main(void) {
         pb_reset();
         pb_target_back_buffer();
 
-        board.RunFrame();
-        auto &pcm = board.SoundOut();
-        if (!pcm.empty()) {
-            audio.PushMono44k(pcm.data(), pcm.size());
-            pcm.clear();
-        }
-
-        // Stream framebuffer into write-combined NV2A texture without polluting PIII L1/L2 cache
-        // when direct source pointer is available; otherwise copy directly into WC buffer.
-        if constexpr (requires { board.PictureData(); }) {
-            presenter.UploadFrameSSE(board.PictureData());
-        } else {
-            board.Picture(presenter.TexBuffer());
-        }
-
-        static uint32_t frameNum = 0;
-        ++frameNum;
-#ifdef XBOX_DEBUG_FB_DUMP
-        if (frameNum == 1 || frameNum == 10 || (frameNum % 60) == 0) {
-            const uint32_t *fb = presenter.TexBuffer();
-            const int w = spelunk_xbox::Nv2aPresenter::kSrcWidth;
-            const int h = spelunk_xbox::Nv2aPresenter::kSrcHeight;
-            uint32_t nonBlack = 0;
-            uint32_t hash = 2166136261u;
-            for (int i = 0; i < w * h; ++i) {
-                const uint32_t px = fb[i];
-                if ((px & 0x00FFFFFFu) != 0) {
-                    ++nonBlack;
-                }
-                hash ^= px;
-                hash *= 16777619u;
+        // Pace Cave 68000 execution to exact 57.44485 Hz arcade timing via Xbox MCPX hardware timer.
+        if (timer.ConsumeArcadeFrame()) {
+            board.RunFrame();
+            auto &pcm = board.SoundOut();
+            if (!pcm.empty()) {
+                audio.PushMono44k(pcm.data(), pcm.size());
+                pcm.clear();
             }
-            SerialPrintf("FB frame=%u nonBlack=%u/%d hash=0x%08X\n",
-                     frameNum, nonBlack, w * h, hash);
+            static uint32_t frameNum = 0;
+            ++frameNum;
         }
-#endif
 
-        presenter.Present(tateMode, bilinear, integerScale);
+        renderer.Render(board.video, nativeFrame, tateMode, bilinear, integerScale);
         while (pb_busy()) {
         }
         while (pb_finished()) {
         }
     }
 
-    presenter.Shutdown();
+    renderer.Shutdown();
     audio.Shutdown();
     input.Shutdown();
 
