@@ -5,6 +5,7 @@
 // NV097 hardware textured quads, hardware alpha-test transparency, hardware YOKO/TATE
 // rotation & scaling, hardware scissor clipping, and a contiguous VRAM tile/sprite atlas.
 #include "machine/cave_video.h"
+#include "xbox_asm.h"
 
 #include <pbkit/pbkit.h>
 #include <xboxkrnl/xboxkrnl.h>
@@ -45,7 +46,8 @@ public:
         atlasPhys_ = static_cast<uint32_t>(MmGetPhysicalAddress(atlas_));
 
         tileCache_.assign(kTileSlots, {});
-        paletteLut_.assign(0x8000, 0xFF000000u);
+        // +256 mirrored tail allows bounds-safe unmasked palBase[px] indexing in assembly.
+        paletteLut_.assign(0x8000 + 256, 0xFF000000u);
         paletteEpoch_ = 1;
         lastPaletteHash_ = 0;
         stateInitialized_ = false;
@@ -242,13 +244,9 @@ private:
     }
 
     void UpdatePalette(const std::vector<uint8_t> &palRam) {
-        // Fast 32-bit FNV-1a over 64 KB palette RAM to skip LUT rebuild & tile cache invalidation when unchanged.
-        uint32_t hash = 2166136261u;
-        const uint32_t *words = reinterpret_cast<const uint32_t *>(palRam.data());
-        for (size_t i = 0; i < 0x4000; ++i) {
-            hash ^= words[i];
-            hash *= 16777619u;
-        }
+        // Fast 4x-unrolled assembly FNV-1a with PIII prefetcht0 over 64 KB palette RAM.
+        const uint32_t hash = xbox_hash_palette_64k_asm(
+            reinterpret_cast<const uint32_t *>(palRam.data()), 0x4000u);
         if (hash == lastPaletteHash_) {
             return;
         }
@@ -260,14 +258,9 @@ private:
                 s.key = 0;
             }
         }
-        for (uint32_t n = 0; n < 0x8000; ++n) {
-            const uint16_t c = ReadWordBE(palRam, n * 2);
-            const uint32_t g = (c >> 10) & 31u;
-            const uint32_t r = (c >> 5) & 31u;
-            const uint32_t b = c & 31u;
-            paletteLut_[n] = 0xFF000000u | (((b << 3) | (b >> 2)) << 16) |
-                             (((g << 3) | (g >> 2)) << 8) | ((r << 3) | (r >> 2));
-        }
+        // Pentium III MMX + prefetchnta conversion of all 32,768 Cave 15-bit colors -> A8B8G8R8.
+        xbox_convert_palette_32k_mmx(reinterpret_cast<const uint16_t *>(palRam.data()), paletteLut_.data());
+        std::memcpy(paletteLut_.data() + 0x8000, paletteLut_.data(), 256 * sizeof(uint32_t));
     }
 
     // Push a hardware quad for arcade rectangle [ax0..ax1, ay0..ay1] sampling atlas [u0..u1, v0..v1].
@@ -353,21 +346,16 @@ private:
                     spriteShelfRowH_ = s.height;
                 }
 
-                bool anyOpaque = false;
+                uint32_t anyOpaque = 0;
+                const uint32_t *palPtr = paletteLut_.data() + palBase;
                 for (int sy = 0; sy < s.height; ++sy) {
                     uint32_t *dstRow = atlas_ + static_cast<size_t>(dstY + sy) * kAtlasW + dstX;
                     const uint32_t srcOff = s.code + static_cast<uint32_t>(sy * s.width);
-                    for (int sx = 0; sx < s.width; ++sx) {
-                        const uint8_t px = video.spritePixels[(srcOff + static_cast<uint32_t>(sx)) & spMask];
-                        if (px) {
-                            dstRow[sx] = paletteLut_[(palBase + px) & 0x7FFFu];
-                            anyOpaque = true;
-                        } else {
-                            dstRow[sx] = 0x00000000u; // Alpha = 0 -> hardware alpha-test discard
-                        }
-                    }
+                    anyOpaque |= xbox_unpack_sprite_row_asm(
+                        video.spritePixels.data(), srcOff, spMask,
+                        static_cast<uint32_t>(s.width), dstRow, palPtr);
                 }
-                spriteCache_.push_back({key, static_cast<uint16_t>(dstX), static_cast<uint16_t>(dstY), !anyOpaque});
+                spriteCache_.push_back({key, static_cast<uint16_t>(dstX), static_cast<uint16_t>(dstY), anyOpaque == 0});
                 entry = &spriteCache_.back();
             }
 
@@ -447,22 +435,12 @@ private:
                 if (slot.key != key) {
                     const uint32_t palBase = (kind.colourBase + colourIdx * kind.colourStep) & 0x7FFFu;
                     const uint8_t *srcTile = &kind.pixels[static_cast<size_t>(tileIdx) * 64];
-                    bool anyOpaque = false;
-                    for (int row = 0; row < 8; ++row) {
-                        uint32_t *dstRow = atlas_ + static_cast<size_t>(slotY + row) * kAtlasW + slotX;
-                        const uint8_t *srcRow = srcTile + row * 8;
-                        for (int col = 0; col < 8; ++col) {
-                            const uint8_t pxVal = srcRow[col];
-                            if (pxVal) {
-                                dstRow[col] = paletteLut_[(palBase + pxVal) & 0x7FFFu];
-                                anyOpaque = true;
-                            } else {
-                                dstRow[col] = 0x00000000u;
-                            }
-                        }
-                    }
+                    uint32_t *dstTile = atlas_ + static_cast<size_t>(slotY) * kAtlasW + slotX;
+                    const uint32_t anyOpaque = xbox_unpack_tile8x8_asm(
+                        srcTile, dstTile, static_cast<uint32_t>(kAtlasW * sizeof(uint32_t)),
+                        paletteLut_.data() + palBase);
                     slot.key = key;
-                    slot.empty = !anyOpaque;
+                    slot.empty = (anyOpaque == 0);
                 }
 
                 if (slot.empty) {

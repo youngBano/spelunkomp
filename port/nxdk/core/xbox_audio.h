@@ -3,6 +3,7 @@
 // Native Original Xbox AC'97 DMA audio backend via hal/audio.h (replaces SDL2 Audio).
 // Uses a lock-free SPSC ring buffer and integer 16.16 fixed-point resampling (44.1 kHz mono -> 48 kHz stereo)
 // so the DPC interrupt callback never touches x87/SSE floating-point state.
+#include "xbox_asm.h"
 #include <hal/audio.h>
 #include <xboxkrnl/xboxkrnl.h>
 
@@ -87,43 +88,11 @@ private:
         }
     }
 
-    // Runs in AC'97 DPC context: integer-only (no FPU/SSE).
+    // Runs in AC'97 DPC context: pure i386 integer assembly (zero FPU/SSE touched).
     void FillAndSubmit() {
         int16_t *dst = dmaBuf_[curDma_];
-        uint32_t r = ringRead_;
-        const uint32_t w = ringWrite_;
-        uint32_t phase = phase16_;
-        int16_t cur = lastSample_;
-
-        for (uint16_t i = 0; i < kDmaFrames; ++i) {
-            const uint32_t avail = w - r;
-            if (avail > 1) {
-                const int32_t s0 = ring_[r & kRingMask];
-                const int32_t s1 = ring_[(r + 1) & kRingMask];
-                const int32_t frac = static_cast<int32_t>(phase & 0xFFFFu);
-                cur = static_cast<int16_t>(s0 + (((s1 - s0) * frac) >> 16));
-                phase += kResampleStep16;
-                r += (phase >> 16);
-                phase &= 0xFFFFu;
-            } else if (avail == 1) {
-                cur = ring_[r & kRingMask];
-                phase += kResampleStep16;
-                if (phase >= 0x10000u) {
-                    ++r;
-                    phase &= 0xFFFFu;
-                }
-            } else {
-                // Underrun: decay smoothly to zero to avoid pops.
-                cur = static_cast<int16_t>(cur >> 1);
-            }
-            dst[i * 2 + 0] = cur;
-            dst[i * 2 + 1] = cur;
-        }
-
-        ringRead_ = r;
-        phase16_ = phase;
-        lastSample_ = cur;
-
+        xbox_resample_mono_to_stereo_asm(ring_, kRingMask, &ringRead_, ringWrite_,
+                                         &phase16_, &lastSample_, dst, kDmaFrames, kResampleStep16);
         XAudioProvideSamples(reinterpret_cast<unsigned char *>(dst), kDmaBytes, 0);
         curDma_ = (curDma_ + 1) % kNumDmaBuffers;
     }
