@@ -27,20 +27,23 @@ public:
     static constexpr int kSrcHeight = spelunk::CaveVideo::kHeight; // 240
     static constexpr int kAtlasW = 1024;
     static constexpr int kAtlasH = 1024;
-    // +1 extra top guard row (4 KB): alternating NV097_SET_TEXTURE_OFFSET between +0 (vBias=+1)
-    // and +4096 (vBias=0) guarantees NV097_SET_TEXTURE_OFFSET changes value every frame, forcing
+    // +4 extra top guard rows (16 KB): cycling NV097_SET_TEXTURE_OFFSET across 4 distinct row-aligned
+    // addresses guarantees no triple-buffered GPU frame ever aliases the same texture offset and forces
     // both real NV2A hardware and Xemu's texture cache to re-fetch modified atlas texels.
-    static constexpr int kAtlasAllocH = kAtlasH + 1;
-    static constexpr size_t kAtlasBytes = static_cast<size_t>(kAtlasW) * kAtlasAllocH * sizeof(uint32_t); // 4 MB + 4 KB
+    static constexpr int kAtlasGuardRows = 4;
+    static constexpr int kAtlasAllocH = kAtlasH + kAtlasGuardRows;
+    static constexpr size_t kAtlasBytes = static_cast<size_t>(kAtlasW) * kAtlasAllocH * sizeof(uint32_t); // 4 MB + 16 KB
 
-    // Top half (1024x512): 128x64 = 8,192 cached 8x8 tile slots.
-    // Each slot is a single packed uint64_t (8 bytes): bit 63 = empty, bits 62..0 = key -> 64 KB total (half of L2).
+    // Top half (1024x512): 128x64 = 8,192 linear-allocated 8x8 tile atlas slots,
+    // decoupled from a 16,384-slot epoch-reset hash table (load factor mathematically <= 50% forever).
+    // Whenever < 4,096 free atlas slots remain at frame start, an O(1) epoch bump resets the ring
+    // with zero rehashing, zero tombstones, zero same-frame evictions, and zero degradation over time.
     static constexpr int kTileCols = kAtlasW / 8;            // 128
     static constexpr int kTileRows = 512 / 8;                // 64
-    static constexpr int kTileSlots = kTileCols * kTileRows; // 8,192 (power of 2)
-    static constexpr uint32_t kTileMask = kTileSlots - 1;
-    static constexpr uint64_t kTileEmptyBit = 1ULL << 63;
-    static constexpr uint64_t kTileKeyMask = ~kTileEmptyBit;
+    static constexpr int kTileSlots = kTileCols * kTileRows; // 8,192 atlas slots
+    static constexpr int kTileFrameReserve = 4096;           // > max 3,813 visible tiles/frame across 3 layers
+    static constexpr uint32_t kTileHashSlots = 16384;        // 2x kTileSlots -> <= 50% load factor forever
+    static constexpr uint32_t kTileHashMask = kTileHashSlots - 1;
 
     // Bottom half (1024x512): per-frame shelf-allocated sprite atlas with O(1) 2,048-slot hash table (32 KB).
     static constexpr int kSpriteAreaY = 512;
@@ -55,13 +58,11 @@ public:
             return false;
         }
         std::memset(atlasAlloc_, 0, kAtlasBytes);
-        atlas_ = atlasAlloc_ + kAtlasW; // Logical row 0 starts at physical row 1 (+4096 bytes)
-        atlasPhys0_ = static_cast<uint32_t>(MmGetPhysicalAddress(atlasAlloc_));
-        atlasPhys1_ = atlasPhys0_ + static_cast<uint32_t>(kAtlasW * sizeof(uint32_t));
+        atlas_ = atlasAlloc_ + static_cast<size_t>(kAtlasW) * kAtlasGuardRows; // Logical row 0 at physical row 4
+        atlasPhysBase_ = static_cast<uint32_t>(MmGetPhysicalAddress(atlasAlloc_));
         atlasPhase_ = 0;
 
-        tileCache_.assign(kTileSlots, 0ULL);
-        tileFrame_.assign(kTileSlots, 0u);
+        tileHash_.assign(kTileHashSlots, {});
         spriteHash_.assign(kSpriteHashSlots, {});
         // +256 mirrored tail allows bounds-safe unmasked palBase[px] indexing in assembly.
         paletteLut_.assign(0x8000 + 256, 0xFF000000u);
@@ -72,8 +73,8 @@ public:
             tileQuads_[p].reserve(1024);
         }
 
-        paletteEpoch_ = 1;
-        tileFrameEpoch_ = 1;
+        tileHashEpoch_ = 1;
+        tileAllocCursor_ = 0;
         spriteEpoch_ = 1;
         lastSpritePalHash_ = 0;
         lastTilePalHash_ = 0;
@@ -89,11 +90,9 @@ public:
             MmFreeContiguousMemory(atlasAlloc_);
             atlasAlloc_ = nullptr;
             atlas_ = nullptr;
-            atlasPhys0_ = 0;
-            atlasPhys1_ = 0;
+            atlasPhysBase_ = 0;
         }
-        tileCache_.clear();
-        tileFrame_.clear();
+        tileHash_.clear();
         spriteHash_.clear();
         paletteLut_.clear();
         for (int p = 0; p < 4; ++p) {
@@ -132,9 +131,9 @@ public:
         const uint32_t bgArgb = (bgAbgr & 0xFF00FF00u) | ((bgAbgr & 0xFFu) << 16) | ((bgAbgr >> 16) & 0xFFu);
         pb_fill(clipX0_, clipY0_, clipX1_ - clipX0_, clipY1_ - clipY0_, bgArgb);
 
-        // 3. Reset priority buckets, O(1) sprite cache epoch, and toggle 4 KB texture offset phase.
-        atlasPhase_ ^= 1u;
-        atlasVBias_ = (atlasPhase_ == 0u) ? 1.0f : 0.0f;
+        // 3. Reset priority buckets, O(1) sprite cache epoch, and cycle 4-row texture offset phase.
+        atlasPhase_ = (atlasPhase_ + 1u) & 3u;
+        atlasVBias_ = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
         for (int p = 0; p < 4; ++p) {
             spriteQuads_[p].clear();
             tileQuads_[p].clear();
@@ -146,9 +145,10 @@ public:
             spriteEpoch_ = 1;
             std::memset(spriteHash_.data(), 0, spriteHash_.size() * sizeof(SpriteHashSlot));
         }
-        if (++tileFrameEpoch_ == 0) {
-            tileFrameEpoch_ = 1;
-            std::memset(tileFrame_.data(), 0, tileFrame_.size() * sizeof(uint16_t));
+        // O(1) tile cache reset whenever remaining atlas headroom is below one worst-case frame (4,096 tiles).
+        // Keeps load factor <= 50% and guarantees zero evictions or clustering even after hours of play.
+        if (tileAllocCursor_ > kTileSlots - kTileFrameReserve) {
+            ResetTileCache();
         }
 
         // 4. Single linear pass over frame.sprites -> distributes into spriteQuads_[0..3].
@@ -191,11 +191,11 @@ public:
         // 6. Flush write-combined VRAM atlas writes before NV2A DMA read.
         _mm_sfence();
 
-        // 7. Push invariant NV2A state once, and alternate NV097_SET_TEXTURE_OFFSET every frame
-        //    (atlasPhys0_ <-> atlasPhys1_) after _mm_sfence() so NV2A hardware & Xemu ALWAYS
-        //    invalidate their texture cache and fetch newly unpacked tile/sprite texels.
-        const uint32_t activeTexPhys = (atlasPhase_ == 0u) ? atlasPhys0_ : atlasPhys1_;
-        const uint32_t activeTexH = (atlasPhase_ == 0u) ? kAtlasAllocH : kAtlasH;
+        // 7. Push invariant NV2A state once, and cycle NV097_SET_TEXTURE_OFFSET across 4 row-aligned
+        //    addresses after _mm_sfence() so NV2A hardware & Xemu ALWAYS fetch modified atlas texels.
+        const uint32_t activeTexPhys =
+            atlasPhysBase_ + atlasPhase_ * static_cast<uint32_t>(kAtlasW * sizeof(uint32_t));
+        const uint32_t activeTexH = static_cast<uint32_t>(kAtlasAllocH) - atlasPhase_;
         uint32_t *p = pb_begin();
         if (!stateInitialized_) {
             p = PushStaticState(p, screenW, screenH, activeTexPhys, activeTexH);
@@ -238,6 +238,24 @@ private:
         uint8_t empty = 1;
         uint8_t pad = 0;
     };
+
+    // Exactly 16 bytes = 2 slots per 32-byte Pentium III cache line.
+    // Decouples tile lookup (16,384 slots, <= 50% load) from linear atlas allocation (8,192 slots).
+    struct TileHashSlot {
+        uint64_t key = 0;
+        uint16_t atlasSlot = 0;
+        uint16_t epoch = 0;
+        uint8_t empty = 1;
+        uint8_t pad[3] = {};
+    };
+
+    void ResetTileCache() {
+        tileAllocCursor_ = 0;
+        if (++tileHashEpoch_ == 0) {
+            tileHashEpoch_ = 1;
+            std::memset(tileHash_.data(), 0, tileHash_.size() * sizeof(TileHashSlot));
+        }
+    }
 
     static constexpr uint32_t kFloatZeroBits = 0x00000000u;
     static constexpr uint32_t kFloatOneBits = 0x3F800000u;
@@ -329,11 +347,7 @@ private:
         }
         if (tileHash != lastTilePalHash_) {
             lastTilePalHash_ = tileHash;
-            paletteEpoch_ = (paletteEpoch_ + 1u) & 0x7FFFu; // 15-bit epoch fits in packed 64-bit tileCache_ key.
-            if (paletteEpoch_ == 0) {
-                paletteEpoch_ = 1;
-                std::memset(tileCache_.data(), 0, tileCache_.size() * sizeof(uint64_t));
-            }
+            ResetTileCache();
         }
         lastSpritePalHash_ = spriteHash;
         xbox_convert_palette_32k_mmx(reinterpret_cast<const uint16_t *>(palRam.data()), paletteLut_.data());
@@ -493,8 +507,7 @@ private:
         const uint32_t tileMask = static_cast<uint32_t>(tileCount - 1);
         const uint8_t *tilePixels = kind.pixels.data();
         const uint32_t *lutBase = paletteLut_.data();
-        const uint64_t layerEpochPrefix = (static_cast<uint64_t>(paletteEpoch_) << 36) |
-                                          (static_cast<uint64_t>(layerIdx) << 32);
+        const uint64_t layerPrefix = static_cast<uint64_t>(layerIdx) << 32;
 
         const int endTx = (kSrcWidth / 8) + 1;
         const int endTy = (kSrcHeight / 8) + 1;
@@ -540,33 +553,33 @@ private:
                 const int tilePrio = static_cast<int>(tileWord >> 30);
                 const uint32_t tileIdx = pow2Tiles ? (code & tileMask) : static_cast<uint32_t>(code % tileCount);
                 const uint32_t colourIdx = (tileWord >> 24) & kind.colourMask;
-                const uint64_t key = layerEpochPrefix | (static_cast<uint64_t>(colourIdx) << 20) | tileIdx;
+                const uint64_t key = layerPrefix | (static_cast<uint64_t>(colourIdx) << 20) | tileIdx;
 
-                // Frame-pinned open-addressed tile cache with Mix64 avalanche hash (0 drops, <=7 probes):
-                // never evicts a tile already emitted this frame.
-                const uint32_t baseSlot = Mix64(key) & kTileMask;
-                uint32_t slotIdx = baseSlot;
-                uint32_t freeSlot = UINT32_MAX;
+                // Decoupled 16,384-slot epoch-reset hash table (load <= 50% forever, zero tombstones)
+                // backed by linear atlas allocation (0..8191): guaranteed zero same-frame evictions.
+                uint32_t hIdx = Mix64(key) & kTileHashMask;
+                TileHashSlot *hSlot = nullptr;
                 bool hit = false;
-                uint64_t entry = 0;
-                for (uint32_t probe = 0; probe < 256; ++probe) {
-                    const uint32_t cand = (baseSlot + probe) & kTileMask;
-                    const uint64_t e = tileCache_[cand];
-                    if ((e & kTileKeyMask) == key) {
-                        slotIdx = cand;
-                        entry = e;
+                for (uint32_t probe = 0; probe < kTileHashSlots; ++probe) {
+                    TileHashSlot &cand = tileHash_[(hIdx + probe) & kTileHashMask];
+                    if (cand.epoch != tileHashEpoch_) {
+                        hSlot = &cand;
+                        break;
+                    }
+                    if (cand.key == key) {
+                        hSlot = &cand;
                         hit = true;
                         break;
                     }
-                    if (freeSlot == UINT32_MAX && tileFrame_[cand] != tileFrameEpoch_) {
-                        freeSlot = cand;
-                    }
+                }
+                if (!hSlot) {
+                    continue;
                 }
                 if (!hit) {
-                    if (freeSlot == UINT32_MAX) {
-                        continue; // Atlas full for this frame; never overwrite an in-flight tile.
+                    if (tileAllocCursor_ >= kTileSlots) {
+                        continue;
                     }
-                    slotIdx = freeSlot;
+                    const uint16_t slotIdx = static_cast<uint16_t>(tileAllocCursor_++);
                     const int slotX = static_cast<int>(slotIdx & (kTileCols - 1)) * 8;
                     const int slotY = static_cast<int>(slotIdx >> 7) * 8;
                     const uint32_t palBase = (kind.colourBase + colourIdx * kind.colourStep) & 0x7FFFu;
@@ -574,15 +587,17 @@ private:
                     uint32_t *dstTile = atlas_ + static_cast<size_t>(slotY) * kAtlasW + slotX;
                     const uint32_t anyOpaque = xbox_unpack_tile8x8_asm(
                         srcTile, dstTile, static_cast<uint32_t>(kAtlasW * sizeof(uint32_t)), lutBase + palBase);
-                    entry = key | (anyOpaque == 0 ? kTileEmptyBit : 0ULL);
-                    tileCache_[slotIdx] = entry;
+                    hSlot->key = key;
+                    hSlot->atlasSlot = slotIdx;
+                    hSlot->epoch = tileHashEpoch_;
+                    hSlot->empty = (anyOpaque == 0) ? 1 : 0;
                 }
-                tileFrame_[slotIdx] = tileFrameEpoch_;
 
-                if ((entry & kTileEmptyBit) != 0) {
+                if (hSlot->empty) {
                     continue;
                 }
 
+                const uint32_t slotIdx = hSlot->atlasSlot;
                 const int slotX = static_cast<int>(slotIdx & (kTileCols - 1)) * 8;
                 const int slotY = static_cast<int>(slotIdx >> 7) * 8;
                 // Inset UVs by 0.001 texel so flipped tiles (flipX/flipY = true in ddonpach) never bleed
@@ -696,20 +711,18 @@ private:
 
     uint32_t *atlasAlloc_ = nullptr;
     uint32_t *atlas_ = nullptr;
-    uint32_t atlasPhys0_ = 0;
-    uint32_t atlasPhys1_ = 0;
+    uint32_t atlasPhysBase_ = 0;
     uint32_t atlasPhase_ = 0;
     float atlasVBias_ = 0.0f;
 
-    std::vector<uint64_t> tileCache_;
-    std::vector<uint16_t> tileFrame_;
+    std::vector<TileHashSlot> tileHash_;
     std::vector<SpriteHashSlot> spriteHash_;
     std::vector<uint32_t> paletteLut_;
     std::vector<Quad> spriteQuads_[4];
     std::vector<Quad> tileQuads_[4];
 
-    uint32_t paletteEpoch_ = 1;
-    uint16_t tileFrameEpoch_ = 1;
+    uint16_t tileHashEpoch_ = 1;
+    int tileAllocCursor_ = 0;
     uint16_t spriteEpoch_ = 1;
     uint32_t lastSpritePalHash_ = 0;
     uint32_t lastTilePalHash_ = 0;
