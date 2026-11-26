@@ -17,13 +17,13 @@ SRCS = \
 	$(GEN_DIR)/registry.cpp
 
 NXDK_CXX = y
-NXDK_CXXFLAGS += -std=c++20 -O2 -march=pentium3 -msse -mmmx -mfpmath=sse -fno-exceptions -fno-rtti
+NXDK_CXXFLAGS += -std=c++20 -O2 -march=pentium3 -msse -mmmx -mfpmath=sse -fomit-frame-pointer -fno-math-errno -fno-exceptions -fno-rtti
 NXDK_CXXFLAGS += -DXBOX_CV1000_B -DXBOX_NO_SW_VRAM
 ifeq ($(FAKE_PLAY),1)
 NXDK_CXXFLAGS += -DXBOX_FAKE_PLAY=1
 endif
 NXDK_CXXFLAGS += -I$(CURDIR) -I$(ENGINE_DIR) -I$(ENGINE_DIR)/machine -I$(ENGINE_DIR)/runtime
-NXDK_CFLAGS += -O2 -march=pentium3 -msse -mmmx -mfpmath=sse
+NXDK_CFLAGS += -O2 -march=pentium3 -msse -mmmx -mfpmath=sse -fomit-frame-pointer
 
 include $(NXDK_DIR)/Makefile
 

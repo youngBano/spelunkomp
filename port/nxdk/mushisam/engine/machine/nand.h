@@ -74,6 +74,8 @@ public:
         case 0x30:
             if (m_mode == Mode::Read && m_addressCount >= 4) {
                 m_at = static_cast<size_t>(m_page) * kPageTotal + m_column;
+                m_streamPage = m_page;
+                m_streamCol = m_column;
                 m_mode = Mode::Reading;
                 reads++;
             }
@@ -85,6 +87,8 @@ public:
         case 0xE0:
             if (m_mode == Mode::Column) {
                 m_at = static_cast<size_t>(m_page) * kPageTotal + m_column;
+                m_streamPage = m_page;
+                m_streamCol = m_column;
                 m_mode = Mode::Reading;
             }
             break;
@@ -302,20 +306,27 @@ private:
         return buf;
     }
 
-    uint8_t ReadStreamingByte() {
+    inline uint8_t ReadStreamingByte() {
         if (m_at >= m_fileSize) {
             return 0xFF;
         }
-        const uint32_t pageIdx = static_cast<uint32_t>(m_at / kPageTotal);
-        const uint32_t col = static_cast<uint32_t>(m_at % kPageTotal);
         ++m_at;
-        return FetchStreamingPage(pageIdx)[col];
+        // Zero-division fast path: track page & column directly instead of 64-bit __udivdi3 per byte!
+        if (m_streamCol >= kPageTotal) {
+            m_streamCol -= kPageTotal;
+            ++m_streamPage;
+        }
+        const uint8_t *buf = (m_streamPage == m_curPageIdx && m_curPageBuf)
+                                 ? m_curPageBuf
+                                 : FetchStreamingPage(m_streamPage);
+        return buf[m_streamCol++];
     }
 
     enum class Mode : uint8_t { Idle, Read, Reading, Column, Program, Erase, Status, Id };
     Mode m_mode = Mode::Idle;
     uint8_t m_status = 0xC0; // (ready, not write-protected)
     uint32_t m_addressCount = 0, m_column = 0, m_page = 0, m_idAt = 0, m_programmed = 0;
+    uint32_t m_streamPage = 0, m_streamCol = 0;
     uint64_t m_at = 0;
     uint8_t m_pageRegister[kPageTotal] = {};
 

@@ -59,6 +59,7 @@ public:
         atlasPhase_ = 0;
 
         pageTable_.assign(kTotalLogicalPages, -1);
+        pagePtrs_.assign(kTotalLogicalPages, nullptr);
         pageLru_.reserve(kMaxAllocPages);
         pageOwner_.reserve(kMaxAllocPages);
         pageData_.reserve(kMaxAllocPages);
@@ -83,6 +84,7 @@ public:
         }
         pageData_.clear();
         pageTable_.clear();
+        pagePtrs_.clear();
         pageLru_.clear();
         pageOwner_.clear();
         rectHash_.clear();
@@ -220,20 +222,25 @@ private:
         return h ^ (h >> 16);
     }
 
+    // Division-free 5/6-bit CV1000 channel -> 8-bit scale (x * 255 / 31, clamped at 255).
+    static inline uint32_t Scale5To8(uint32_t v) {
+        if (v >= 31u) return 255u;
+        return (v << 3) | (v >> 2);
+    }
+
     uint16_t *GetPageWrite(int px, int py) {
         const int logical = py * kPagesX + px;
-        int phys = pageTable_[logical];
-        if (phys >= 0) {
-            pageLru_[phys] = ++lruClock_;
-            return pageData_[phys].data();
+        if (uint16_t *ptr = pagePtrs_[logical]) {
+            return ptr;
         }
         if (static_cast<int>(pageData_.size()) < kMaxAllocPages) {
-            phys = static_cast<int>(pageData_.size());
+            const int phys = static_cast<int>(pageData_.size());
             pageData_.emplace_back(kPageSize * kPageSize, 0u);
             pageLru_.push_back(++lruClock_);
             pageOwner_.push_back(logical);
             pageTable_[logical] = phys;
-            return pageData_[phys].data();
+            pagePtrs_[logical] = pageData_[phys].data();
+            return pagePtrs_[logical];
         }
         // Evict least-recently-used VRAM page (keeps RAM strictly <= 18 MB on 64 MB Xbox).
         int victim = 0;
@@ -244,22 +251,20 @@ private:
                 victim = i;
             }
         }
-        pageTable_[pageOwner_[victim]] = -1;
+        const int oldLogical = pageOwner_[victim];
+        pageTable_[oldLogical] = -1;
+        pagePtrs_[oldLogical] = nullptr;
         pageOwner_[victim] = logical;
         pageLru_[victim] = ++lruClock_;
         pageTable_[logical] = victim;
-        std::memset(pageData_[victim].data(), 0, kPageSize * kPageSize * sizeof(uint16_t));
-        return pageData_[victim].data();
+        uint16_t *dst = pageData_[victim].data();
+        pagePtrs_[logical] = dst;
+        std::memset(dst, 0, kPageSize * kPageSize * sizeof(uint16_t));
+        return dst;
     }
 
-    inline const uint16_t *GetPageRead(int px, int py) {
-        const int logical = py * kPagesX + px;
-        const int phys = pageTable_[logical];
-        if (phys < 0) {
-            return nullptr;
-        }
-        pageLru_[phys] = ++lruClock_;
-        return pageData_[phys].data();
+    inline const uint16_t *GetPageRead(int px, int py) const {
+        return pagePtrs_[py * kPagesX + px];
     }
 
     void ApplyUpload(const spelunk::NativeUpload &up, const std::vector<uint16_t> &pixels) {
@@ -380,12 +385,12 @@ private:
             slot->epoch = rectEpoch_;
         }
 
-        // Compute tint & blend state.
+        // Compute tint & blend state (division-free Scale5To8).
         uint32_t diffuse = 0xFFFFFFFFu;
         if (d.flags & spelunk::NativeDraw::kTinted) {
-            const uint32_t tr = std::min<uint32_t>(255u, ((d.colours >> 10) & 0x3Fu) * 255u / 31u);
-            const uint32_t tg = std::min<uint32_t>(255u, ((d.colours >> 16) & 0x3Fu) * 255u / 31u);
-            const uint32_t tb = std::min<uint32_t>(255u, ((d.colours >> 22) & 0x3Fu) * 255u / 31u);
+            const uint32_t tr = Scale5To8((d.colours >> 10) & 0x3Fu);
+            const uint32_t tg = Scale5To8((d.colours >> 16) & 0x3Fu);
+            const uint32_t tb = Scale5To8((d.colours >> 22) & 0x3Fu);
             diffuse = 0xFF000000u | (tb << 16) | (tg << 8) | tr;
         }
 
@@ -394,8 +399,8 @@ private:
         uint16_t dFactor = NV097_SET_BLEND_FUNC_DFACTOR_V_ZERO;
         uint32_t blendColor = 0xFFFFFFFFu;
         if (blendOn) {
-            const uint32_t sa = (d.colours & 0x1Fu) * 255u / 31u;
-            const uint32_t da = ((d.colours >> 5) & 0x1Fu) * 255u / 31u;
+            const uint32_t sa = Scale5To8(d.colours & 0x1Fu);
+            const uint32_t da = Scale5To8((d.colours >> 5) & 0x1Fu);
             const int sm = d.flags & 7;
             const int dm = (d.flags >> 3) & 7;
             blendColor = (sa << 24) | (da << 16) | (da << 8) | da;
@@ -477,7 +482,7 @@ private:
             size_t emitted = 0;
             bool inBegin = false;
 
-            while (i < total && emitted < 192) {
+            while (i < total && emitted < 256) {
                 const DrawCmd &c = cmds_[i];
                 const bool stateDiff = (c.alphaTest != curAlpha) || (c.blendOn != curBlend) ||
                                        (c.blendOn && (c.sFactor != curSF || c.dFactor != curDF || c.blendColor != curBlendCol));
@@ -659,6 +664,7 @@ private:
     float atlasVBias_ = 0.0f;
 
     std::vector<int> pageTable_;
+    std::vector<uint16_t *> pagePtrs_;
     std::vector<uint32_t> pageLru_;
     std::vector<int> pageOwner_;
     std::vector<std::vector<uint16_t>> pageData_;
