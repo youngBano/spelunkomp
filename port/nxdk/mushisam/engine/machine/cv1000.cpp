@@ -9,6 +9,16 @@ namespace spelunk {
 
 namespace {
     FILE *const g_blitLog = getenv("SPELUNK_BLIT_LOG") ? fopen(getenv("SPELUNK_BLIT_LOG"), "w") : nullptr;
+
+    inline uint64_t ReadTsc() {
+#if defined(__i386__) || defined(__x86_64__)
+        uint32_t lo, hi;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        return (static_cast<uint64_t>(hi) << 32) | lo;
+#else
+        return 0;
+#endif
+    }
 }
 
 Cv1000::Cv1000()
@@ -39,11 +49,23 @@ void Cv1000::Reset() {
 }
 
 void Cv1000::RunFrame() {
+    profSh3Tsc = 0;
+    profAudioTsc = 0;
+    profBlitterTsc = 0;
     // The vertical sync pulse, on the CPU's IRQ2 pin
     cpu.RaiseIrq(2);
     m_frameEnd += kFrameCycles;
+    const uint64_t tCpu0 = ReadTsc();
     cpu.Run(m_frameEnd);
+    const uint64_t tCpu1 = ReadTsc();
+    const uint64_t cpuTotal = tCpu1 - tCpu0;
+    const uint64_t subTsc = profBlitterTsc + profAudioTsc;
+    profSh3Tsc = (cpuTotal > subTsc) ? (cpuTotal - subTsc) : 0;
+#ifndef XBOX_AUDIO_OFF
+    const uint64_t tAud0 = ReadTsc();
     sound.RunTo(cpu.cycles, kCpuHz);
+    profAudioTsc += ReadTsc() - tAud0;
+#endif
     frame++;
 #ifdef SPELUNK_SHADOW_TIMING
     cpu.ShadowCheckWhole("the frame's end");
@@ -65,7 +87,7 @@ void Cv1000::ScheduleIrq1() {
 }
 
 uint16 Cv1000::Fetch(uint32 address) {
-    if (address < 0x400000) {
+    if (address < 0x400000 && !program.empty()) {
         const uint32 mask = static_cast<uint32>(program.size() - 1);
         return static_cast<uint16>((program[address & mask] << 8) | program[(address + 1) & mask]);
     }
@@ -76,8 +98,16 @@ uint16 Cv1000::Fetch(uint32 address) {
     return 0x0009; // (nop)
 }
 
+bool Cv1000::ReadBulk(uint32 address, uint8 *dst, uint32 count) {
+    if (address == 0x10000000u) {
+        return nand.ReadBlock(dst, count);
+    }
+    return false;
+}
+
 uint32 Cv1000::Read(uint32 address, unsigned size) {
     if (address < 0x400000) {
+        if (program.empty()) return 0xFFFFFFFFu;
         const uint32 mask = static_cast<uint32>(program.size() - 1);
         uint32 v = 0;
         for (unsigned i = 0; i < size; i++) {
@@ -113,8 +143,14 @@ uint32 Cv1000::Read(uint32 address, unsigned size) {
 
 void Cv1000::Write(uint32 address, uint32 value, unsigned size) {
     if (address >= 0x18000000u && address < 0x18000058u) {
+        const uint32_t regOff = (address - 0x18000000u) & ~3u;
         blitter.started = false;
-        blitter.Write((address - 0x18000000u) & ~3u, value);
+        const bool starting = (regOff == 0x04u) && ((value & 1u) != 0);
+        const uint64_t tBlit0 = starting ? ReadTsc() : 0;
+        blitter.Write(regOff, value);
+        if (starting) {
+            profBlitterTsc += ReadTsc() - tBlit0;
+        }
         if (blitter.started) {
             // (its uploads took the bus from the CPU; it is busy for the time the list takes)
             cpu.cycles += blitter.lastStolenCpuCycles;
@@ -159,7 +195,11 @@ void Cv1000::Write(uint32 address, uint32 value, unsigned size) {
             m_soundRegister = static_cast<uint8_t>(value);
         } else {
             if (!sound.held) {
+#ifndef XBOX_AUDIO_OFF
+                const uint64_t tAud0 = ReadTsc();
                 sound.RunTo(cpu.cycles, kCpuHz);
+                profAudioTsc += ReadTsc() - tAud0;
+#endif
                 sound.WriteRegister(m_soundRegister, static_cast<uint8_t>(value));
             }
         }
@@ -266,8 +306,10 @@ void Cv1000::KeepNow(bool exact, int which) {
         sound.KeepDecoders(which);
     }
     m_keptExact[which] = exact;
+#ifndef XBOX_FAST_CPU
     m_keptPathsClock[which] = cpu.timingPaths.clock;
     m_keptPathsGeneration[which] = cpu.timingPaths.generation;
+#endif
     blitter.BeginJournal(which);
     sound.held = !exact;
 }
@@ -295,7 +337,9 @@ void Cv1000::PutBack(int which, bool again) {
     SerializeSmall(ar);
     cpu.keepEpochs = false;
     cpu.keepPaths = false;
+#ifndef XBOX_FAST_CPU
     cpu.timingPaths.PutBack(m_keptPathsClock[which], m_keptPathsGeneration[which]);
+#endif
     if (m_keptExact[which]) {
         sound.Serialize(ar);
         sound.PutBackDecoders(which);

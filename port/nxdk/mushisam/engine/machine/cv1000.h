@@ -29,7 +29,7 @@
 
 namespace spelunk {
 
-class Cv1000 : public Bus {
+class Cv1000 final : public Bus {
 public:
     Cv1000();
 
@@ -60,6 +60,11 @@ public:
     static constexpr uint64_t kCpuHz = 102400000;
     static constexpr uint64_t kFrameCycles = 262ull * 407 * 16; // (the CPU's clock is 16 times the pixel clock)
     uint64_t frame = 0;
+
+    // Per-frame RDTSC breakdown (populated inside RunFrame/Write for Xbox profiling)
+    uint64_t profSh3Tsc = 0;
+    uint64_t profAudioTsc = 0;
+    uint64_t profBlitterTsc = 0;
     // The picture on show: 320 x 240, 32 bits a pixel, red in the low byte
     void Picture(uint32_t *out) const {
         blitter.Picture(out);
@@ -102,6 +107,7 @@ public:
     // Bus
     uint32 Read(uint32 address, unsigned size) override;
     void Write(uint32 address, uint32 value, unsigned size) override;
+    bool ReadBulk(uint32 address, uint8 *dst, uint32 count) override;
     uint16 Fetch(uint32 address) override;
     void Event() override;
     void ScheduleIrq1();

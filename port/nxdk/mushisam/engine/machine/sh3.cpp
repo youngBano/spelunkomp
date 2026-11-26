@@ -138,6 +138,7 @@ namespace ops {
 
 SH3::SH3() {
     (void)g_built;
+#ifndef XBOX_FAST_CPU
     Sh3Timing::opCycles = s_cycles;
     SHADOW_TIMING_ALSO(ref::Sh3Timing::opCycles = s_cycles);
     pollSkip = getenv("SPELUNK_NO_POLL_SKIP") == nullptr;
@@ -145,6 +146,7 @@ SH3::SH3() {
         sscanf(w, "%x-%x", &watchLo, &watchHi);
         watching = watchHi != 0;
     }
+#endif
     if (const char *list = getenv("SPELUNK_BREAK")) {
         for (const char *p = list; *p;) {
             char *end;
@@ -258,6 +260,7 @@ void SH3::TakeInterrupt() {
     PC = VBR + 0x600;
     sleeping = false;
     cycles += 5;
+#ifndef XBOX_FAST_CPU
     if (timing) {
         memoryTiming.Redirect(PC, cycles);
         PollForget();
@@ -266,6 +269,7 @@ void SH3::TakeInterrupt() {
         ShadowCheckWhole("interrupt");
 #endif
     }
+#endif
 }
 
 void SH3::TakeException(uint32 code, uint32 returnPc) {
@@ -357,6 +361,7 @@ void SH3::Run(uint64 until) {
 
 // ---------------------------------------------------------------------------------------------------------
 // The poll loop's fast-forward (sh3.h's PollLoop)
+#ifndef XBOX_FAST_CPU
 
 namespace {
     // The model's fields of a time: each either the same at the end of every turn, and past (it is not read), or later
@@ -574,36 +579,45 @@ void SH3::PollTurn(uint32 target) {
     poll.before = memoryTiming;
 #endif
 }
+#endif // !XBOX_FAST_CPU
 
 // ---------------------------------------------------------------------------------------------------------
 // Timers: TCNT counts down at the peripheral clock (a quarter of the CPU's) divided by 4, 16, 64 or 256
 
 namespace {
-    uint64 TimerPeriod(uint16 tcr) {
-        static const uint64 kDivide[8] = {4, 16, 64, 256, 256, 256, 256, 256};
-        return 4 * kDivide[tcr & 7];
+    // Peripheral clock = CPU/4; dividers = 4, 16, 64, 256 -> shifts 4, 6, 8, 10 (eliminates 64-bit __udivdi3).
+    constexpr uint8 kTimerShift[8] = {4, 6, 8, 10, 10, 10, 10, 10};
+    inline uint8 TimerShift(uint16 tcr) {
+        return kTimerShift[tcr & 7];
     }
 } // namespace
 
-void SH3::SyncTimers() {
-    for (int i = 0; i < 3; i++) {
-        Timer &t = tmu[i];
-        if (!(TSTR & (1 << i))) {
-            t.base = cycles;
-            continue;
-        }
-        const uint64 period = TimerPeriod(t.TCR);
-        uint64 counts = (cycles - t.base) / period;
-        t.base += counts * period;
-        if (counts <= t.TCNT) {
-            t.TCNT -= static_cast<uint32>(counts);
-            continue;
-        }
-        counts -= static_cast<uint64>(t.TCNT) + 1;
-        t.TCR |= 0x0100; // UNF
-        const uint64 reload = static_cast<uint64>(t.TCOR) + 1;
-        t.TCNT = t.TCOR - static_cast<uint32>(counts % reload);
+void SH3::SyncTimer(int i) {
+    Timer &t = tmu[i];
+    if (!(TSTR & (1 << i))) {
+        t.base = cycles;
+        return;
     }
+    const uint8 shift = TimerShift(t.TCR);
+    uint64 counts = (cycles - t.base) >> shift;
+    if (!counts) {
+        return;
+    }
+    t.base += counts << shift;
+    if (counts <= t.TCNT) {
+        t.TCNT -= static_cast<uint32>(counts);
+        return;
+    }
+    counts -= static_cast<uint64>(t.TCNT) + 1;
+    t.TCR |= 0x0100; // UNF
+    const uint64 reload = static_cast<uint64>(t.TCOR) + 1;
+    t.TCNT = t.TCOR - static_cast<uint32>(counts % reload);
+}
+
+void SH3::SyncTimers() {
+    SyncTimer(0);
+    SyncTimer(1);
+    SyncTimer(2);
 }
 
 uint64 SH3::NextTimerEvent() const {
@@ -611,12 +625,111 @@ uint64 SH3::NextTimerEvent() const {
     for (int i = 0; i < 3; i++) {
         const Timer &t = tmu[i];
         if ((TSTR & (1 << i)) && (t.TCR & 0x0020) && !(t.TCR & 0x0100)) {
-            const uint64 at = t.base + (static_cast<uint64>(t.TCNT) + 1) * TimerPeriod(t.TCR);
+            const uint64 at = t.base + ((static_cast<uint64>(t.TCNT) + 1) << TimerShift(t.TCR));
             next = std::min(next, at);
         }
     }
     return next;
 }
+
+#ifdef XBOX_FAST_CPU
+// Exact O(1) fast-forward for Mushihimesama's 4-instruction TMU poll loop at 0x0C04A2AA:
+//   sub R1, R0; cmp/hi R0, R4; bt/s 0x0C04A2AA; mov.l @R2, R0
+// Skips conservatively to within 1 timer tick of loop exit, underflow, or blockStop, then lets
+// the exact 4-instruction loop finish the final few iterations.
+bool SH3::FastForwardTmuPoll() {
+    if (interruptReady || cycles + 4 >= blockStop) {
+        return false;
+    }
+    const uint32 addr = R[2];
+    // Case 1: Mushihimesama's main VSync idle loop polls a RAM counter (e.g. 0x0C0024D8).
+    // While spinning with !interruptReady, RAM cannot change until blockStop (IRQ2 VSync / timer / blitter IRQ1).
+    if (IsRam(addr)) {
+        const uint32 diff0 = R[0] - R[1];
+        if (!(R[4] > diff0)) {
+            return false;
+        }
+        const uint32 memVal = Read32(addr);
+        if (!(R[4] > (memVal - R[1]))) {
+            return false;
+        }
+        // Advance exact multiple of 4-cycle iterations to reach blockStop.
+        const uint64 iters = (blockStop - cycles + 3ull) >> 2;
+        if (iters < 2) {
+            return false;
+        }
+        cycles += iters << 2;
+        R[0] = memVal;
+        T = 1;
+        PC = 0x0C04A2AAu;
+        return true;
+    }
+
+    // Case 2: TMU counter poll (0xFFFFFE98 / A4 / B0).
+    int idx = -1;
+    if (addr == 0xFFFFFE98u) idx = 0;
+    else if (addr == 0xFFFFFEA4u) idx = 1;
+    else if (addr == 0xFFFFFEB0u) idx = 2;
+    else return false;
+
+    if (!(TSTR & (1 << idx)) || cycles + 8 >= blockStop) {
+        return false;
+    }
+    // Check if the current iteration will take the back-edge
+    const uint32 diff0 = R[0] - R[1];
+    if (!(R[4] > diff0)) {
+        return false;
+    }
+    SyncTimer(idx);
+    Timer &t = tmu[idx];
+    const uint8 shift = TimerShift(t.TCR);
+    const uint64 period = 1ull << shift;
+    const uint32 curDiff = t.TCNT - R[1];
+    if (!(R[4] > curDiff)) {
+        return false;
+    }
+    // TCNT counts down by 1 every `period` cycles; curDiff decreases by 1 per tick until it hits 0 and wraps.
+    // Stay strictly before: (1) curDiff reaching 0 (exit), (2) TCNT underflowing, and (3) blockStop.
+    const uint32 safeTicks = std::min(curDiff, t.TCNT);
+    if (safeTicks <= 1) {
+        return false;
+    }
+    const uint64 maxCyclesByTicks = static_cast<uint64>(safeTicks - 1) << shift;
+    const uint64 maxCyclesByStop = blockStop - cycles - 4;
+    const uint64 availCycles = std::min(maxCyclesByTicks, maxCyclesByStop);
+    const uint64 skipIters = availCycles >> 2;
+    if (skipIters < 2) {
+        return false;
+    }
+    // Advance `skipIters` full 4-cycle iterations; R[0] takes TCNT at the last skipped iteration's delay slot (+2).
+    const uint64 lastReadCycle = cycles + ((skipIters - 1) << 2) + 2;
+    cycles += skipIters << 2;
+    const uint64 ticksAtRead = (lastReadCycle > t.base) ? ((lastReadCycle - t.base) >> shift) : 0;
+    t.base += ticksAtRead << shift;
+    t.TCNT -= static_cast<uint32>(ticksAtRead);
+    R[0] = t.TCNT;
+    T = 1;
+    PC = 0x0C04A2AAu;
+    return true;
+}
+
+// Exact O(1) fast-forward for pure delay spin loops (nop; dt R9; bf/s loop; nop) at 0x0C056756 / 0x0C056768.
+bool SH3::FastForwardDelayLoop(uint32 loopPc) {
+    if (R[9] <= 2 || interruptReady || cycles + 8 >= blockStop) {
+        return false;
+    }
+    const uint64 maxSkip = (blockStop - cycles - 4) >> 2;
+    const uint64 skip = std::min<uint64>(R[9] - 2, maxSkip);
+    if (skip < 2) {
+        return false;
+    }
+    R[9] -= static_cast<uint32>(skip);
+    cycles += skip << 2;
+    T = 0;
+    PC = loopPc;
+    return true;
+}
+#endif
 
 // ---------------------------------------------------------------------------------------------------------
 // Memory outside main RAM
@@ -640,6 +753,7 @@ void SH3::WriteSlow(uint32 a, uint32 v, unsigned size) {
         if (a >= 0xFFFFFD00u) {
             WriteRegister(a, v, size);
         } else if ((a & 0xFF000000u) == 0xF0000000u) {
+#ifndef XBOX_FAST_CPU
             // (the cache's address array: a dirty line is written back)
             const uint32 cost = memoryTiming.ArrayWrite(a & 0x00FFFFFFu, v, cycles);
 #ifdef SPELUNK_SHADOW_TIMING
@@ -649,6 +763,7 @@ void SH3::WriteSlow(uint32 a, uint32 v, unsigned size) {
             if (timing) {
                 cycles += cost;
             }
+#endif
         }
         return;
     }
@@ -685,12 +800,16 @@ uint32 SH3::ReadRegister(uint32 a, unsigned size) {
     case 0xFFFFFE90: return TOCR;
     case 0xFFFFFE92: return TSTR;
     case 0xFFFFFE94: case 0xFFFFFEA0: case 0xFFFFFEAC: return tmu[(a - 0xFFFFFE94) / 12].TCOR;
-    case 0xFFFFFE98: case 0xFFFFFEA4: case 0xFFFFFEB0:
-        SyncTimers();
-        return tmu[(a - 0xFFFFFE98) / 12].TCNT;
-    case 0xFFFFFE9C: case 0xFFFFFEA8: case 0xFFFFFEB4:
-        SyncTimers();
-        return tmu[(a - 0xFFFFFE9C) / 12].TCR;
+    case 0xFFFFFE98: case 0xFFFFFEA4: case 0xFFFFFEB0: {
+        const int idx = (a == 0xFFFFFE98u) ? 0 : (a == 0xFFFFFEA4u) ? 1 : 2;
+        SyncTimer(idx);
+        return tmu[idx].TCNT;
+    }
+    case 0xFFFFFE9C: case 0xFFFFFEA8: case 0xFFFFFEB4: {
+        const int idx = (a == 0xFFFFFE9Cu) ? 0 : (a == 0xFFFFFEA8u) ? 1 : 2;
+        SyncTimer(idx);
+        return tmu[idx].TCR;
+    }
     case 0xA4000020: case 0xA4000030: case 0xA4000040: case 0xA4000050: return SAR[((a >> 4) & 7) - 2];
     case 0xA4000024: case 0xA4000034: case 0xA4000044: case 0xA4000054: return DAR[((a >> 4) & 7) - 2];
     case 0xA4000028: case 0xA4000038: case 0xA4000048: case 0xA4000058: return DMATCR[((a >> 4) & 7) - 2];
@@ -726,6 +845,7 @@ void SH3::WriteRegister(uint32 a, uint32 v, unsigned size) {
     case 0xFFFFFFE0: MMUCR = v; return;
     case 0xFFFFFFEC:
         // (the CF bit throws the cache away; it is not kept)
+#ifndef XBOX_FAST_CPU
         if (v & 8) {
             if (timing) {
                 cycles += Sh3Timing::kFlushCost;
@@ -741,12 +861,17 @@ void SH3::WriteRegister(uint32 a, uint32 v, unsigned size) {
         refTiming.ccr = CCR;
         ShadowCheckWhole("CCR");
 #endif
+#else
+        CCR = v & ~8u;
+#endif
         return;
+#ifndef XBOX_FAST_CPU
     // The bus state controller: what the bus timing goes by
     case 0xFFFFFF62: memoryTiming.bcr2 = static_cast<uint16>(v); SHADOW_TIMING_ALSO(refTiming.bcr2 = static_cast<uint16>(v)); return;
     case 0xFFFFFF64: memoryTiming.wcr1 = static_cast<uint16>(v); SHADOW_TIMING_ALSO(refTiming.wcr1 = static_cast<uint16>(v)); return;
     case 0xFFFFFF66: memoryTiming.wcr2 = static_cast<uint16>(v); SHADOW_TIMING_ALSO(refTiming.wcr2 = static_cast<uint16>(v)); return;
     case 0xFFFFFF68: memoryTiming.mcr = static_cast<uint16>(v); SHADOW_TIMING_ALSO(refTiming.mcr = static_cast<uint16>(v)); return;
+#endif
     case 0xFFFFFFF0: PTEH = v; return;
     case 0xFFFFFFF4: PTEL = v; return;
     case 0xFFFFFFF8: TTB = v; return;
@@ -824,6 +949,33 @@ void SH3::RunDma(unsigned channel) {
     const int sourceStep = ((chcr >> 12) & 3) == 1 ? size : ((chcr >> 12) & 3) == 2 ? -static_cast<int>(size) : 0;
     const int destStep = ((chcr >> 14) & 3) == 1 ? size : ((chcr >> 14) & 3) == 2 ? -static_cast<int>(size) : 0;
     uint32 count = DMATCR[channel] ? DMATCR[channel] : 0x01000000u;
+#ifdef XBOX_FAST_CPU
+    cycles += static_cast<uint64>(count) * 10;
+    // Fast path: bulk NAND-port-to-RAM DMA (replaces 2,048 virtual Read8+Write8 calls per NAND page with one memcpy).
+    if (size == 1 && sourceStep == 0 && destStep == 1 && IsRam(DAR[channel])) {
+        const uint32 dstPhys = DAR[channel] & (kRamSize - 1);
+        const uint32 srcPhys = SAR[channel] & 0x1FFFFFFFu;
+        if (dstPhys + count <= kRamSize && !IsRam(SAR[channel]) && SAR[channel] < 0xE0000000u &&
+            (srcPhys & 0x1C000000u) != 0x04000000u && bus->ReadBulk(srcPhys, ram + dstPhys, count)) {
+            if (dstPhys < codeAddrEnd) [[unlikely]] {
+                NoteRamWrite(DAR[channel], count);
+            }
+            DAR[channel] += count;
+            DMATCR[channel] = 0;
+            chcr |= 2; // TE
+            return;
+        }
+    }
+    for (; count; count--) {
+        switch (size) {
+        case 1: Write8(DAR[channel], Read8(SAR[channel])); break;
+        case 2: Write16(DAR[channel], Read16(SAR[channel])); break;
+        default: Write32(DAR[channel], Read32(SAR[channel])); break;
+        }
+        SAR[channel] += sourceStep;
+        DAR[channel] += destStep;
+    }
+#else
     const bool timed = timing;
     timing = false; // (the transfers are not the CPU's own accesses)
     if (!timed) {
@@ -853,6 +1005,7 @@ void SH3::RunDma(unsigned channel) {
         DAR[channel] += destStep;
     }
     timing = timed;
+#endif
     DMATCR[channel] = 0;
     chcr |= 2; // TE
 }
@@ -890,6 +1043,7 @@ void SH3::Serialize(Archive &ar) {
     ar.Pod(TOCR);
     ar.Pod(TSTR);
     ar.Pod(CCR);
+#ifndef XBOX_FAST_CPU
     ar.Pod(memoryTiming);
     if (!ar.Saving()) {
         if (!keepPaths) {
@@ -898,6 +1052,7 @@ void SH3::Serialize(Archive &ar) {
         PollForget();
         SHADOW_TIMING_ALSO(ShadowSync());
     }
+#endif
     ar.Pod(MMUCR);
     ar.Pod(PTEH);
     ar.Pod(PTEL);

@@ -10,6 +10,9 @@
 #pragma once
 
 #include "../runtime/state.h"
+#ifdef XBOX_FAST_CPU
+#include "../native_cv1k/adpcm_cache.h"
+#endif
 
 #include <cstdint>
 #include <memory>
@@ -81,9 +84,19 @@ private:
     uint8_t m_mute = 0, m_volume = 0, m_boost = 0, m_clip = 0;
     uint64_t m_made = 0;     // samples made since m_madeFrom
     uint64_t m_madeFrom = 0; // the CPU cycle the count began at (moved when the rate changes)
+#ifdef XBOX_FAST_CPU
+    ImaAdpcmCache m_adpcmCache;
+    ImaAdpcmCache::DecoderState m_adpcmState[16];
+    bool m_useAdpcm[16] = {};
+    // Zero-spike incremental capture: records first natural playback of short SFX phrases, then commits to ADPCM.
+    bool m_capturing[16] = {};
+    uint8_t m_capturePhrase[16] = {};
+    uint32_t m_captureRate[16] = {};
+    std::vector<int16_t> m_captureBuf[16];
+#endif
 
     uint8_t Rom(uint32_t offset) const {
-        return rom[offset % romSize];
+        return rom[offset & (romSize - 1u)];
     }
     uint32_t PhraseOffset(unsigned phrase) const {
         return (Rom(4 * phrase + 1) << 16) | (Rom(4 * phrase + 2) << 8) | Rom(4 * phrase + 3);

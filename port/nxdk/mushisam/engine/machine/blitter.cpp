@@ -277,6 +277,7 @@ void Blitter::DrawOp(uint32_t &address) {
     a.dimY = (d.height & 0x0FFF) + 1;
 
     // --- the time it takes (before the draw's own clipping changes the sizes) ---
+#if !defined(XBOX_NO_SW_VRAM) && !defined(XBOX_FAST_CPU)
     // The destination is read as unsigned 16-bit here, as MAME's cv1k_v.cpp does: a draw that starts left of the clip
     // or above it costs a list entry's read alone, although the draw below paints its pixels inside. Timing such draws
     // by what they paint (2026-11-22, #56) made Mushihimesama's stage 3 late about three times as often as two boards
@@ -335,6 +336,7 @@ void Blitter::DrawOp(uint32_t &address) {
             }
         }
     }
+#endif
 
     // --- the draw ---
     if (flipX) {
@@ -442,11 +444,13 @@ void Blitter::Write(uint32_t offset, uint32_t value) {
             lastStolenCpuCycles = 0;
             stats = ListStats{};
             Run();
+#if !defined(XBOX_NO_SW_VRAM) && !defined(XBOX_FAST_CPU)
             m_delayNs += m_vramClocks * 1000000000ull / kVramClockHz;
             // (every line period the blitter stops to fetch a line of the picture for the screen, also in the time
             // those stops add)
             stats.lineFetchNs = m_delayNs / (kLinePeriodNs - kLineFetchNs) * kLineFetchNs;
             m_delayNs += stats.lineFetchNs;
+#endif
             lastBusyNs = m_delayNs;
             busy = true;
             started = true;

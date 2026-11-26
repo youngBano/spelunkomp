@@ -46,6 +46,12 @@ struct NativeList {
         uploads.clear();
         pixels.clear();
     }
+    void Reserve() {
+        steps.reserve(256);
+        draws.reserve(4096);
+        uploads.reserve(64);
+        pixels.reserve(131072);
+    }
 };
 
 // A part of VRAM

@@ -30,3 +30,8 @@ port/nxdk/core/gen/
 port/nxdk/core/obj/
 port/nxdk/mushisam/gen/
 port/nxdk/mushisam/obj/
+port/nxdk/mushisam/work/
+port/nxdk/mushisam/tests/obj/
+*.map
+*.log
+__pycache__/

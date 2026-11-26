@@ -6,6 +6,9 @@
 
 #include <cmath>
 #include <cstring>
+#if defined(__SSE__)
+#include <xmmintrin.h>
+#endif
 #if __has_include(<numbers>)
 #include <numbers>
 #else
@@ -84,22 +87,23 @@ struct Tables {
     int limit[kTableCount]; // (the bands sent at all)
 
     // A quantiser: its code bits (three samples together when grouped), the bits of one sample as the standard
-    // requantises it (nb), and the standard's C
+    // requantises it (nb), and the standard's C / 2^nb (= 1 / levels)
     struct Q {
         int levels, sampleBits, codeBits;
         bool grouped;
-        double c;
+        float c;
+        float invLevels;
     } q[kQuantisers];
 
     // The scalefactors (11172-3 Table 3-B.1: 2^(1 - i/3), as the standard prints them, to 14 decimals; 63 is not
     // used, and scales to nothing)
-    double scale[64];
+    float scale[64];
     // The matrixing (11172-3 3-A.2's N, for the 32 values of V that differ: cos(i(2k + 1)pi/64), i, k = 0 to 31)
-    double cosine[32][32];
+    float cosine[32][32];
     // The synthesis window (Table 3-B.3's D, multiples of 2^-16; D[i] for i = 0 to 256, the rest of it D[512 - i] =
     // -D[i], but where i is a multiple of 64, D[i]), arranged for Synthesise: the two taps of each of the 8 pairs of
     // vectors each output sample sums, their signs folded in, and which value of the vector each tap reads
-    double tap[2][32][8];
+    float tap[2][32][8];
     int from[2][32];
 };
 
@@ -150,7 +154,8 @@ const Tables &Built() {
                 }
             }
             // (C = 2^nb / levels: a code's fraction (2v + 1 - levels) / 2^nb, with D added, times C is the level)
-            one.c = static_cast<double>(1 << one.sampleBits) / one.levels;
+            one.c = static_cast<float>(static_cast<double>(1 << one.sampleBits) / one.levels);
+            one.invLevels = static_cast<float>(1.0 / one.levels);
         }
         for (int table = 0; table < kTableCount; table++) {
             int band = 0;
@@ -173,12 +178,12 @@ const Tables &Built() {
         }
         for (int i = 0; i < 63; i++) {
             // Portable pow/floor avoids nxdk pdclib's unimplemented exp2()/round() stubs.
-            t.scale[i] = std::floor(std::pow(2.0, 1.0 - i / 3.0) * 1e14 + 0.5) / 1e14;
+            t.scale[i] = static_cast<float>(std::floor(std::pow(2.0, 1.0 - i / 3.0) * 1e14 + 0.5) / 1e14);
         }
-        t.scale[63] = 0;
+        t.scale[63] = 0.0f;
         for (int i = 0; i < 32; i++) {
             for (int k = 0; k < 32; k++) {
-                t.cosine[i][k] = std::cos(i * (2 * k + 1) * std::numbers::pi / 64);
+                t.cosine[i][k] = static_cast<float>(std::cos(i * (2 * k + 1) * std::numbers::pi / 64));
             }
         }
         // Output sample j sums, for each pair p of vectors (the 2p'th newest and the one before it), U[64p + j] D[64p + j]
@@ -186,7 +191,8 @@ const Tables &Built() {
         // their signs: V[n] = X[16 + n] (n < 16), 0 (n = 16), -X[48 - n] (n <= 48), -X[n - 48]
         for (int j = 0; j < 32; j++) {
             for (int p = 0; p < 8; p++) {
-                const double first = Window(64 * p + j), second = Window(64 * p + 32 + j);
+                const float first = static_cast<float>(Window(64 * p + j));
+                const float second = static_cast<float>(Window(64 * p + 32 + j));
                 if (j < 16) {
                     t.tap[0][j][p] = first;   // (V[j] of the newer: X[16 + j])
                     t.tap[1][j][p] = -second; // (V[32 + j] of the older: -X[16 - j])
@@ -313,7 +319,7 @@ int AmmDecoder::DecodeFrame(int &bit, int end, int16_t *pcm, int cbrTable) {
             selection[ch][band] = quantiser[ch][band] >= 0 ? static_cast<int>(in.Take(2)) : 0;
         }
     }
-    double scale[2][3][32];
+    float scale[2][3][32];
     for (int band = 0; band < limit; band++) {
         for (int ch = 0; ch < channels; ch++) {
             if (quantiser[ch][band] < 0) {
@@ -348,7 +354,7 @@ int AmmDecoder::DecodeFrame(int &bit, int end, int16_t *pcm, int cbrTable) {
     // The samples: twelve granules of three for each band (four granules to each third of the frame, each third with
     // its scalefactor), requantised and scaled, each granule three slices through the filterbank
     int made = 0;
-    double sample[2][3][32];
+    float sample[2][3][32];
     for (int granule = 0; granule < 12 && made < slices; granule++) {
         const int part = granule / 4;
         std::memset(sample, 0, sizeof(sample));
@@ -371,13 +377,17 @@ int AmmDecoder::DecodeFrame(int &bit, int end, int16_t *pcm, int cbrTable) {
                         c = in.Take(qu.sampleBits);
                     }
                 }
-                // (the standard's s''' = C (s'' + D): s'' + D is (2v + 1 - levels) / 2^nb, exactly)
-                const double half = static_cast<double>(1 << qu.sampleBits);
+                // (the standard's s''' = C (s'' + D): (2v + 1 - levels) / 2^nb * (2^nb / levels) = (2v + 1 - levels) / levels)
+                const float invLevels = qu.invLevels;
+                const float bias = static_cast<float>(1 - qu.levels);
+                const float sc0 = scale[ch][part][band] * invLevels;
+                const bool joint = (band >= bound && channels == 2);
+                const float sc1 = joint ? (scale[1][part][band] * invLevels) : 0.0f;
                 for (int s = 0; s < 3; s++) {
-                    const double level = (2.0 * codes[s] + 1 - qu.levels) / half * qu.c;
-                    sample[ch][s][band] = level * scale[ch][part][band];
-                    if (band >= bound && channels == 2) {
-                        sample[1][s][band] = level * scale[1][part][band];
+                    const float num = 2.0f * static_cast<float>(codes[s]) + bias;
+                    sample[ch][s][band] = num * sc0;
+                    if (joint) {
+                        sample[1][s][band] = num * sc1;
                     }
                 }
             }
@@ -399,34 +409,52 @@ int AmmDecoder::DecodeFrame(int &bit, int end, int16_t *pcm, int cbrTable) {
 
 // One slice of a channel's 32 bands to 32 samples (11172-3 3-A.2): matrixed into the newest vector, then each sample
 // the window's sum over the last sixteen
-void AmmDecoder::Synthesise(int channel, const double *subbands, int bandsUsed, int16_t *pcm, int stride) {
+void AmmDecoder::Synthesise(int channel, const float *subbands, int bandsUsed, int16_t *pcm, int stride) {
     const Tables &t = Built();
-    double (*history)[32] = m_history[channel];
+    float (*history)[32] = m_history[channel];
     const int newest = m_newest[channel] = (m_newest[channel] + 15) & 15;
-    double *v = history[newest];
+    float *v = history[newest];
+#if defined(__SSE__)
+    const int bands4 = (bandsUsed + 3) & ~3;
     for (int i = 0; i < 32; i++) {
-        double sum = 0;
-        // (the bands above the table's are nothing, and adding nothing changes no sum)
+        const float *cosRow = t.cosine[i];
+        __m128 acc = _mm_setzero_ps();
+        // subbands[bandsUsed..31] are zeroed by DecodeFrame's memset, so 4-wide SSE1 load is exact.
+        // Use unaligned _mm_loadu_ps so i386-pc-win32 / nxdk 4/8-byte aligned stack/heap never #GP faults.
+        for (int k = 0; k < bands4; k += 4) {
+            acc = _mm_add_ps(acc, _mm_mul_ps(_mm_loadu_ps(subbands + k), _mm_loadu_ps(cosRow + k)));
+        }
+        __m128 shuf = _mm_shuffle_ps(acc, acc, _MM_SHUFFLE(2, 3, 0, 1));
+        __m128 sum2 = _mm_add_ps(acc, shuf);
+        __m128 hi = _mm_movehl_ps(sum2, sum2);
+        v[i] = _mm_cvtss_f32(_mm_add_ss(sum2, hi));
+    }
+#else
+    for (int i = 0; i < 32; i++) {
+        float sum = 0.0f;
         for (int k = 0; k < bandsUsed; k++) {
             sum += subbands[k] * t.cosine[i][k];
         }
         v[i] = sum;
     }
+#endif
     for (int j = 0; j < 32; j++) {
-        double out = 0;
+        float out = 0.0f;
         const int a = t.from[0][j], b = t.from[1][j];
+        const float *tap0 = t.tap[0][j];
+        const float *tap1 = t.tap[1][j];
         if (j == 16) {
             for (int p = 0; p < 8; p++) {
-                out += history[(newest + 2 * p + 1) & 15][b] * t.tap[1][j][p];
+                out += history[(newest + 2 * p + 1) & 15][b] * tap1[p];
             }
         } else {
             for (int p = 0; p < 8; p++) {
-                out += history[(newest + 2 * p) & 15][a] * t.tap[0][j][p] + history[(newest + 2 * p + 1) & 15][b] * t.tap[1][j][p];
+                out += history[(newest + 2 * p) & 15][a] * tap0[p] + history[(newest + 2 * p + 1) & 15][b] * tap1[p];
             }
         }
         // (to 16 bits: half added, then the fraction dropped toward zero)
-        const double scaled = out * 32768 + 0.5;
-        pcm[j * stride] = scaled <= -32768 ? -32768 : scaled >= 32767 ? 32767 : static_cast<int16_t>(static_cast<int>(scaled));
+        const float scaled = out * 32768.0f + 0.5f;
+        pcm[j * stride] = scaled <= -32768.0f ? -32768 : scaled >= 32767.0f ? 32767 : static_cast<int16_t>(static_cast<int>(scaled));
     }
 }
 

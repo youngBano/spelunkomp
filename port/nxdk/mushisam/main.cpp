@@ -3,6 +3,7 @@
 // streaming 132 MB NAND from D:\mushisam\mushisam_u2 (64 KB LRU cache), native AC'97 XAudio,
 // native USB XID gamepad, native MCPX 60.0184 Hz timer, GDB profiler, and R3/FAKE_PLAY mode.
 #include "machine/cv1000.h"
+#include "native_cv1k/xbox_eeprom.h"
 #include "mushisam_fake_play.h"
 #include "nv2a_cv1k_renderer.h"
 #include "xbox_audio.h"
@@ -30,27 +31,27 @@ void SwapWords(uint8_t *data, size_t size) {
 }
 
 bool LoadFileSwapped(const char *path, std::vector<uint8_t> &dst, size_t offset = 0) {
-    FILE *f = std::fopen(path, "rb");
-    if (!f) {
+    // Direct Win32/Xbox ReadFile bypasses nxdk pdclib's 1 KB byte-by-byte fread() loop (10,000x fewer syscalls).
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
         return false;
     }
-    std::fseek(f, 0, SEEK_END);
-    const long sz = std::ftell(f);
-    std::fseek(f, 0, SEEK_SET);
-    if (sz <= 0) {
-        std::fclose(f);
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0) {
+        CloseHandle(h);
         return false;
     }
-    const size_t n = static_cast<size_t>(sz);
+    const size_t n = static_cast<size_t>(sz.QuadPart);
     if (offset + n > dst.size()) {
         dst.resize(offset + n);
     }
-    const size_t got = std::fread(dst.data() + offset, 1, n, f);
-    std::fclose(f);
-    if (got != n) {
+    DWORD got = 0;
+    const BOOL ok = ReadFile(h, dst.data() + offset, static_cast<DWORD>(n), &got, nullptr);
+    CloseHandle(h);
+    if (!ok || static_cast<size_t>(got) != n) {
         return false;
     }
-    SwapWords(dst.data() + offset, got);
+    SwapWords(dst.data() + offset, n);
     return true;
 }
 
@@ -91,10 +92,15 @@ int main(void) {
 
     auto nativeListPtr = std::make_unique<spelunk::NativeList>();
     auto &nativeList = *nativeListPtr;
+    nativeList.Reserve();
     board.blitter.rasterize = false;
     board.blitter.native = &nativeList;
     board.cpu.mode = spelunk::SH3::Mode::Native;
+    board.cpu.InstallTranslations();
     board.Reset();
+
+    spelunk_xbox::XboxEeprom eeprom;
+    eeprom.Load(board.rtc);
 
     if (pb_init() != 0) {
         debugPrint("Mushihimesama: pb_init failed\n");
@@ -124,6 +130,11 @@ int main(void) {
     spelunk_xbox::XboxTimer timer;
     timer.Init();
     spelunk_xbox::g_xboxPerf.Reset();
+    spelunk_xbox::g_xboxPerf.rdtscPerUs = static_cast<uint32_t>(timer.RdtscPerUs());
+    spelunk_xbox::g_xboxPerf.SampleRamStats();
+    spelunk_xbox::P3Pmc::Configure(spelunk_xbox::P3Pmc::kEvtIfuIfetchMiss,
+                                   spelunk_xbox::P3Pmc::kEvtL2LinesIn);
+    bool programFreed = false;
 
     spelunk_xbox::MushisamFakePlay fakePlay;
     fakePlay.Reset();
@@ -189,7 +200,19 @@ int main(void) {
             board.system = sys;
 
             const uint64_t tCpu0 = spelunk_xbox::XboxTimer::NowTicks();
+            const uint64_t pmc0_a = spelunk_xbox::P3Pmc::Read(0);
+            const uint64_t pmc1_a = spelunk_xbox::P3Pmc::Read(1);
             board.RunFrame();
+            const uint64_t pmc0_b = spelunk_xbox::P3Pmc::Read(0) - pmc0_a;
+            const uint64_t pmc1_b = spelunk_xbox::P3Pmc::Read(1) - pmc1_a;
+            if (!programFreed && board.frame >= 60u && (board.cpu.PC & 0xFF800000u) == 0x0C000000u) {
+                // Reclaim 2 MB U4 flash buffer after boot copy completes (saves 2 MB on 64 MB retail Xbox).
+                std::vector<uint8_t>().swap(board.program);
+                programFreed = true;
+            }
+            if ((board.frame & 127u) == 0u) {
+                eeprom.FlushIfDirty(board.rtc);
+            }
             if (board.sound.rateChanged) {
                 audio.SetSampleRate(board.sound.sampleRate);
                 board.sound.rateChanged = false;
@@ -200,6 +223,8 @@ int main(void) {
             }
             cpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tCpu0;
             stepped = true;
+            (void)pmc0_b;
+            (void)pmc1_b;
         }
 
         if (stepped || displayChanged) {
@@ -222,12 +247,24 @@ int main(void) {
                     static_cast<uint32_t>(timer.TicksToMicros(cpuTicks)),
                     static_cast<uint32_t>(timer.TicksToMicros(renTicks)),
                     static_cast<uint32_t>(timer.TicksToMicros(gpuTicks)),
+                    static_cast<uint32_t>(timer.RdtscToMicros(board.profSh3Tsc)),
+                    static_cast<uint32_t>(timer.RdtscToMicros(board.profAudioTsc)),
+                    static_cast<uint32_t>(timer.RdtscToMicros(board.profBlitterTsc)),
+                    board.cpu.nativeBlocks,
+                    board.cpu.interpretedBlocks,
                     spelunk_xbox::MushisamFakePlay::InPlay(board) ? 1u : 0u,
                     spelunk_xbox::MushisamFakePlay::Stage(board),
                     renderer.ActiveVramPages(),
                     static_cast<uint32_t>(board.nand.reads),
+                    static_cast<uint32_t>(board.nand.cacheMisses),
                     static_cast<uint32_t>(renderer.LastDrawCount()),
-                    static_cast<uint32_t>(renderer.LastQuadCount()));
+                    static_cast<uint32_t>(renderer.LastQuadCount()),
+                    renderer.LastBatchCount(),
+                    renderer.LastStateChanges(),
+                    renderer.LastUploadCount(),
+                    renderer.SwapCount(),
+                    spelunk_xbox::P3Pmc::Read(0),
+                    spelunk_xbox::P3Pmc::Read(1));
             }
         }
 

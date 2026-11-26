@@ -174,29 +174,32 @@ SH3::Translation *SH3::Lookup(uint32 pc) {
             // (looked at once: the flash is the game's own, as the translation was made from it)
             t->epoch = 0;
             t->valid = true;
-            for (uint32 i = 0; i < t->block->length; i += 2) {
-                const uint16 op = Fetch(pc + i);
-                t->valid = t->valid && t->block->bytes[i] == static_cast<uint8>(op >> 8) && t->block->bytes[i + 1] == static_cast<uint8>(op);
+            if (t->block->bytes) {
+                for (uint32 i = 0; i < t->block->length; i += 2) {
+                    const uint16 op = Fetch(pc + i);
+                    t->valid = t->valid && t->block->bytes[i] == static_cast<uint8>(op >> 8) && t->block->bytes[i + 1] == static_cast<uint8>(op);
+                }
             }
         }
         return t->valid ? t : nullptr;
     }
     const uint32 phys = pc & (kRamSize - 1), page = phys >> 12;
-    std::vector<Translation *> &slots = m_pages[page];
-    if (slots.empty()) {
+    Translation **slots = m_pagePtrs[page];
+    if (!slots) [[unlikely]] {
         return nullptr;
     }
     // (an address can have more than one translation: code loaded over other code, each version recorded)
+    const uint32 pEpoch = pageEpoch[page];
     for (Translation *t = slots[(phys & 0xFFF) >> 1]; t; t = t->next) {
-        if (t->block->address != pc) {
+        if (t->address != pc) [[unlikely]] {
             continue;
         }
-        const uint32 last = (phys + t->block->length - 1) >> 12;
-        const uint32 lastEpoch = last < kPages ? pageEpoch[last] : 0;
-        if (t->epoch != pageEpoch[page] || t->epoch2 != lastEpoch) [[unlikely]] {
-            t->epoch = pageEpoch[page];
+        const uint32 lastEpoch = t->lastPage < kPages ? pageEpoch[t->lastPage] : 0;
+        if (t->epoch != pEpoch || t->epoch2 != lastEpoch) [[unlikely]] {
+            t->epoch = pEpoch;
             t->epoch2 = lastEpoch;
-            t->valid = phys + t->block->length <= kRamSize && std::memcmp(ram + phys, t->block->bytes, t->block->length) == 0;
+            t->valid = !t->block->bytes ||
+                       (phys + t->block->length <= kRamSize && std::memcmp(ram + phys, t->block->bytes, t->block->length) == 0);
         }
         if (t->valid) [[likely]] {
             return t;
@@ -205,10 +208,45 @@ SH3::Translation *SH3::Lookup(uint32 pc) {
     return nullptr;
 }
 
+#ifdef XBOX_FAST_CPU
+namespace {
+    void (*g_origTmuPoll)(SH3 &) = nullptr;
+    void (*g_origDelay1)(SH3 &) = nullptr;
+    void (*g_origDelay2)(SH3 &) = nullptr;
+
+    void FastTmuPollWrapper(SH3 &c) {
+        c.FastForwardTmuPoll();
+        if (c.cycles < c.blockStop && !c.interruptReady) {
+            g_origTmuPoll(c);
+        }
+    }
+    void FastDelay1Wrapper(SH3 &c) {
+        c.FastForwardDelayLoop(0x0C056756u);
+        if (c.cycles < c.blockStop && !c.interruptReady) {
+            g_origDelay1(c);
+        }
+    }
+    void FastDelay2Wrapper(SH3 &c) {
+        c.FastForwardDelayLoop(0x0C056768u);
+        if (c.cycles < c.blockStop && !c.interruptReady) {
+            g_origDelay2(c);
+        }
+    }
+} // namespace
+#endif
+
+#ifdef MUSHISAM_PROFILE_HOT
+#include <unordered_map>
+extern std::unordered_map<uint32, uint64> g_hotPcCounts;
+extern std::unordered_map<uint32, uint64> g_hotPcCycles;
+#endif
+
 void SH3::RunBlocks(uint64 stop) {
     blockStop = stop;
     if (mode == Mode::Native) {
+        uint32 localNative = 0;
         while (cycles < blockStop && !interruptReady && !sleeping) {
+#ifndef XBOX_FAST_CPU
             if (stopPc != 0xFFFFFFFFu) [[unlikely]] {
                 if ((PC & 0x1FFFFFFFu) == (stopPc & 0x1FFFFFFFu)) {
                     stopPc = 0xFFFFFFFFu;
@@ -220,9 +258,28 @@ void SH3::RunBlocks(uint64 stop) {
             if (RunNativeCall()) [[unlikely]] {
                 continue;
             }
+#endif
+            if ((PC & 0xFF800000u) == 0x0C000000u) [[likely]] {
+                const uint32 phys = PC & (kRamSize - 1);
+                if (BlockFn *fnSlots = m_pageFnPtrs[phys >> 12]) [[likely]] {
+                    if (BlockFn fn = fnSlots[(phys & 0xFFF) >> 1]) [[likely]] {
+#ifdef MUSHISAM_PROFILE_HOT
+                        const uint32 entryPc = PC;
+                        const uint64 c0 = cycles;
+#endif
+                        fn(*this);
+#ifdef MUSHISAM_PROFILE_HOT
+                        g_hotPcCounts[entryPc]++;
+                        g_hotPcCycles[entryPc] += (cycles - c0);
+#endif
+                        ++localNative;
+                        continue;
+                    }
+                }
+            }
             if (Translation *t = Lookup(PC)) [[likely]] {
-                t->block->run(*this);
-                nativeBlocks++;
+                t->run(*this);
+                ++localNative;
             } else {
                 if (countInterpreted) [[unlikely]] {
                     m_interpretedAt[PC]++;
@@ -231,6 +288,7 @@ void SH3::RunBlocks(uint64 stop) {
                 interpretedBlocks++;
             }
         }
+        nativeBlocks += localNative;
         return;
     }
     while (cycles < blockStop && !interruptReady && !sleeping) {
@@ -268,25 +326,46 @@ void SH3::InstallTranslations() {
     const NativeBlock *blocks = NativeBlocks(count);
     m_translations.assign(count, Translation{});
     m_flash.clear();
+    codeAddrEnd = 0;
+    std::memset(m_pagePtrs, 0, sizeof(m_pagePtrs));
+    std::memset(m_pageFnPtrs, 0, sizeof(m_pageFnPtrs));
     for (size_t i = 0; i < count; i++) {
         Translation &t = m_translations[i];
         t.block = &blocks[i];
+        t.run = blocks[i].run;
+        t.address = blocks[i].address;
         if (!IsRam(blocks[i].address)) {
             m_flash[blocks[i].address] = &t;
             continue;
         }
         const uint32 phys = blocks[i].address & (kRamSize - 1);
         const uint32 first = phys >> 12, last = (phys + blocks[i].length - 1) >> 12;
+        t.lastPage = last;
         for (uint32 p = first; p <= last && p < kPages; p++) {
             codeMark[p] = 1;
+            const uint32 pageEnd = (p + 1u) << 12;
+            if (pageEnd > codeAddrEnd) {
+                codeAddrEnd = pageEnd;
+            }
         }
         std::vector<Translation *> &slots = m_pages[first];
         if (slots.empty()) {
             slots.assign(2048, nullptr);
+            m_pagePtrs[first] = slots.data();
         }
         Translation *&head = slots[(phys & 0xFFF) >> 1];
         t.next = head;
         head = &t;
+
+        // Populate zero-indirection direct function-pointer table for canonical 0x0Cxxxxxx RAM blocks.
+        if (!blocks[i].bytes && (blocks[i].address & 0xFF800000u) == 0x0C000000u) {
+            std::vector<BlockFn> &fnSlots = m_fnPages[first];
+            if (fnSlots.empty()) {
+                fnSlots.assign(2048, nullptr);
+                m_pageFnPtrs[first] = fnSlots.data();
+            }
+            fnSlots[(phys & 0xFFF) >> 1] = blocks[i].run;
+        }
     }
 }
 

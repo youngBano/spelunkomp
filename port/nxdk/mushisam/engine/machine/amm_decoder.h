@@ -59,15 +59,15 @@ private:
     struct Quantiser; // (a number of levels: how its codes are read and requantised)
 
     // The last 16 matrixed vectors of each channel (the standard's V, 32 values of the 64 that differ; the newest at
-    // m_newest[channel])
-    double m_history[2][16][32];
+    // m_newest[channel]). No alignas(16) on heap-allocated member because nxdk malloc is 8-byte aligned.
+    float m_history[2][16][32];
     int m_newest[2];
 
     const uint8_t *m_data;
     int m_rate = 0, m_channels = 1;
 
     bool FindSync(Bits &in) const;
-    void Synthesise(int channel, const double *subbands, int bandsUsed, int16_t *pcm, int stride);
+    void Synthesise(int channel, const float *subbands, int bandsUsed, int16_t *pcm, int stride);
 };
 
 } // namespace spelunk

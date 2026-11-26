@@ -15,6 +15,9 @@
 #include <set>
 #include <unordered_map>
 #include <vector>
+#ifdef NXDK
+#include <windows.h>
+#endif
 
 namespace spelunk {
 
@@ -22,7 +25,12 @@ class Nand {
 public:
     static constexpr uint32_t kPageData = 2048, kPageTotal = 2048 + 64, kPages = 64 * 1024, kBlockPages = 64;
     static constexpr size_t kSize = static_cast<size_t>(kPageTotal) * kPages;
-    static constexpr uint32_t kCacheSlots = 32; // 32 * 2,112 B = ~66 KB LRU streaming cache (vs 132 MB RAM!)
+    // 256-slot 4-way set-associative LRU streaming cache (64 sets * 4 ways * 2,112 B = ~540 KB)
+    // + 256 KB sector-aligned sequential read-ahead buffer to eliminate DVD/HDD seek stalls.
+    static constexpr uint32_t kCacheSets = 64;
+    static constexpr uint32_t kCacheWays = 4;
+    static constexpr uint32_t kCacheSlots = kCacheSets * kCacheWays; // 256
+    static constexpr size_t kReadAheadBytes = 256u * 1024u;
 
     std::vector<uint8_t> data;     // Optional full in-memory image (host); empty when streaming from file on Xbox
     std::set<uint32_t> written;    // blocks the game has programmed or erased
@@ -31,6 +39,19 @@ public:
 
     bool AttachFile(const char *path) {
         CloseFile();
+#ifdef NXDK
+        // Bypass nxdk pdclib's 1 KB byte-by-byte fread() loop with direct 128 KB Xbox ReadFile() syscalls.
+        m_handle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (m_handle == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        LARGE_INTEGER sz{};
+        if (!GetFileSizeEx(m_handle, &sz) || sz.QuadPart <= 0) {
+            CloseFile();
+            return false;
+        }
+        m_fileSize = static_cast<size_t>(sz.QuadPart);
+#else
         m_file = std::fopen(path, "rb");
         if (!m_file) {
             return false;
@@ -39,27 +60,47 @@ public:
         const long sz = std::ftell(m_file);
         std::fseek(m_file, 0, SEEK_SET);
         m_fileSize = sz > 0 ? static_cast<size_t>(sz) : 0;
+#endif
         for (auto &c : m_cache) {
             c.page = UINT32_MAX;
             c.lru = 0;
         }
         m_lruClock = 0;
+        m_raOff = 0;
+        m_raLen = 0;
         m_curPageBuf = nullptr;
         m_curPageIdx = UINT32_MAX;
         return m_fileSize > 0;
     }
 
     void CloseFile() {
+#ifdef NXDK
+        if (m_handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_handle);
+            m_handle = INVALID_HANDLE_VALUE;
+        }
+#else
         if (m_file) {
             std::fclose(m_file);
             m_file = nullptr;
         }
+#endif
         m_fileSize = 0;
+        m_raOff = 0;
+        m_raLen = 0;
         m_curPageBuf = nullptr;
         m_curPageIdx = UINT32_MAX;
     }
 
-    size_t ImageSize() const { return m_file ? m_fileSize : data.size(); }
+    bool HasStreamFile() const {
+#ifdef NXDK
+        return m_handle != INVALID_HANDLE_VALUE;
+#else
+        return m_file != nullptr;
+#endif
+    }
+
+    size_t ImageSize() const { return HasStreamFile() ? m_fileSize : data.size(); }
 
     void Command(uint8_t c) {
         switch (c) {
@@ -101,12 +142,12 @@ public:
         case 0x10:
             if (m_mode == Mode::Program) {
                 if (m_page < kPages) {
-                    if (!m_file && static_cast<size_t>(m_page + 1) * kPageTotal <= data.size()) {
+                    if (!HasStreamFile() && static_cast<size_t>(m_page + 1) * kPageTotal <= data.size()) {
                         uint8_t *page = &data[static_cast<size_t>(m_page) * kPageTotal];
                         for (uint32_t i = 0; i < kPageTotal; i++) {
                             page[i] &= m_pageRegister[i];
                         }
-                    } else if (m_file) {
+                    } else if (HasStreamFile()) {
                         auto &dst = GetOrCreateDirtyPage(m_page);
                         for (uint32_t i = 0; i < kPageTotal; i++) {
                             dst[i] &= m_pageRegister[i];
@@ -127,9 +168,9 @@ public:
         case 0xD0:
             if (m_mode == Mode::Erase && m_page < kPages) {
                 const uint32_t first = m_page & ~(kBlockPages - 1);
-                if (!m_file && static_cast<size_t>(first + kBlockPages) * kPageTotal <= data.size()) {
+                if (!HasStreamFile() && static_cast<size_t>(first + kBlockPages) * kPageTotal <= data.size()) {
                     std::memset(&data[static_cast<size_t>(first) * kPageTotal], 0xFF, static_cast<size_t>(kBlockPages) * kPageTotal);
-                } else if (m_file) {
+                } else if (HasStreamFile()) {
                     for (uint32_t p = 0; p < kBlockPages; ++p) {
                         auto &dst = m_dirtyPages[first + p];
                         dst.fill(0xFF);
@@ -189,7 +230,7 @@ public:
     uint8_t Read() {
         switch (m_mode) {
         case Mode::Reading:
-            if (!m_file) {
+            if (!HasStreamFile()) {
                 return m_at < data.size() ? data[m_at++] : 0xFF;
             }
             return ReadStreamingByte();
@@ -203,6 +244,48 @@ public:
             return 0xFF;
         }
     }
+    // Bulk DMA fast path: copies `count` bytes directly from the active NAND page(s) into `dst`.
+    bool ReadBlock(uint8_t *dst, uint32_t count) {
+        if (m_mode != Mode::Reading) {
+            return false;
+        }
+        if (!HasStreamFile()) {
+            const size_t avail = m_at < data.size() ? (data.size() - m_at) : 0;
+            const size_t n = avail < count ? avail : count;
+            if (n > 0) {
+                std::memcpy(dst, data.data() + m_at, n);
+                m_at += n;
+            }
+            if (n < count) {
+                std::memset(dst + n, 0xFF, count - n);
+            }
+            return true;
+        }
+        uint32_t done = 0;
+        while (done < count) {
+            if (m_at >= m_fileSize) {
+                std::memset(dst + done, 0xFF, count - done);
+                return true;
+            }
+            if (m_streamCol >= kPageTotal) {
+                m_streamCol -= kPageTotal;
+                ++m_streamPage;
+            }
+            const uint8_t *buf = (m_streamPage == m_curPageIdx && m_curPageBuf)
+                                     ? m_curPageBuf
+                                     : FetchStreamingPage(m_streamPage);
+            const uint32_t pageLeft = kPageTotal - m_streamCol;
+            const size_t fileLeft = m_fileSize - m_at;
+            uint32_t chunk = count - done;
+            if (chunk > pageLeft) chunk = pageLeft;
+            if (static_cast<size_t>(chunk) > fileLeft) chunk = static_cast<uint32_t>(fileLeft);
+            std::memcpy(dst + done, buf + m_streamCol, chunk);
+            m_streamCol += chunk;
+            m_at += chunk;
+            done += chunk;
+        }
+        return true;
+    }
     void Write(uint8_t v) {
         if (m_mode == Mode::Program) {
             const uint32_t at = m_column + m_programmed++;
@@ -212,6 +295,7 @@ public:
         }
     }
     uint64_t reads = 0; // page reads started (the checks: how much loading a frame did)
+    uint64_t cacheMisses = 0; // streaming disk/DVD misses (for Phase 3 verification)
 
     void Serialize(Archive &ar) {
         ar.Mark(0x4E414E44);
@@ -248,36 +332,52 @@ private:
         if (pageIdx == m_curPageIdx && m_curPageBuf) {
             return m_curPageBuf;
         }
-        auto it = m_dirtyPages.find(pageIdx);
-        if (it != m_dirtyPages.end()) {
-            m_curPageIdx = pageIdx;
-            m_curPageBuf = it->second.data();
-            return m_curPageBuf;
-        }
-        uint32_t victim = 0;
-        uint32_t oldest = UINT32_MAX;
-        for (uint32_t i = 0; i < kCacheSlots; ++i) {
-            if (m_cache[i].page == pageIdx) {
-                m_cache[i].lru = ++m_lruClock;
+        if (!m_dirtyPages.empty()) {
+            auto it = m_dirtyPages.find(pageIdx);
+            if (it != m_dirtyPages.end()) {
                 m_curPageIdx = pageIdx;
-                m_curPageBuf = m_cache[i].bytes;
+                m_curPageBuf = it->second.data();
                 return m_curPageBuf;
             }
-            if (m_cache[i].lru < oldest) {
-                oldest = m_cache[i].lru;
-                victim = i;
+        }
+        // O(1) 4-way set-associative lookup (checks 4 tags instead of scanning 512 slots).
+        const uint32_t setBase = (pageIdx & (kCacheSets - 1u)) * kCacheWays;
+        uint32_t victim = setBase;
+        uint32_t oldest = UINT32_MAX;
+        for (uint32_t w = 0; w < kCacheWays; ++w) {
+            CacheSlot &cand = m_cache[setBase + w];
+            if (cand.page == pageIdx) {
+                cand.lru = ++m_lruClock;
+                m_curPageIdx = pageIdx;
+                m_curPageBuf = cand.bytes;
+                return m_curPageBuf;
+            }
+            if (cand.lru < oldest) {
+                oldest = cand.lru;
+                victim = setBase + w;
             }
         }
         CacheSlot &slot = m_cache[victim];
         slot.page = pageIdx;
         slot.lru = ++m_lruClock;
+        ++cacheMisses;
         const size_t off = static_cast<size_t>(pageIdx) * kPageTotal;
         if (off < m_fileSize) {
-            // 64 KB sequential read-ahead eliminates per-page Xbox DVD fseek/fread stalls (32x faster boot).
+            // 128 KB sequential read-ahead eliminates per-page Xbox DVD fseek/fread stalls.
             if (off < m_raOff || off + kPageTotal > m_raOff + m_raLen) {
                 m_raOff = off;
+#ifdef NXDK
+                LARGE_INTEGER pos{};
+                pos.QuadPart = static_cast<LONGLONG>(m_raOff);
+                SetFilePointerEx(m_handle, pos, nullptr, FILE_BEGIN);
+                DWORD got = 0;
+                m_raLen = ReadFile(m_handle, m_raBuf, static_cast<DWORD>(sizeof(m_raBuf)), &got, nullptr)
+                              ? static_cast<size_t>(got)
+                              : 0u;
+#else
                 std::fseek(m_file, static_cast<long>(m_raOff), SEEK_SET);
                 m_raLen = std::fread(m_raBuf, 1, sizeof(m_raBuf), m_file);
+#endif
             }
             const size_t avail = (off < m_raOff + m_raLen) ? (m_raOff + m_raLen - off) : 0;
             const size_t copyLen = avail < kPageTotal ? avail : kPageTotal;
@@ -330,11 +430,15 @@ private:
     uint64_t m_at = 0;
     uint8_t m_pageRegister[kPageTotal] = {};
 
+#ifdef NXDK
+    HANDLE m_handle = INVALID_HANDLE_VALUE;
+#else
     FILE *m_file = nullptr;
+#endif
     size_t m_fileSize = 0;
     size_t m_raOff = 0;
     size_t m_raLen = 0;
-    uint8_t m_raBuf[65536] = {};
+    uint8_t m_raBuf[kReadAheadBytes] = {};
     CacheSlot m_cache[kCacheSlots] = {};
     uint32_t m_lruClock = 0;
     uint32_t m_curPageIdx = UINT32_MAX;

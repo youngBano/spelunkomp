@@ -11,9 +11,11 @@
 // game's own layout; the accessors swap on the way in and out.
 #pragma once
 
+#ifndef XBOX_FAST_CPU
 #include "bus_timing.h"
 #ifdef SPELUNK_SHADOW_TIMING
 #include "bus_timing_shadow.h"
+#endif
 #endif
 
 #include <array>
@@ -49,6 +51,8 @@ public:
     virtual ~Bus() = default;
     virtual uint32 Read(uint32 address, unsigned size) = 0;
     virtual void Write(uint32 address, uint32 value, unsigned size) = 0;
+    // Optional bulk DMA read from a fixed hardware port (e.g. NAND data port 0x10000000) into main RAM.
+    virtual bool ReadBulk(uint32 /*address*/, uint8 * /*dst*/, uint32 /*count*/) { return false; }
     // An instruction fetched from outside main RAM (the boot flash)
     virtual uint16 Fetch(uint32 address) = 0;
     // The CPU's I/O ports (A = 0, B = 1 ... H = 7, J = 8, K = 9, L = 10): what the board drives, what it is sent
@@ -138,6 +142,18 @@ public:
     static bool IsFlash(uint32 a) {
         return (a & 0x1FFFFFFFu) < 0x400000u && a < 0xE0000000u;
     }
+#ifdef XBOX_FAST_CPU
+    // Xbox fast CPU mode: omit Sh3Timing, Sh3Paths (~600 KB+), and PollLoop; dead-code-eliminate timing/watching checks.
+    static constexpr bool timing = false;
+    static constexpr bool watching = false;
+    struct DummyAt {
+        inline DummyAt &operator=(uint32) { return *this; }
+    };
+    DummyAt at{};
+    inline void TimeAccess(uint32, uint32, bool) {}
+    inline void TimeBranch(uint32, uint32) {}
+    inline void PollForget() {}
+#else
     // The board's slowdown (bus_timing.h): with `timing` on, every data access is charged what the pipeline, the
     // cache and the bus make it cost beyond the instruction's own cycles. `at` is the address of the instruction
     // making it (set as each instruction that touches memory begins); the model reads the code it walks from RAM
@@ -243,44 +259,53 @@ public:
         refPaths.Forget();
     }
 #endif
+#endif // !XBOX_FAST_CPU
     uint8 Read8(uint32 a) {
+#ifndef XBOX_FAST_CPU
         if (timing) [[unlikely]] {
             TimeAccess(a, 1, false);
         }
+#endif
         if (IsRam(a)) [[likely]] {
             return ram[a & (kRamSize - 1)];
         }
         return static_cast<uint8>(ReadSlow(a, 1));
     }
     uint16 Read16(uint32 a) {
+#ifndef XBOX_FAST_CPU
         if (timing) [[unlikely]] {
             TimeAccess(a, 2, false);
         }
+#endif
         if (IsRam(a)) [[likely]] {
             uint16 v;
-            std::memcpy(&v, ram + (a & (kRamSize - 2)), 2);
+            __builtin_memcpy(&v, ram + (a & (kRamSize - 2)), 2);
             return __builtin_bswap16(v);
         }
         return static_cast<uint16>(ReadSlow(a & ~1u, 2));
     }
     uint32 Read32(uint32 a) {
+#ifndef XBOX_FAST_CPU
         if (timing) [[unlikely]] {
             TimeAccess(a, 4, false);
         }
+#endif
         if (IsRam(a)) [[likely]] {
             uint32 v;
-            std::memcpy(&v, ram + (a & (kRamSize - 4)), 4);
+            __builtin_memcpy(&v, ram + (a & (kRamSize - 4)), 4);
             return __builtin_bswap32(v);
         }
         return ReadSlow(a & ~3u, 4);
     }
     void Write8(uint32 a, uint8 v) {
+#ifndef XBOX_FAST_CPU
         if (timing) [[unlikely]] {
             TimeAccess(a, 1, true);
         }
         if (watching) [[unlikely]] {
             Watch(a, v, 1);
         }
+#endif
         if (IsRam(a)) [[likely]] {
             NoteCodeWrite(a);
             ram[a & (kRamSize - 1)] = v;
@@ -289,31 +314,35 @@ public:
         WriteSlow(a, v, 1);
     }
     void Write16(uint32 a, uint16 v) {
+#ifndef XBOX_FAST_CPU
         if (timing) [[unlikely]] {
             TimeAccess(a, 2, true);
         }
         if (watching) [[unlikely]] {
             Watch(a, v, 2);
         }
+#endif
         if (IsRam(a)) [[likely]] {
             NoteCodeWrite(a);
             v = __builtin_bswap16(v);
-            std::memcpy(ram + (a & (kRamSize - 2)), &v, 2);
+            __builtin_memcpy(ram + (a & (kRamSize - 2)), &v, 2);
             return;
         }
         WriteSlow(a & ~1u, v, 2);
     }
     void Write32(uint32 a, uint32 v) {
+#ifndef XBOX_FAST_CPU
         if (timing) [[unlikely]] {
             TimeAccess(a, 4, true);
         }
         if (watching) [[unlikely]] {
             Watch(a, v, 4);
         }
+#endif
         if (IsRam(a)) [[likely]] {
             NoteCodeWrite(a);
             v = __builtin_bswap32(v);
-            std::memcpy(ram + (a & (kRamSize - 4)), &v, 4);
+            __builtin_memcpy(ram + (a & (kRamSize - 4)), &v, 4);
             return;
         }
         WriteSlow(a & ~3u, v, 4);
@@ -321,7 +350,7 @@ public:
     uint16 Fetch(uint32 a) {
         if (IsRam(a)) [[likely]] {
             uint16 v;
-            std::memcpy(&v, ram + (a & (kRamSize - 2)), 2);
+            __builtin_memcpy(&v, ram + (a & (kRamSize - 2)), 2);
             return __builtin_bswap16(v);
         }
         return bus->Fetch(a & 0x1FFFFFFEu);
@@ -330,10 +359,17 @@ public:
     enum class Mode { Interpreter, Blocks, Native };
     Mode mode = Mode::Interpreter;
     static constexpr uint32 kPages = kRamSize >> 12;
+    uint32 codeAddrEnd = 0;        // upper bound (exclusive) of translated code in RAM; skips codeMark[] for data/stack writes
     uint8 codeMark[kPages] = {};   // pages of RAM that hold translated code
     uint32 pageEpoch[kPages] = {}; // moved on by each write to such a page
     void NoteCodeWrite(uint32 a) {
-        const uint32 page = (a & (kRamSize - 1)) >> 12;
+        const uint32 phys = a & (kRamSize - 1);
+#ifdef XBOX_FAST_CPU
+        if (phys >= codeAddrEnd) [[likely]] {
+            return;
+        }
+#endif
+        const uint32 page = phys >> 12;
         if (codeMark[page]) [[unlikely]] {
             ++pageEpoch[page];
         }
@@ -371,7 +407,13 @@ public:
     void WriteRegister(uint32 a, uint32 value, unsigned size);
     // Timers: brought up to the CPU's time (their counters are worked out lazily); the cycle of the next underflow
     void SyncTimers();
+    void SyncTimer(int i);
     uint64 NextTimerEvent() const;
+#ifdef XBOX_FAST_CPU
+    // O(1) exact fast-forward helpers for Mushihimesama's hot TMU poll loop (0x0C04A2AA) & delay loops (0x0C056756/68).
+    bool FastForwardTmuPoll();
+    bool FastForwardDelayLoop(uint32 loopPc);
+#endif
 
     // Debugging: addresses where the registers are printed when reached (SPELUNK_BREAK=addr,addr...)
     std::vector<uint32> breakpoints;
@@ -387,11 +429,17 @@ public:
         uint32 value;
     };
     std::vector<Written> *journal = nullptr;
+#ifndef XBOX_FAST_CPU
     bool watching = false; // (either of the two: a write goes through Watch)
     void SetJournal(std::vector<Written> *j) {
         journal = j;
         watching = journal || watchHi;
     }
+#else
+    void SetJournal(std::vector<Written> *j) {
+        journal = j;
+    }
+#endif
     // One block from PC, as the dispatcher runs it: C++ at the address first (unless `native` is false), then its
     // translation, else the interpreter (the rewrites' calls of the game's own routines: runtime/rewrite.h)
     void RunOneBlock(bool native = true);
@@ -449,16 +497,27 @@ public:
     void Describe(FILE *out) const;
 
     struct Translation {
+        void (*run)(SH3 &) = nullptr; // cached from block->run to avoid extra pointer chase on every block dispatch
+        uint32 address = 0;           // cached from block->address
+        uint32 lastPage = 0;          // cached (phys + length - 1) >> 12
+        uint32 epoch = UINT32_MAX, epoch2 = UINT32_MAX;
         const struct NativeBlock *block = nullptr;
         Translation *next = nullptr; // (the same RAM run at another segment's address)
-        uint32 epoch = UINT32_MAX, epoch2 = UINT32_MAX;
         bool valid = false;
     };
+
+    uint32 ReadSlowPublic(uint32 a, unsigned size) { return ReadSlow(a, size); }
+    void WriteSlowPublic(uint32 a, uint32 v, unsigned size) { WriteSlow(a, v, size); }
+
+    using BlockFn = void (*)(SH3 &);
 
 private:
     std::unordered_map<uint32, std::pair<NativeCall, void *>> m_nativeCalls;
     std::vector<uint8> m_nativePages;
     std::vector<Translation *> m_pages[kPages]; // (per page, one slot per halfword once the page has any)
+    Translation **m_pagePtrs[kPages] = {};      // flat direct pointers to m_pages[p].data() for zero-indirection Lookup()
+    std::vector<BlockFn> m_fnPages[kPages];     // direct function-pointer page table (XBOX_IMMUTABLE_CODE fast dispatch)
+    BlockFn *m_pageFnPtrs[kPages] = {};         // flat direct pointers to m_fnPages[p].data()
     std::unordered_map<uint32, Translation *> m_flash; // (the flash's translations, by address: it never changes)
     std::vector<Translation> m_translations;
     struct Recorded {

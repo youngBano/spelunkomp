@@ -11,7 +11,9 @@
 #include "machine/blitter.h"
 #include "xbox_asm.h"
 
+#include <nxdk/mount.h>
 #include <pbkit/pbkit.h>
+#include <windows.h>
 #include <xboxkrnl/xboxkrnl.h>
 
 #include <algorithm>
@@ -36,7 +38,8 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kMaxAllocPages = 576; // 576 * 32 KB = 18 MB hard RAM cap (safe on 64 MB Xbox)
+    static constexpr int kRetailMaxAllocPages = 768; // 768 * 32 KB = 24 MB hot RAM pool on 64 MB retail Xbox (eliminates Z:\ swaps!)
+    static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
     // 1024x(1024+4) A1R5G5B5 dynamic per-frame NV2A atlas (2 MB + 8 KB).
     static constexpr int kAtlasW = 1024;
@@ -46,6 +49,20 @@ public:
     static constexpr size_t kAtlasBytes = static_cast<size_t>(kAtlasW) * kAtlasAllocH * sizeof(uint16_t);
     static constexpr uint32_t kRectHashSlots = 4096;
     static constexpr uint32_t kRectHashMask = kRectHashSlots - 1;
+
+    // Double-buffered write-combined NV2A hardware DMA vertex buffer:
+    // Compact 16-byte vertex (int16x2 TYPE_S32K pos + float2 tex0 + D3DCOLOR diffuse = 64 B/quad = 2 PIII WC lines!).
+    // YOKO/TATE rotation and viewport scaling execute in NV2A hardware NV097_SET_COMPOSITE_MATRIX!
+    static constexpr uint32_t kMaxQuadsPerFrame = 2048;
+    static constexpr uint32_t kMaxVertsPerFrame = kMaxQuadsPerFrame * 4;
+    struct Nv2aVertex {
+        int16_t x, y;
+        float u, v;
+        uint32_t diffuse;
+    };
+    static_assert(sizeof(Nv2aVertex) == 16, "Nv2aVertex must be 16 bytes");
+    static constexpr size_t kVbFrameBytes = static_cast<size_t>(kMaxVertsPerFrame) * sizeof(Nv2aVertex);
+    static constexpr size_t kVbTotalBytes = kVbFrameBytes * 2;
 
     bool Init() {
         atlasAlloc_ = static_cast<uint16_t *>(
@@ -58,16 +75,45 @@ public:
         atlasPhysBase_ = static_cast<uint32_t>(MmGetPhysicalAddress(atlasAlloc_));
         atlasPhase_ = 0;
 
+        vbAlloc_ = static_cast<Nv2aVertex *>(
+            MmAllocateContiguousMemoryEx(kVbTotalBytes, 0, 0x3ffb000, 0, PAGE_READWRITE | PAGE_WRITECOMBINE));
+        if (!vbAlloc_) {
+            MmFreeContiguousMemory(atlasAlloc_);
+            atlasAlloc_ = nullptr;
+            atlas_ = nullptr;
+            return false;
+        }
+        vbPhysBase_ = static_cast<uint32_t>(MmGetPhysicalAddress(vbAlloc_));
+        vbPhase_ = 0;
+
+        // Detect 128 MB modded/dev Xbox at runtime to unlock full 64 MB VRAM residency (0 evictions ever).
+        maxAllocPages_ = kRetailMaxAllocPages;
+        MM_STATISTICS mmStats{};
+        mmStats.Length = sizeof(mmStats);
+        if (MmQueryStatistics(&mmStats) == STATUS_SUCCESS && mmStats.TotalPhysicalPages > 24576u) {
+            maxAllocPages_ = kTotalLogicalPages;
+        }
+
         pageTable_.assign(kTotalLogicalPages, -1);
         pagePtrs_.assign(kTotalLogicalPages, nullptr);
-        pageLru_.reserve(kMaxAllocPages);
-        pageOwner_.reserve(kMaxAllocPages);
-        pageData_.reserve(kMaxAllocPages);
+        pageOnDisk_.assign(kTotalLogicalPages, 0);
+        pageLru_.reserve(maxAllocPages_);
+        pageOwner_.reserve(maxAllocPages_);
+        pageDirty_.reserve(maxAllocPages_);
+        pageData_.reserve(maxAllocPages_);
         rectHash_.assign(kRectHashSlots, {});
-        cmds_.reserve(2048);
+        batches_.reserve(256);
+
+        // Open lossless 64 MB VRAM swap backing file on Xbox utility cache partition (Z: -> fallback E:).
+        OpenSwapFile();
 
         lruClock_ = 0;
         rectEpoch_ = 1;
+        shelfX_ = 0;
+        shelfY_ = 0;
+        shelfRowH_ = 0;
+        atlasVBias_ = static_cast<float>(kAtlasGuardRows);
+        swapCount_ = 0;
         stateInitialized_ = false;
         filterInitialized_ = false;
         geomInitialized_ = false;
@@ -76,6 +122,12 @@ public:
     }
 
     void Shutdown() {
+        CloseSwapFile();
+        if (vbAlloc_) {
+            MmFreeContiguousMemory(vbAlloc_);
+            vbAlloc_ = nullptr;
+            vbPhysBase_ = 0;
+        }
         if (atlasAlloc_) {
             MmFreeContiguousMemory(atlasAlloc_);
             atlasAlloc_ = nullptr;
@@ -85,10 +137,12 @@ public:
         pageData_.clear();
         pageTable_.clear();
         pagePtrs_.clear();
+        pageOnDisk_.clear();
         pageLru_.clear();
         pageOwner_.clear();
+        pageDirty_.clear();
         rectHash_.clear();
-        cmds_.clear();
+        batches_.clear();
         stateInitialized_ = false;
     }
 
@@ -115,58 +169,79 @@ public:
         const int scrX = static_cast<int>(blitter.clipX & 0x1FFFu);
         const int scrY = static_cast<int>(blitter.clipY & 0x0FFFu);
 
-        // 1. Cycle 4-row texture offset & reset per-frame shelf atlas.
-        atlasPhase_ = (atlasPhase_ + 1u) & 3u;
-        atlasVBias_ = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
-        shelfX_ = 0;
-        shelfY_ = 0;
-        shelfRowH_ = 0;
-        if (++rectEpoch_ == 0) {
-            rectEpoch_ = 1;
-            std::memset(rectHash_.data(), 0, rectHash_.size() * sizeof(RectHashSlot));
-        }
-        cmds_.clear();
+        // 1. Flip double-buffered hardware VB; keep persistent multi-frame A1R5G5B5 atlas warm across frames!
+        vbPhase_ ^= 1u;
+        vbCur_ = vbAlloc_ + (vbPhase_ ? kMaxVertsPerFrame : 0u);
+        vbCount_ = 0;
+        batches_.clear();
         lastDrawCount_ = list.draws.size();
+        lastUploadCount_ = static_cast<uint32_t>(list.uploads.size());
+        lastStateChanges_ = 0;
+        bool atlasMutated = false;
 
-        // 2. Process all blitter steps in exact game order.
+        // 2. Process all blitter steps in exact game order (writes vertices straight to WC hardware VB).
         for (const auto &step : list.steps) {
             if (step.upload) {
                 ApplyUpload(list.uploads[step.first], list.pixels);
-                // Any upload may mutate source VRAM regions; bump rect dedup epoch safely.
-                if (++rectEpoch_ == 0) {
-                    rectEpoch_ = 1;
-                    std::memset(rectHash_.data(), 0, rectHash_.size() * sizeof(RectHashSlot));
-                }
+                // Any upload may mutate source VRAM regions; reset persistent shelf atlas safely.
+                ResetAtlasCache();
+                atlasMutated = true;
             } else {
                 for (uint32_t i = 0; i < step.count; ++i) {
-                    ProcessDraw(list.draws[step.first + i], scrX, scrY);
+                    if (ProcessDraw(list.draws[step.first + i], scrX, scrY)) {
+                        atlasMutated = true;
+                    }
                 }
             }
         }
         list.Clear();
 
-        // 3. Flush write-combined A1R5G5B5 atlas writes before NV2A DMA.
+        // Only cycle 4-row texture offset when atlas pixels actually changed (preserves NV2A L1 tex cache on static frames!).
+        if (atlasMutated) {
+            atlasPhase_ = (atlasPhase_ + 1u) & 3u;
+            const float newBias = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
+            const float deltaBias = newBias - atlasVBias_;
+            atlasVBias_ = newBias;
+            if (deltaBias != 0.0f && vbCount_ > 0u) {
+                for (uint32_t i = 0; i < vbCount_; ++i) {
+                    vbCur_[i].v += deltaBias;
+                }
+            }
+        }
+
+        // 3. Flush write-combined A1R5G5B5 atlas & hardware vertex buffer writes before NV2A DMA.
         _mm_sfence();
 
-        // 4. Clear letterbox on layout change, then clear game viewport black.
-        if (clearFramesRemaining_ > 0) {
-            pb_fill(0, 0, static_cast<int>(screenW), static_cast<int>(screenH), 0xFF000000);
-            --clearFramesRemaining_;
-        }
-        pb_fill(clipX0_, clipY0_, clipX1_ - clipX0_, clipY1_ - clipY0_, 0xFF000000);
-
-        // 5. Push invariant NV2A state once + cycle 4-row texture offset every frame.
+        // 4. Single fused pushbuffer frame header: NV097 hardware clear + static/dynamic texture & VB DMA pointers.
         const uint32_t activeTexPhys =
             atlasPhysBase_ + atlasPhase_ * static_cast<uint32_t>(kAtlasW * sizeof(uint16_t));
         const uint32_t activeTexH = static_cast<uint32_t>(kAtlasAllocH) - atlasPhase_;
+        const uint32_t activeVbPhys = vbPhysBase_ + (vbPhase_ ? static_cast<uint32_t>(kVbFrameBytes) : 0u);
         uint32_t *p = pb_begin();
+        if (clearFramesRemaining_ > 0) {
+            const uint32_t sw = static_cast<uint32_t>(screenW);
+            const uint32_t sh = static_cast<uint32_t>(screenH);
+            p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, ((sw - 1u) << 16) | 0u);
+            p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, ((sh - 1u) << 16) | 0u);
+            p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, 0xFF000000u);
+            p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
+            --clearFramesRemaining_;
+        }
+        p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, (static_cast<uint32_t>(clipX1_ - 1) << 16) | static_cast<uint32_t>(clipX0_));
+        p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, (static_cast<uint32_t>(clipY1_ - 1) << 16) | static_cast<uint32_t>(clipY0_));
+        p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, 0xFF000000u);
+        p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
+
         if (!stateInitialized_) {
-            p = PushStaticState(p, screenW, screenH, activeTexPhys, activeTexH);
+            p = PushStaticState(p, screenW, screenH, activeTexPhys, activeTexH, activeVbPhys);
             stateInitialized_ = true;
             filterInitialized_ = false;
         } else {
             p = pb_push1(p, NV097_SET_TEXTURE_OFFSET, activeTexPhys);
             p = pb_push1(p, NV097_SET_TEXTURE_IMAGE_RECT, (kAtlasW << 16) | activeTexH);
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, activeVbPhys + 0u);
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, activeVbPhys + 12u);
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 9 * 4, activeVbPhys + 4u);
         }
         if (!filterInitialized_ || bilinear != cachedBilinear_) {
             const uint32_t filterMode = bilinear ? 2u : 1u;
@@ -176,24 +251,27 @@ public:
         }
         pb_end(p);
 
-        // 6. Submit hardware NV2A quads with state coalescing (alpha-test, blend, tint).
+        // 5. Submit hardware NV2A DMA vertex-array batches (NV097_DRAW_ARRAYS).
         SubmitDraws();
     }
 
-    size_t LastQuadCount() const { return cmds_.size(); }
+    size_t LastQuadCount() const { return vbCount_ >> 2; }
     size_t LastDrawCount() const { return lastDrawCount_; }
     uint32_t ActiveVramPages() const { return static_cast<uint32_t>(pageData_.size()); }
+    uint32_t LastBatchCount() const { return static_cast<uint32_t>(batches_.size()); }
+    uint32_t LastStateChanges() const { return lastStateChanges_; }
+    uint32_t LastUploadCount() const { return lastUploadCount_; }
+    uint32_t SwapCount() const { return swapCount_; }
 
 private:
-    struct alignas(32) DrawCmd {
-        uint32_t x[4], y[4], u[4], v[4];
-        uint32_t diffuse;
+    struct DrawBatch {
+        uint32_t firstVertex;
+        uint32_t vertexCount;
         uint32_t blendColor;
         uint16_t sFactor;
         uint16_t dFactor;
         uint8_t blendOn;
         uint8_t alphaTest;
-        uint8_t pad[2];
     };
 
     struct RectHashSlot {
@@ -222,49 +300,144 @@ private:
         return h ^ (h >> 16);
     }
 
-    // Division-free 5/6-bit CV1000 channel -> 8-bit scale (x * 255 / 31, clamped at 255).
+    // Division-free 5-bit CV1000 alpha -> 8-bit scale (x * 255 / 31, clamped at 255).
     static inline uint32_t Scale5To8(uint32_t v) {
         if (v >= 31u) return 255u;
         return (v << 3) | (v >> 2);
     }
 
-    uint16_t *GetPageWrite(int px, int py) {
-        const int logical = py * kPagesX + px;
-        if (uint16_t *ptr = pagePtrs_[logical]) {
-            return ptr;
+    // Exact 6-bit CV1000 tint (0..63, where 32 = 1.0x and 63 = 2.0x overdrive) -> 8-bit diffuse for NV2A SHIFTLEFTBY1 combiner.
+    static inline uint32_t ScaleTint6To8(uint32_t v) {
+        if (v >= 63u) return 255u;
+        return (v << 2) | (v >> 4);
+    }
+
+    void ResetAtlasCache() {
+        shelfX_ = 0;
+        shelfY_ = 0;
+        shelfRowH_ = 0;
+        if (++rectEpoch_ == 0) {
+            rectEpoch_ = 1;
+            std::memset(rectHash_.data(), 0, rectHash_.size() * sizeof(RectHashSlot));
         }
-        if (static_cast<int>(pageData_.size()) < kMaxAllocPages) {
-            const int phys = static_cast<int>(pageData_.size());
+    }
+
+    void OpenSwapFile() {
+        CloseSwapFile();
+        if (!nxIsDriveMounted('Z')) {
+            nxMountDrive('Z', "\\Device\\Harddisk0\\Partition5\\");
+        }
+        swapHandle_ = CreateFileA("Z:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (swapHandle_ == INVALID_HANDLE_VALUE) {
+            if (!nxIsDriveMounted('E')) {
+                nxMountDrive('E', "\\Device\\Harddisk0\\Partition1\\");
+            }
+            swapHandle_ = CreateFileA("E:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+    }
+
+    void CloseSwapFile() {
+        if (swapHandle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(swapHandle_);
+            swapHandle_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    void SwapOutPage(int logical, const uint16_t *src) {
+        if (swapHandle_ == INVALID_HANDLE_VALUE) {
+            return;
+        }
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
+        if (SetFilePointerEx(swapHandle_, pos, nullptr, FILE_BEGIN)) {
+            DWORD written = 0;
+            if (WriteFile(swapHandle_, src, kPageBytes, &written, nullptr) && written == kPageBytes) {
+                pageOnDisk_[logical] = 1;
+                ++swapCount_;
+            }
+        }
+    }
+
+    bool SwapInPage(int logical, uint16_t *dst) {
+        if (swapHandle_ == INVALID_HANDLE_VALUE || !pageOnDisk_[logical]) {
+            return false;
+        }
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
+        if (SetFilePointerEx(swapHandle_, pos, nullptr, FILE_BEGIN)) {
+            DWORD got = 0;
+            if (ReadFile(swapHandle_, dst, kPageBytes, &got, nullptr) && got == kPageBytes) {
+                ++swapCount_;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    uint16_t *AllocateOrEvictPage(int logical, bool forWrite) {
+        int slot = -1;
+        uint16_t *dst = nullptr;
+        if (static_cast<int>(pageData_.size()) < maxAllocPages_) {
+            slot = static_cast<int>(pageData_.size());
             pageData_.emplace_back(kPageSize * kPageSize, 0u);
             pageLru_.push_back(++lruClock_);
             pageOwner_.push_back(logical);
-            pageTable_[logical] = phys;
-            pagePtrs_[logical] = pageData_[phys].data();
-            return pagePtrs_[logical];
-        }
-        // Evict least-recently-used VRAM page (keeps RAM strictly <= 18 MB on 64 MB Xbox).
-        int victim = 0;
-        uint32_t oldest = UINT32_MAX;
-        for (int i = 0; i < kMaxAllocPages; ++i) {
-            if (pageLru_[i] < oldest) {
-                oldest = pageLru_[i];
-                victim = i;
+            pageDirty_.push_back(forWrite ? 1u : 0u);
+            dst = pageData_[slot].data();
+        } else {
+            int victim = 0;
+            uint32_t oldest = UINT32_MAX;
+            for (int i = 0; i < maxAllocPages_; ++i) {
+                if (pageLru_[i] < oldest) {
+                    oldest = pageLru_[i];
+                    victim = i;
+                }
             }
+            const int oldLogical = pageOwner_[victim];
+            uint16_t *victimPtr = pageData_[victim].data();
+            if (pageDirty_[victim] || !pageOnDisk_[oldLogical]) {
+                SwapOutPage(oldLogical, victimPtr);
+            }
+            pageTable_[oldLogical] = -1;
+            pagePtrs_[oldLogical] = nullptr;
+            slot = victim;
+            pageOwner_[slot] = logical;
+            pageLru_[slot] = ++lruClock_;
+            pageDirty_[slot] = forWrite ? 1u : 0u;
+            dst = victimPtr;
         }
-        const int oldLogical = pageOwner_[victim];
-        pageTable_[oldLogical] = -1;
-        pagePtrs_[oldLogical] = nullptr;
-        pageOwner_[victim] = logical;
-        pageLru_[victim] = ++lruClock_;
-        pageTable_[logical] = victim;
-        uint16_t *dst = pageData_[victim].data();
+        if (!SwapInPage(logical, dst)) {
+            std::memset(dst, 0, kPageBytes);
+        }
+        pageTable_[logical] = slot;
         pagePtrs_[logical] = dst;
-        std::memset(dst, 0, kPageSize * kPageSize * sizeof(uint16_t));
         return dst;
     }
 
-    inline const uint16_t *GetPageRead(int px, int py) const {
-        return pagePtrs_[py * kPagesX + px];
+    uint16_t *GetPageWrite(int px, int py) {
+        const int logical = py * kPagesX + px;
+        const int phys = pageTable_[logical];
+        if (phys >= 0) {
+            pageLru_[phys] = ++lruClock_;
+            pageDirty_[phys] = 1;
+            return pagePtrs_[logical];
+        }
+        return AllocateOrEvictPage(logical, true);
+    }
+
+    inline const uint16_t *GetPageRead(int px, int py) {
+        const int logical = py * kPagesX + px;
+        const int phys = pageTable_[logical];
+        if (phys >= 0) {
+            pageLru_[phys] = ++lruClock_;
+            return pagePtrs_[logical];
+        }
+        if (pageOnDisk_[logical]) {
+            return AllocateOrEvictPage(logical, false);
+        }
+        return nullptr;
     }
 
     void ApplyUpload(const spelunk::NativeUpload &up, const std::vector<uint16_t> &pixels) {
@@ -291,35 +464,48 @@ private:
         }
     }
 
+    // Hoisted 128x128 page-strip copy: resolves GetPageRead/LRU once per page tile instead of per scanline (up to 128x fewer lookups).
     void CopyVramRectToAtlas(int srcX0, int srcY0, int w, int h, int dstX, int dstY) {
-        for (int row = 0; row < h; ++row) {
-            const int vy = (srcY0 + row) & (kVramH - 1);
-            const int py = vy >> kPageShift;
-            const int ly = vy & kPageMask;
-            uint16_t *dstRow = atlas_ + static_cast<size_t>(dstY + row) * kAtlasW + dstX;
+        int row = 0;
+        while (row < h) {
+            const int vy0 = (srcY0 + row) & (kVramH - 1);
+            const int py = vy0 >> kPageShift;
+            const int ly0 = vy0 & kPageMask;
+            const int rowSpan = std::min(h - row, kPageSize - ly0);
+
             int col = 0;
             while (col < w) {
-                const int vx = (srcX0 + col) & (kVramW - 1);
-                const int px = vx >> kPageShift;
-                const int lx = vx & kPageMask;
-                const int chunk = std::min(w - col, kPageSize - lx);
+                const int vx0 = (srcX0 + col) & (kVramW - 1);
+                const int px = vx0 >> kPageShift;
+                const int lx = vx0 & kPageMask;
+                const int colSpan = std::min(w - col, kPageSize - lx);
                 const uint16_t *page = GetPageRead(px, py);
+                uint16_t *dstPtr = atlas_ + static_cast<size_t>(dstY + row) * kAtlasW + dstX + col;
                 if (page) {
-                    xbox_copy_u16_row_asm(page + static_cast<size_t>(ly) * kPageSize + lx,
-                                          dstRow + col, static_cast<uint32_t>(chunk));
+                    const uint16_t *srcPtr = page + static_cast<size_t>(ly0) * kPageSize + lx;
+                    for (int r = 0; r < rowSpan; ++r) {
+                        xbox_copy_u16_row_asm(srcPtr, dstPtr, static_cast<uint32_t>(colSpan));
+                        srcPtr += kPageSize;
+                        dstPtr += kAtlasW;
+                    }
                 } else {
-                    std::memset(dstRow + col, 0, static_cast<size_t>(chunk) * sizeof(uint16_t));
+                    const size_t bytes = static_cast<size_t>(colSpan) * sizeof(uint16_t);
+                    for (int r = 0; r < rowSpan; ++r) {
+                        std::memset(dstPtr, 0, bytes);
+                        dstPtr += kAtlasW;
+                    }
                 }
-                col += chunk;
+                col += colSpan;
             }
+            row += rowSpan;
         }
     }
 
-    void ProcessDraw(const spelunk::NativeDraw &d, int scrX, int scrY) {
+    bool ProcessDraw(const spelunk::NativeDraw &d, int scrX, int scrY) {
         const int w = d.x1 - d.x0 + 1;
         const int h = d.y1 - d.y0 + 1;
         if (w <= 0 || h <= 0) {
-            return;
+            return false;
         }
 
         // Convert VRAM destination rect to screen-relative coordinates (320x240 window at scrollX, scrollY).
@@ -328,7 +514,7 @@ private:
         const int dx1 = dx0 + w;
         const int dy1 = dy0 + h;
         if (dx1 <= 0 || dx0 >= kSrcWidth || dy1 <= 0 || dy0 >= kSrcHeight) {
-            return;
+            return false;
         }
 
         const bool flipX = (d.flags & spelunk::NativeDraw::kFlipX) != 0;
@@ -337,10 +523,10 @@ private:
         const int srcY0 = flipY ? (d.sy - d.y1) : (d.sy + d.y0);
 
         if (w > kAtlasW || h > kAtlasH) {
-            return;
+            return false;
         }
 
-        // O(1) per-frame rect dedup in 2 MB A1R5G5B5 atlas.
+        // O(1) persistent multi-frame rect dedup in 2 MB A1R5G5B5 atlas.
         const uint64_t key = (static_cast<uint64_t>(w & 0x3FF) << 44) |
                              (static_cast<uint64_t>(h & 0x3FF) << 34) |
                              (static_cast<uint64_t>(srcX0 & 0x1FFF) << 16) |
@@ -361,8 +547,10 @@ private:
             }
         }
         if (!slot) {
-            return;
+            ResetAtlasCache();
+            slot = &rectHash_[hBase];
         }
+        bool copiedToAtlas = false;
         if (!hit) {
             if (shelfX_ + w > kAtlasW) {
                 shelfX_ = 0;
@@ -370,7 +558,9 @@ private:
                 shelfRowH_ = 0;
             }
             if (shelfY_ + h > kAtlasH) {
-                return;
+                // Shelf full across frames: reset persistent cache cleanly and place at (0, 0).
+                ResetAtlasCache();
+                slot = &rectHash_[hBase];
             }
             const int dstX = shelfX_;
             const int dstY = shelfY_;
@@ -383,14 +573,16 @@ private:
             slot->u0 = static_cast<uint16_t>(dstX);
             slot->v0 = static_cast<uint16_t>(dstY);
             slot->epoch = rectEpoch_;
+            copiedToAtlas = true;
         }
 
-        // Compute tint & blend state (division-free Scale5To8).
-        uint32_t diffuse = 0xFFFFFFFFu;
+        // Compute tint & blend state for NV2A Stage-0 SHIFTLEFTBY1 (2x overdrive) Register Combiner:
+        // Untinted = 0xFF808080 (0.502 * 2 = 1.0x); tint 0..63 maps 32 -> 1.0x, 63 -> 2.0x hit-flash overdrive!
+        uint32_t diffuse = 0xFF808080u;
         if (d.flags & spelunk::NativeDraw::kTinted) {
-            const uint32_t tr = Scale5To8((d.colours >> 10) & 0x3Fu);
-            const uint32_t tg = Scale5To8((d.colours >> 16) & 0x3Fu);
-            const uint32_t tb = Scale5To8((d.colours >> 22) & 0x3Fu);
+            const uint32_t tr = ScaleTint6To8((d.colours >> 10) & 0x3Fu);
+            const uint32_t tg = ScaleTint6To8((d.colours >> 16) & 0x3Fu);
+            const uint32_t tb = ScaleTint6To8((d.colours >> 22) & 0x3Fu);
             diffuse = 0xFF000000u | (tb << 16) | (tg << 8) | tr;
         }
 
@@ -424,116 +616,112 @@ private:
             }
         }
 
-        // Emit screen-space quad with 0.001-texel UV inset.
+        if (vbCount_ + 4u > kMaxVertsPerFrame) {
+            return copiedToAtlas;
+        }
+
+        // Emit compact 16-byte integer-position quad directly into write-combined NV2A hardware vertex buffer.
+        // NV2A hardware NV097_SET_COMPOSITE_MATRIX performs YOKO 90 deg CCW / TATE transform & viewport scaling!
         constexpr float kUvEps = 0.001f;
         const float uMin = static_cast<float>(slot->u0) + kUvEps;
         const float uMax = static_cast<float>(slot->u0 + w) - kUvEps;
         const float vMin = static_cast<float>(slot->v0) + atlasVBias_ + kUvEps;
         const float vMax = static_cast<float>(slot->v0 + h) + atlasVBias_ - kUvEps;
-        const uint32_t fu0 = FloatBits(flipX ? uMax : uMin);
-        const uint32_t fu1 = FloatBits(flipX ? uMin : uMax);
-        const uint32_t fv0 = FloatBits(flipY ? vMax : vMin);
-        const uint32_t fv1 = FloatBits(flipY ? vMin : vMax);
+        const float fu0 = flipX ? uMax : uMin;
+        const float fu1 = flipX ? uMin : uMax;
+        const float fv0 = flipY ? vMax : vMin;
+        const float fv1 = flipY ? vMin : vMax;
 
-        DrawCmd cmd{};
-        cmd.diffuse = diffuse;
-        cmd.blendColor = blendColor;
-        cmd.sFactor = sFactor;
-        cmd.dFactor = dFactor;
-        cmd.blendOn = blendOn ? 1u : 0u;
-        cmd.alphaTest = (d.flags & spelunk::NativeDraw::kTransparent) ? 1u : 0u;
+        const int16_t ix0 = static_cast<int16_t>(dx0);
+        const int16_t iy0 = static_cast<int16_t>(dy0);
+        const int16_t ix1 = static_cast<int16_t>(dx1);
+        const int16_t iy1 = static_cast<int16_t>(dy1);
+        Nv2aVertex *v = vbCur_ + vbCount_;
+        v[0] = {ix0, iy0, fu0, fv0, diffuse};
+        v[1] = {ix1, iy0, fu1, fv0, diffuse};
+        v[2] = {ix1, iy1, fu1, fv1, diffuse};
+        v[3] = {ix0, iy1, fu0, fv1, diffuse};
 
-        const float ax0 = static_cast<float>(dx0), ay0 = static_cast<float>(dy0);
-        const float ax1 = static_cast<float>(dx1), ay1 = static_cast<float>(dy1);
-        if (!cachedTate_) {
-            const uint32_t xA = FloatBits(ay0 * scrScaleX_ + scrOffsetX_);
-            const uint32_t xB = FloatBits(ay1 * scrScaleX_ + scrOffsetX_);
-            const uint32_t yA = FloatBits(ax0 * scrScaleY_ + scrOffsetY_);
-            const uint32_t yB = FloatBits(ax1 * scrScaleY_ + scrOffsetY_);
-            cmd.x[0] = xA; cmd.y[0] = yA; cmd.u[0] = fu0; cmd.v[0] = fv0;
-            cmd.x[1] = xA; cmd.y[1] = yB; cmd.u[1] = fu1; cmd.v[1] = fv0;
-            cmd.x[2] = xB; cmd.y[2] = yB; cmd.u[2] = fu1; cmd.v[2] = fv1;
-            cmd.x[3] = xB; cmd.y[3] = yA; cmd.u[3] = fu0; cmd.v[3] = fv1;
-        } else {
-            const uint32_t xA = FloatBits(ax0 * scrScaleX_ + scrOffsetX_);
-            const uint32_t xB = FloatBits(ax1 * scrScaleX_ + scrOffsetX_);
-            const uint32_t yA = FloatBits(ay0 * scrScaleY_ + scrOffsetY_);
-            const uint32_t yB = FloatBits(ay1 * scrScaleY_ + scrOffsetY_);
-            cmd.x[0] = xA; cmd.y[0] = yA; cmd.u[0] = fu0; cmd.v[0] = fv0;
-            cmd.x[1] = xB; cmd.y[1] = yA; cmd.u[1] = fu1; cmd.v[1] = fv0;
-            cmd.x[2] = xB; cmd.y[2] = yB; cmd.u[2] = fu1; cmd.v[2] = fv1;
-            cmd.x[3] = xA; cmd.y[3] = yB; cmd.u[3] = fu0; cmd.v[3] = fv1;
+        const uint8_t bOn = blendOn ? 1u : 0u;
+        const uint8_t aTest = (d.flags & spelunk::NativeDraw::kTransparent) ? 1u : 0u;
+        if (!batches_.empty()) {
+            DrawBatch &b = batches_.back();
+            if (b.alphaTest == aTest && b.blendOn == bOn &&
+                (!bOn || (b.sFactor == sFactor && b.dFactor == dFactor && b.blendColor == blendColor))) {
+                b.vertexCount += 4u;
+                vbCount_ += 4u;
+                return copiedToAtlas;
+            }
         }
-        cmds_.push_back(cmd);
+        batches_.push_back({vbCount_, 4u, blendColor, sFactor, dFactor, bOn, aTest});
+        vbCount_ += 4u;
+        return copiedToAtlas;
     }
 
+    // Direct NV097_DRAW_ARRAYS hardware DMA submission: ~2 DWORDs per 64 quads instead of 28 DWORDs/quad!
     void SubmitDraws() {
-        if (cmds_.empty()) {
+        if (batches_.empty()) {
             return;
         }
         uint8_t curAlpha = 0xFF, curBlend = 0xFF;
         uint16_t curSF = 0xFFFF, curDF = 0xFFFF;
-        uint32_t curBlendCol = 0, curDiff = 0;
+        uint32_t curBlendCol = 0;
 
-        size_t i = 0;
-        const size_t total = cmds_.size();
-        while (i < total) {
-            uint32_t *p = pb_begin();
-            size_t emitted = 0;
-            bool inBegin = false;
-
-            while (i < total && emitted < 256) {
-                const DrawCmd &c = cmds_[i];
-                const bool stateDiff = (c.alphaTest != curAlpha) || (c.blendOn != curBlend) ||
-                                       (c.blendOn && (c.sFactor != curSF || c.dFactor != curDF || c.blendColor != curBlendCol));
-                if (stateDiff) {
-                    if (inBegin) {
-                        p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
-                        inBegin = false;
-                    }
-                    if (c.alphaTest != curAlpha) {
-                        p = pb_push1(p, NV097_SET_ALPHA_TEST_ENABLE, c.alphaTest);
-                        curAlpha = c.alphaTest;
-                    }
-                    if (c.blendOn != curBlend) {
-                        p = pb_push1(p, NV097_SET_BLEND_ENABLE, c.blendOn);
-                        curBlend = c.blendOn;
-                    }
-                    if (c.blendOn) {
-                        if (c.sFactor != curSF) {
-                            p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, c.sFactor);
-                            curSF = c.sFactor;
-                        }
-                        if (c.dFactor != curDF) {
-                            p = pb_push1(p, NV097_SET_BLEND_FUNC_DFACTOR, c.dFactor);
-                            curDF = c.dFactor;
-                        }
-                        if (c.blendColor != curBlendCol) {
-                            p = pb_push1(p, NV097_SET_BLEND_COLOR, c.blendColor);
-                            curBlendCol = c.blendColor;
-                        }
-                    }
-                }
-                if (!inBegin) {
-                    p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_QUADS);
-                    inBegin = true;
-                }
-                if (c.diffuse != curDiff) {
-                    p = pb_push1(p, NV097_SET_DIFFUSE_COLOR4I, c.diffuse);
-                    curDiff = c.diffuse;
-                }
-                for (int v = 0; v < 4; ++v) {
-                    p = pb_push2(p, NV097_SET_VERTEX_DATA2F_M + 9 * 8, c.u[v], c.v[v]);
-                    p = pb_push3(p, NV097_SET_VERTEX3F, c.x[v], c.y[v], kFloatZeroBits);
-                }
-                ++i;
-                ++emitted;
+        uint32_t *p = pb_begin();
+        uint32_t pushed = 0;
+        for (const DrawBatch &b : batches_) {
+            if (pushed > 480u) {
+                pb_end(p);
+                p = pb_begin();
+                pushed = 0;
             }
-            if (inBegin) {
-                p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
+            if (b.alphaTest != curAlpha) {
+                p = pb_push1(p, NV097_SET_ALPHA_TEST_ENABLE, b.alphaTest);
+                curAlpha = b.alphaTest;
+                pushed += 2u;
+                ++lastStateChanges_;
             }
-            pb_end(p);
+            if (b.blendOn != curBlend) {
+                p = pb_push1(p, NV097_SET_BLEND_ENABLE, b.blendOn);
+                curBlend = b.blendOn;
+                pushed += 2u;
+                ++lastStateChanges_;
+            }
+            if (b.blendOn) {
+                if (b.sFactor != curSF) {
+                    p = pb_push1(p, NV097_SET_BLEND_FUNC_SFACTOR, b.sFactor);
+                    curSF = b.sFactor;
+                    pushed += 2u;
+                    ++lastStateChanges_;
+                }
+                if (b.dFactor != curDF) {
+                    p = pb_push1(p, NV097_SET_BLEND_FUNC_DFACTOR, b.dFactor);
+                    curDF = b.dFactor;
+                    pushed += 2u;
+                    ++lastStateChanges_;
+                }
+                if (b.blendColor != curBlendCol) {
+                    p = pb_push1(p, NV097_SET_BLEND_COLOR, b.blendColor);
+                    curBlendCol = b.blendColor;
+                    pushed += 2u;
+                    ++lastStateChanges_;
+                }
+            }
+            p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_QUADS);
+            pushed += 2u;
+            uint32_t start = b.firstVertex;
+            uint32_t rem = b.vertexCount;
+            while (rem > 0u) {
+                const uint32_t chunk = rem > 256u ? 256u : rem;
+                p = pb_push1(p, NV097_DRAW_ARRAYS, ((chunk - 1u) << 24) | (start & 0x00FFFFFFu));
+                start += chunk;
+                rem -= chunk;
+                pushed += 2u;
+            }
+            p = pb_push1(p, NV097_SET_BEGIN_END, NV097_SET_BEGIN_END_OP_END);
+            pushed += 2u;
         }
+        pb_end(p);
     }
 
     void ComputeViewport(float screenW, float screenH, bool tateMode, bool integerScale) {
@@ -584,7 +772,7 @@ private:
     }
 
     uint32_t *PushStaticState(uint32_t *p, float screenW, float screenH,
-                              uint32_t texPhys, uint32_t texH) const {
+                              uint32_t texPhys, uint32_t texH, uint32_t vbPhys) const {
         (void)screenW;
         (void)screenH;
         const uint32_t texFmt =
@@ -592,12 +780,26 @@ private:
             (NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5 << 8) | (1u << 16);
         const uint32_t texAddr = 3u | (3u << 8) | (3u << 16);
 
-        const float kComposite[16] = {
-            1.0f, 0.0f, 0.0f, 0.0f,
-            0.0f, 1.0f, 0.0f, 0.0f,
-            0.0f, 0.0f, 1.0f, 0.0f,
-            0.0f, 0.0f, 0.0f, 1.0f
-        };
+        // Hardware NV097_SET_COMPOSITE_MATRIX: offloads YOKO 90 deg CCW / TATE rotation & viewport scaling to NV2A!
+        // NV2A computes row-vector * matrix or column-vector: out.x = dot(row0, pos), out.y = dot(row1, pos).
+        float composite[16];
+        if (!cachedTate_) {
+            const float m[16] = {
+                0.0f,       scrScaleX_, 0.0f, scrOffsetX_,
+                scrScaleY_, 0.0f,       0.0f, scrOffsetY_,
+                0.0f,       0.0f,       1.0f, 0.0f,
+                0.0f,       0.0f,       0.0f, 1.0f
+            };
+            std::memcpy(composite, m, sizeof(composite));
+        } else {
+            const float m[16] = {
+                scrScaleX_, 0.0f,       0.0f, scrOffsetX_,
+                0.0f,       scrScaleY_, 0.0f, scrOffsetY_,
+                0.0f,       0.0f,       1.0f, 0.0f,
+                0.0f,       0.0f,       0.0f, 1.0f
+            };
+            std::memcpy(composite, m, sizeof(composite));
+        }
 
         p = pb_push1(p, NV097_SET_DEPTH_TEST_ENABLE, 0);
         p = pb_push1(p, NV097_SET_DEPTH_MASK, 0);
@@ -625,7 +827,7 @@ private:
 
         pb_push(p, NV097_SET_COMPOSITE_MATRIX, 16);
         p++;
-        std::memcpy(p, kComposite, sizeof(kComposite));
+        std::memcpy(p, composite, sizeof(composite));
         p += 16;
 
         p = pb_push4(p, NV097_SET_VIEWPORT_OFFSET, kFloatZeroBits, kFloatZeroBits, kFloatZeroBits, kFloatZeroBits);
@@ -644,16 +846,34 @@ private:
         p = pb_push1(p, NV097_SET_SHADER_STAGE_PROGRAM, NV097_SET_SHADER_STAGE_PROGRAM_STAGE0_2D_PROJECTIVE);
         p = pb_push1(p, NV097_SET_SHADER_OTHER_STAGE_INPUT, 0);
 
-        // Stage 0 combiner: AB_DST (bits 4..7) = SPARE0 (0xC0) = TEX0.rgb * DIFFUSE.rgb;
+        // Stage 0 combiner: AB_DST (bits 4..7) = SPARE0 (0xC0) = clamp(2.0 * TEX0.rgb * DIFFUSE.rgb, 0..1)
+        // via NV097_SET_COMBINER_COLOR_OCW_OP_SHIFTLEFTBY1 (0x00010000u) for exact CV1000 0x..2x hit-flash overdrive!
         // Final combiner: RGB = SPARE0 (0x0C), A = TEX0.a (0x18 << 8).
         p = pb_push1(p, NV097_SET_COMBINER_CONTROL, NV097_SET_COMBINER_CONTROL_ITERATION_COUNT_ONE);
         p = pb_push1(p, NV097_SET_COMBINER_COLOR_ICW, 0x08040000u);
-        p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW, 0x000000C0u);
+        p = pb_push1(p, NV097_SET_COMBINER_COLOR_OCW,
+                     0x000000C0u | (NV097_SET_COMBINER_COLOR_OCW_OP_SHIFTLEFTBY1 << 15));
         p = pb_push1(p, NV097_SET_COMBINER_ALPHA_ICW, 0x18200000u);
         p = pb_push1(p, NV097_SET_COMBINER_ALPHA_OCW, 0x000000C0u);
         p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW0, 0x0000000Cu);
         p = pb_push1(p, NV097_SET_COMBINER_SPECULAR_FOG_CW1, 0x00001800u);
-        p = pb_push1(p, NV097_SET_DIFFUSE_COLOR4I, 0xFFFFFFFFu);
+        p = pb_push1(p, NV097_SET_DIFFUSE_COLOR4I, 0xFF808080u);
+
+        // Configure NV2A hardware DMA vertex array streams (16-byte stride: Pos2S32K @ 0, Tex0_2F @ 4, Diffuse4UB @ 12).
+        for (uint32_t attr = 0; attr < 16u; ++attr) {
+            p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_FORMAT + attr * 4u,
+                         NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F); // size = 0 (disabled)
+        }
+        const uint32_t stride = static_cast<uint32_t>(sizeof(Nv2aVertex)) << 8;
+        p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4u,
+                     stride | (2u << 4) | NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K);
+        p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4u, vbPhys + 0u);
+        p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4u,
+                     stride | (4u << 4) | NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL);
+        p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4u, vbPhys + 12u);
+        p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_FORMAT + 9 * 4u,
+                     stride | (2u << 4) | NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_F);
+        p = pb_push1(p, NV097_SET_VERTEX_DATA_ARRAY_OFFSET + 9 * 4u, vbPhys + 4u);
         return p;
     }
 
@@ -663,17 +883,30 @@ private:
     uint32_t atlasPhase_ = 0;
     float atlasVBias_ = 0.0f;
 
+    Nv2aVertex *vbAlloc_ = nullptr;
+    Nv2aVertex *vbCur_ = nullptr;
+    uint32_t vbPhysBase_ = 0;
+    uint32_t vbPhase_ = 0;
+    uint32_t vbCount_ = 0;
+
     std::vector<int> pageTable_;
     std::vector<uint16_t *> pagePtrs_;
+    std::vector<uint8_t> pageOnDisk_;
     std::vector<uint32_t> pageLru_;
     std::vector<int> pageOwner_;
+    std::vector<uint8_t> pageDirty_;
     std::vector<std::vector<uint16_t>> pageData_;
+    HANDLE swapHandle_ = INVALID_HANDLE_VALUE;
     uint32_t lruClock_ = 0;
 
     std::vector<RectHashSlot> rectHash_;
-    std::vector<DrawCmd> cmds_;
+    std::vector<DrawBatch> batches_;
     uint16_t rectEpoch_ = 1;
     int shelfX_ = 0, shelfY_ = 0, shelfRowH_ = 0;
+    int maxAllocPages_ = kRetailMaxAllocPages;
+    uint32_t swapCount_ = 0;
+    uint32_t lastStateChanges_ = 0;
+    uint32_t lastUploadCount_ = 0;
     size_t lastDrawCount_ = 0;
 
     float scrScaleX_ = 0.0f, scrOffsetX_ = 0.0f, scrScaleY_ = 0.0f, scrOffsetY_ = 0.0f;

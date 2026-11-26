@@ -23,7 +23,16 @@ void Ymz770::Reset() {
     for (int i = 0; i < 16; i++) {
         m_channels[i] = Channel{};
         m_decoders[i] = std::make_unique<AmmDecoder>(rom);
+#ifdef XBOX_FAST_CPU
+        m_adpcmState[i].Reset();
+        m_useAdpcm[i] = false;
+        m_capturing[i] = false;
+        m_captureBuf[i].clear();
+#endif
     }
+#ifdef XBOX_FAST_CPU
+    m_adpcmCache.Reset();
+#endif
     for (Sequence &s : m_sequences) {
         s = Sequence{};
     }
@@ -114,8 +123,59 @@ int16_t Ymz770::Sample() {
                         m_decoders[i]->Forget();
                     }
                     c.pending = false;
+#ifdef XBOX_FAST_CPU
+                    const uint8_t pIdx = static_cast<uint8_t>(c.phrase & 0xFFu);
+                    m_useAdpcm[i] = false;
+                    m_capturing[i] = false;
+                    m_captureBuf[i].clear();
+                    m_adpcmState[i].Reset();
+                    if (m_adpcmCache.Get(pIdx)) {
+                        m_useAdpcm[i] = true;
+                    } else if (!m_adpcmCache.IsRejected(pIdx) && !c.loop) {
+                        // Stream-capture this phrase incrementally across natural AMM frames (zero first-play spike!).
+                        m_capturing[i] = true;
+                        m_capturePhrase[i] = pIdx;
+                        m_captureRate[i] = sampleRate;
+                    }
+#endif
                 }
-                const int made = m_decoders[i]->DecodeFrame(c.position, static_cast<int>(romSize * 8), m_block[i].data(), c.tableIndex);
+                int made = 0;
+                int rate = 0;
+#ifdef XBOX_FAST_CPU
+                if (m_useAdpcm[i]) {
+                    if (const auto *entry = m_adpcmCache.Get(static_cast<uint8_t>(c.phrase & 0xFFu))) {
+                        made = ImaAdpcmCache::DecodeBlock(*entry, m_adpcmState[i], m_block[i].data(), 1152u);
+                        rate = static_cast<int>(entry->sampleRate);
+                    }
+                } else
+#endif
+                {
+                    made = m_decoders[i]->DecodeFrame(c.position, static_cast<int>(romSize * 8), m_block[i].data(), c.tableIndex);
+                    rate = m_decoders[i]->Rate();
+#ifdef XBOX_FAST_CPU
+                    if (m_capturing[i]) {
+                        if (rate > 0) m_captureRate[i] = static_cast<uint32_t>(rate);
+                        if (made > 0 && m_captureBuf[i].size() + static_cast<size_t>(made) <= ImaAdpcmCache::kMaxSfxSamples) {
+                            m_captureBuf[i].insert(m_captureBuf[i].end(), m_block[i].data(), m_block[i].data() + made);
+                            if (made < 1152) {
+                                m_adpcmCache.StorePcm(m_capturePhrase[i], m_captureRate[i],
+                                                      m_captureBuf[i].data(), static_cast<uint32_t>(m_captureBuf[i].size()));
+                                m_capturing[i] = false;
+                                m_captureBuf[i].clear();
+                            }
+                        } else if (made <= 0 && !m_captureBuf[i].empty()) {
+                            m_adpcmCache.StorePcm(m_capturePhrase[i], m_captureRate[i],
+                                                  m_captureBuf[i].data(), static_cast<uint32_t>(m_captureBuf[i].size()));
+                            m_capturing[i] = false;
+                            m_captureBuf[i].clear();
+                        } else {
+                            m_adpcmCache.MarkRejected(m_capturePhrase[i]);
+                            m_capturing[i] = false;
+                            m_captureBuf[i].clear();
+                        }
+                    }
+#endif
+                }
                 if (made <= 0) {
                     c.playing = !c.lastBlock; // (a phrase that gives nothing twice running is over)
                     c.lastBlock = true;
@@ -123,7 +183,6 @@ int16_t Ymz770::Sample() {
                     continue;
                 }
                 c.remaining = made;
-                const int rate = m_decoders[i]->Rate();
                 if (rate > 0 && static_cast<uint32_t>(rate) != sampleRate) {
                     sampleRate = static_cast<uint32_t>(rate);
                 }
