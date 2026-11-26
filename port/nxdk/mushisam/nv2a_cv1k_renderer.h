@@ -38,13 +38,13 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 704; // 704 * 32 KB = 22 MB hot RAM pool on 64 MB retail Xbox
+    static constexpr int kRetailMaxAllocPages = 768; // 768 * 32 KB = 24 MB hot RAM pool (eliminates Stage 1 disk swaps)
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
-    // 1024x(2048+4) A1R5G5B5 NV2A shelf atlas (4 MB + 8 KB) + 8,192-slot Mix64 hash table:
-    // Holds pre-upload AND post-upload rects in a single frame without ever overwriting queued quads!
+    // 1024x(1024+4) A1R5G5B5 NV2A shelf atlas (2 MB + 8 KB) + 8,192-slot Mix64 hash table:
+    // Holds sprites & tilemap rects persistently across frames; FlushMidFrameAndResetShelf() handles overflow cleanly.
     static constexpr int kAtlasW = 1024;
-    static constexpr int kAtlasH = 2048;
+    static constexpr int kAtlasH = 1024;
     static constexpr int kAtlasGuardRows = 4;
     static constexpr int kAtlasAllocH = kAtlasH + kAtlasGuardRows;
     static constexpr size_t kAtlasBytes = static_cast<size_t>(kAtlasW) * kAtlasAllocH * sizeof(uint16_t);
@@ -110,6 +110,7 @@ public:
 
         lruClock_ = 0;
         rectEpoch_ = 1;
+        tileEpoch_ = 1;
         shelfX_ = 0;
         shelfY_ = 0;
         shelfRowH_ = 0;
@@ -190,6 +191,11 @@ public:
         lastDrawCount_ = list.draws.size();
         lastUploadCount_ = static_cast<uint32_t>(list.uploads.size());
         lastStateChanges_ = 0;
+        lastBlitVramTsc_ = 0;
+        lastAtlasCopyTsc_ = 0;
+        lastPbSubmitTsc_ = 0;
+        lastAtlasHits_ = 0;
+        lastAtlasMisses_ = 0;
         frameHeaderPushed_ = false;
         curScreenW_ = screenW;
         curScreenH_ = screenH;
@@ -214,10 +220,12 @@ public:
         _mm_sfence();
 
         // 4. Push frame header (if not already pushed by a mid-frame overflow flush) & submit hardware batches.
+        const uint64_t tPb0 = ReadRdtsc();
         if (!frameHeaderPushed_) {
             PushFrameHeader(screenW, screenH, bilinear);
         }
         SubmitDraws();
+        lastPbSubmitTsc_ += ReadRdtsc() - tPb0;
     }
 
     size_t LastQuadCount() const { return vbCount_ >> 2; }
@@ -227,6 +235,11 @@ public:
     uint32_t LastStateChanges() const { return lastStateChanges_; }
     uint32_t LastUploadCount() const { return lastUploadCount_; }
     uint32_t SwapCount() const { return swapCount_; }
+    uint64_t LastBlitVramTsc() const { return lastBlitVramTsc_; }
+    uint64_t LastAtlasCopyTsc() const { return lastAtlasCopyTsc_; }
+    uint64_t LastPbSubmitTsc() const { return lastPbSubmitTsc_; }
+    uint32_t LastAtlasHits() const { return lastAtlasHits_; }
+    uint32_t LastAtlasMisses() const { return lastAtlasMisses_; }
 
 private:
     struct DrawBatch {
@@ -244,7 +257,7 @@ private:
         uint16_t u0 = 0;
         uint16_t v0 = 0;
         uint16_t epoch = 0;
-        uint16_t pad = 0;
+        uint16_t isTile = 0;
     };
 
     static constexpr uint32_t kFloatZeroBits = 0x00000000u;
@@ -254,6 +267,12 @@ private:
         uint32_t bits = 0;
         std::memcpy(&bits, &v, sizeof(bits));
         return bits;
+    }
+
+    static inline uint64_t ReadRdtsc() {
+        uint32_t lo = 0, hi = 0;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        return (static_cast<uint64_t>(hi) << 32) | lo;
     }
 
     static inline uint32_t Mix64(uint64_t k) {
@@ -278,7 +297,16 @@ private:
     }
 
     void InvalidateRectHash() {
-        if (++rectEpoch_ == 0) {
+        if (++rectEpoch_ == 0 || ++tileEpoch_ == 0) {
+            rectEpoch_ = 1;
+            tileEpoch_ = 1;
+            std::memset(rectHash_.data(), 0, rectHash_.size() * sizeof(RectHashSlot));
+        }
+    }
+
+    void InvalidateTileHash() {
+        if (++tileEpoch_ == 0) {
+            tileEpoch_ = 1;
             rectEpoch_ = 1;
             std::memset(rectHash_.data(), 0, rectHash_.size() * sizeof(RectHashSlot));
         }
@@ -497,7 +525,11 @@ private:
                 col += span;
             }
         }
-        InvalidateRectHash();
+        if ((d.x0 & (kVramW - 1)) >= 7456) {
+            InvalidateTileHash();
+        } else {
+            InvalidateRectHash();
+        }
     }
 
     void OpenSwapFile() {
@@ -698,7 +730,9 @@ private:
             const int sdx0 = d.x0 - dispX, sdy0 = d.y0 - dispY;
             const bool nearDisplay = !(sdx0 + w <= -32 || sdx0 >= kSrcWidth + 32 || sdy0 + h <= -32 || sdy0 >= kSrcHeight + 32);
             if (!nearActive && !nearDisplay) {
+                const uint64_t tB0 = ReadRdtsc();
                 BlitVramToVram(d);
+                lastBlitVramTsc_ += ReadRdtsc() - tB0;
             }
             return;
         }
@@ -717,16 +751,19 @@ private:
                              (static_cast<uint64_t>(h & 0xFFFu) << 28) |
                              (static_cast<uint64_t>(srcX0 & 0x1FFFu) << 13) |
                              static_cast<uint64_t>(srcY0 & 0x0FFFu);
+        const uint16_t isTile = ((srcX0 & (kVramW - 1)) >= 7456) ? 1u : 0u;
+        const uint16_t wantEpoch = isTile ? tileEpoch_ : rectEpoch_;
         const uint32_t hBase = Mix64(key) & kRectHashMask;
         RectHashSlot *slot = nullptr;
         bool hit = false;
         for (uint32_t pr = 0; pr < 128; ++pr) {
             RectHashSlot &cand = rectHash_[(hBase + pr) & kRectHashMask];
-            if (cand.epoch != rectEpoch_) {
+            const uint16_t candWant = cand.isTile ? tileEpoch_ : rectEpoch_;
+            if (cand.epoch != candWant) {
                 slot = &cand;
                 break;
             }
-            if (cand.key == key) {
+            if (cand.key == key && cand.isTile == isTile) {
                 slot = &cand;
                 hit = true;
                 break;
@@ -737,7 +774,10 @@ private:
             InvalidateRectHash();
             slot = &rectHash_[hBase];
         }
-        if (!hit) {
+        if (hit) {
+            ++lastAtlasHits_;
+        } else {
+            ++lastAtlasMisses_;
             const int padW = std::min(kAtlasW, w + 1); // 1px gutter prevents adjacent shelf UV bleed
             const int padH = std::min(kAtlasH, h + 1);
             if (shelfX_ + padW > kAtlasW) {
@@ -756,7 +796,9 @@ private:
             if (padH > shelfRowH_) {
                 shelfRowH_ = padH;
             }
+            const uint64_t tC0 = ReadRdtsc();
             CopyVramRectToAtlas(srcX0, srcY0, w, h, dstX, dstY);
+            lastAtlasCopyTsc_ += ReadRdtsc() - tC0;
             // Zero the 1px right/bottom gutter texels to prevent bilinear edge bleed into neighbor sprites.
             if (dstX + w < kAtlasW) {
                 uint16_t *gPtr = atlas_ + static_cast<size_t>(dstY) * kAtlasW + (dstX + w);
@@ -771,7 +813,8 @@ private:
             slot->key = key;
             slot->u0 = static_cast<uint16_t>(dstX);
             slot->v0 = static_cast<uint16_t>(dstY);
-            slot->epoch = rectEpoch_;
+            slot->isTile = isTile;
+            slot->epoch = isTile ? tileEpoch_ : rectEpoch_;
         }
 
         // Compute tint & blend state for NV2A Stage-0 SHIFTLEFTBY1 (2x overdrive) Register Combiner:
@@ -1100,12 +1143,18 @@ private:
     std::vector<DrawBatch> batches_;
     std::vector<uint16_t> vramBlitScratch_;
     uint16_t rectEpoch_ = 1;
+    uint16_t tileEpoch_ = 1;
     int shelfX_ = 0, shelfY_ = 0, shelfRowH_ = 0;
     int maxAllocPages_ = kRetailMaxAllocPages;
     uint32_t swapCount_ = 0;
     uint32_t lastStateChanges_ = 0;
     uint32_t lastUploadCount_ = 0;
     size_t lastDrawCount_ = 0;
+    uint64_t lastBlitVramTsc_ = 0;
+    uint64_t lastAtlasCopyTsc_ = 0;
+    uint64_t lastPbSubmitTsc_ = 0;
+    uint32_t lastAtlasHits_ = 0;
+    uint32_t lastAtlasMisses_ = 0;
 
     float scrScaleX_ = 0.0f, scrOffsetX_ = 0.0f, scrScaleY_ = 0.0f, scrOffsetY_ = 0.0f;
     float curScreenW_ = 640.0f, curScreenH_ = 480.0f;

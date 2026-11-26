@@ -284,6 +284,7 @@ void SH3::RunBlocks(uint64 stop) {
                 if (countInterpreted) [[unlikely]] {
                     m_interpretedAt[PC]++;
                 }
+                lastInterpretedPc = PC;
                 InterpretBlock();
                 interpretedBlocks++;
             }

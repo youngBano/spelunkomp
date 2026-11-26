@@ -41,7 +41,7 @@ include $(NXDK_DIR)/Makefile
 
 $(ENGINE_DIR)/machine/amm_decoder.obj: NXDK_CXXFLAGS += -ffast-math
 # Profile-guided hot/cold codegen for Pentium III 16 KB L1i / 128 KB L2 cache:
-BLOCKS_OPT ?= -Os
+BLOCKS_OPT ?= -Oz
 $(GEN_DIR)/blocks_hot.obj: NXDK_CXXFLAGS += -O3
 $(GEN_DIR)/blocks_0%.obj: NXDK_CXXFLAGS += $(BLOCKS_OPT)
 

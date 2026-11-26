@@ -252,6 +252,10 @@ int main(int argc, char **argv) {
     uint64_t farOffscreenDraws = 0;
     uint64_t scrollDiffClipFrames = 0;
     uint64_t sumSh3Tsc = 0, sumAudTsc = 0, sumBlitTsc = 0;
+    uint32_t audioPeakAll = 0;
+    uint32_t audioPeakPlay = 0;
+    uint64_t audioTotalSamples = 0;
+    uint64_t audioNonZeroSamples = 0;
     bool dumpedRam = false;
 
     for (int f = 1; f <= frames; ++f) {
@@ -261,6 +265,14 @@ int main(int argc, char **argv) {
         board.system = sys;
         nl.Clear();
         board.RunFrame();
+        const bool inPlayNow = spelunk_xbox::MushisamFakePlay::InPlay(board);
+        audioTotalSamples += board.sound.out.size();
+        for (int16_t s : board.sound.out) {
+            const uint32_t a = static_cast<uint32_t>(s < 0 ? -static_cast<int32_t>(s) : static_cast<int32_t>(s));
+            if (a > 0) ++audioNonZeroSamples;
+            if (a > audioPeakAll) audioPeakAll = a;
+            if (inPlayNow && a > audioPeakPlay) audioPeakPlay = a;
+        }
         board.sound.out.clear();
 
         totalDraws += nl.draws.size();
@@ -333,16 +345,19 @@ int main(int argc, char **argv) {
                 totalTsc > 0 ? 100.0 * sumSh3Tsc / totalTsc : 0.0,
                 totalTsc > 0 ? 100.0 * sumAudTsc / totalTsc : 0.0,
                 totalTsc > 0 ? 100.0 * sumBlitTsc / totalTsc : 0.0);
-    std::printf("  Avg dispatches/frame: %.1f (interp=%llu) | Avg draws/frame: %.1f | Uploads: %llu (%llu px) | MidFrameUpAfterDraw: %llu | Offscreen: %llu (FarOffscreen: %llu, scroll!=clip: %llu)\n",
+    std::printf("  Avg dispatches/frame: %.1f (interp=%llu, lastInterpPc=0x%08X) | Avg draws/frame: %.1f | Uploads: %llu (%llu px)\n",
                 static_cast<double>(board.cpu.nativeBlocks) / frames,
                 (unsigned long long)board.cpu.interpretedBlocks,
+                board.cpu.lastInterpretedPc,
                 static_cast<double>(totalDraws) / frames,
                 (unsigned long long)totalUploads,
-                (unsigned long long)totalUploadPx,
-                (unsigned long long)midFrameUploadsAfterDraws,
-                (unsigned long long)offscreenDraws,
-                (unsigned long long)farOffscreenDraws,
-                (unsigned long long)scrollDiffClipFrames);
+                (unsigned long long)totalUploadPx);
+    std::printf("  Audio YMZ770: rate=%u Hz | totalSamples=%llu | nonZero=%llu | peakAll=%u | peakPlay=%u\n",
+                board.sound.sampleRate,
+                (unsigned long long)audioTotalSamples,
+                (unsigned long long)audioNonZeroSamples,
+                audioPeakAll,
+                audioPeakPlay);
     if (!dumpBlocksPath.empty()) {
         board.cpu.SaveRecording(dumpBlocksPath.c_str());
         std::printf("Saved block recording to %s\n", dumpBlocksPath.c_str());

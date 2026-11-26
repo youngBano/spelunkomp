@@ -391,6 +391,7 @@ public:
     bool countInterpreted = false;
     void SaveInterpreted(const char *path);
     uint64 nativeBlocks = 0, interpretedBlocks = 0;
+    uint32 lastInterpretedPc = 0;
     // The board's next event (the blitter's IRQ1): Bus::Event is called at the first instruction or block boundary at or
     // after it, and at the latest when Run returns. Not state: the board sets it again when a state is loaded
     uint64 eventAt = ~0ull;

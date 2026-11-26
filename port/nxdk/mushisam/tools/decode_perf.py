@@ -52,6 +52,55 @@ def main():
             print(f"RAM (4KB pages): total={tot_pg*4/1024:.1f} MB | free={free_pg*4/1024:.1f} MB | minFree={min_free_pg*4/1024:.1f} MB")
         if pmc0 or pmc1:
             print(f"PIII PMCs: PMC0={pmc0} PMC1={pmc1}")
+
+    if len(d) >= 520:
+        # v3 block at offset 376:
+        # 376: 6I (audioQueued, audioPeak, ac97CivLviSr, audioUnderruns, audioBufs, lastInterpPc)
+        # 400: 5I (playFrames, playLagFrames, playMaxTot, playMaxCpu, playMaxRen)
+        # 420: 10I (playHist[10]) + 1I padV3_0
+        # 464: 3Q (playSumTot, playSumCpu, playSumRen)
+        # 488: 3I (lastBlitVramUs, lastAtlasCopyUs, lastPbSubmitUs) + 1I padV3_1
+        # 504: 2Q (sumAtlasHits, sumAtlasMisses)
+        aud_q, aud_peak, civ_lvi_sr, aud_under, aud_bufs, last_ipc = struct.unpack_from("<6I", d, 376)
+        pf, plag, pmax_t, pmax_c, pmax_r = struct.unpack_from("<5I", d, 400)
+        hist = struct.unpack_from("<10I", d, 420)
+        psum_t, psum_c, psum_r = struct.unpack_from("<3Q", d, 464)
+        blit_us, atlas_us, pb_us = struct.unpack_from("<3I", d, 488)
+        ahits, amisses = struct.unpack_from("<2Q", d, 504)
+
+        civ = (civ_lvi_sr >> 24) & 0xFF
+        lvi = (civ_lvi_sr >> 16) & 0xFF
+        sr = civ_lvi_sr & 0xFFFF
+        dch = sr & 1
+        print("--- v3 Audio & Gameplay Diagnostics ---")
+        print(
+            f"Audio: peakAmp={aud_peak} | queued={aud_q} | bufsSub={aud_bufs} | underruns={aud_under} | "
+            f"AC97 CIV={civ} LVI={lvi} SR=0x{sr:04X} (DCH={dch})"
+        )
+        if last_ipc:
+            print(f"Last Interpreted PC: 0x{last_ipc:08X}")
+        tot_atlas = ahits + amisses
+        hit_pct = (100.0 * ahits / tot_atlas) if tot_atlas else 0.0
+        print(
+            f"NV2A Sub-Timers (last us): BlitVram={blit_us} | AtlasCopy={atlas_us} | PbSubmit={pb_us} | "
+            f"AtlasHitRate={hit_pct:.1f}% ({ahits}/{tot_atlas})"
+        )
+        if pf > 0:
+            edges = [4000, 6000, 8000, 10000, 12000, 14000, 16662, 20000, 33333, 50000]
+            def pct_us(q):
+                target = max(1, int(pf * q + 0.9999))
+                acc = 0
+                for idx, cnt in enumerate(hist):
+                    acc += cnt
+                    if acc >= target:
+                        return f"<{edges[idx]}us" if idx < 9 else ">33333us"
+                return f"<{edges[-1]}us"
+            print(
+                f"Gameplay Isolated (inPlay & !nandBusy): frames={pf} lag={plag} ({100.0*plag/pf:.2f}%) | "
+                f"AVG Tot={psum_t/pf:.1f}us CPU={psum_c/pf:.1f}us Ren={psum_r/pf:.1f}us | "
+                f"MAX Tot={pmax_t}us CPU={pmax_c}us Ren={pmax_r}us"
+            )
+            print(f"  Percentiles: p50={pct_us(0.50)} | p95={pct_us(0.95)} | p99={pct_us(0.99)} | hist={list(hist)}")
     return 0
 
 

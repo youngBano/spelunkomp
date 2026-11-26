@@ -221,11 +221,13 @@ int main(void) {
                 audio.PushMono(board.sound.out.data(), board.sound.out.size());
                 board.sound.out.clear();
             }
+            audio.Pump();
             cpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tCpu0;
             stepped = true;
             (void)pmc0_b;
             (void)pmc1_b;
         }
+        audio.Pump();
 
         if (stepped || displayChanged) {
             const uint64_t tGpu0 = spelunk_xbox::XboxTimer::NowTicks();
@@ -241,6 +243,7 @@ int main(void) {
             while (pb_finished()) {
             }
             const uint64_t renTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
+            audio.Pump();
 
             if (stepped) {
                 spelunk_xbox::g_xboxPerf.RecordFrame(
@@ -264,7 +267,18 @@ int main(void) {
                     renderer.LastUploadCount(),
                     renderer.SwapCount(),
                     spelunk_xbox::P3Pmc::Read(0),
-                    spelunk_xbox::P3Pmc::Read(1));
+                    spelunk_xbox::P3Pmc::Read(1),
+                    audio.QueuedSamples(),
+                    audio.PeakAmp(),
+                    audio.Ac97CivLviSr(),
+                    audio.Underruns(),
+                    audio.BuffersSubmitted(),
+                    board.cpu.lastInterpretedPc,
+                    static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastBlitVramTsc())),
+                    static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastAtlasCopyTsc())),
+                    static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastPbSubmitTsc())),
+                    renderer.LastAtlasHits(),
+                    renderer.LastAtlasMisses());
             }
         }
 
