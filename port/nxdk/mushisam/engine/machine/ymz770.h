@@ -17,6 +17,9 @@
 #include <cstdint>
 #include <memory>
 #include <vector>
+#ifdef NXDK
+#include <windows.h>
+#endif
 
 namespace spelunk {
 
@@ -30,6 +33,10 @@ public:
     // The sound ROMs as the chip sees them (U23 then U24), set before Reset
     const uint8_t *rom = nullptr;
     uint32_t romSize = 0;
+#ifdef NXDK
+    bool AttachRomFile(const char *path);
+    void CloseRomFile();
+#endif
     void Reset();
 
     // A register written by the game (the board has already brought the chip up to the CPU's time)
@@ -67,7 +74,7 @@ public:
         return m_sequences[slot & 7].playing ? m_sequences[slot & 7].number : -1;
     }
     int PhrasePlaying(int channel) const {
-        return m_channels[channel & 15].playing ? m_channels[channel & 15].phrase : -1;
+        return m_channels[channel & (kNumChannels - 1)].playing ? m_channels[channel & (kNumChannels - 1)].phrase : -1;
     }
 
 private:
@@ -77,28 +84,63 @@ private:
         uint8_t loop = 0;
         bool playing = false;
     };
-    Channel m_channels[16];
-    std::unique_ptr<AmmDecoder> m_decoders[16];
-    std::unique_ptr<AmmDecoder> m_keptDecoders[2][16];
-    bool m_keptHas[2][16] = {};
-    std::vector<int16_t> m_block[16];
+#ifdef XBOX_FAST_CPU
+    static constexpr int kNumChannels = 8; // CV1000 YMZ770C hardware has 8 channels (0..7)
+#else
+    static constexpr int kNumChannels = 16;
+#endif
+    Channel m_channels[kNumChannels];
+    std::unique_ptr<AmmDecoder> m_decoders[kNumChannels];
+    std::unique_ptr<AmmDecoder> m_keptDecoders[2][kNumChannels];
+    bool m_keptHas[2][kNumChannels] = {};
+    std::vector<int16_t> m_block[kNumChannels];
     Sequence m_sequences[8];
     uint8_t m_mute = 0, m_volume = 0, m_boost = 0, m_clip = 0;
     uint64_t m_made = 0;     // samples made since m_madeFrom
     uint64_t m_madeFrom = 0; // the CPU cycle the count began at (moved when the rate changes)
 #ifdef XBOX_FAST_CPU
     ImaAdpcmCache m_adpcmCache;
-    ImaAdpcmCache::DecoderState m_adpcmState[16];
-    bool m_useAdpcm[16] = {};
+    ImaAdpcmCache::DecoderState m_adpcmState[kNumChannels];
+    bool m_useAdpcm[kNumChannels] = {};
     // Zero-spike incremental capture: records first natural playback of short SFX phrases, then commits to ADPCM.
-    bool m_capturing[16] = {};
-    uint8_t m_capturePhrase[16] = {};
-    uint32_t m_captureRate[16] = {};
-    std::vector<int16_t> m_captureBuf[16];
+    bool m_capturing[kNumChannels] = {};
+    uint8_t m_capturePhrase[kNumChannels] = {};
+    uint32_t m_captureRate[kNumChannels] = {};
+    std::vector<int16_t> m_captureBuf[kNumChannels];
+#endif
+#ifdef NXDK
+    static constexpr uint32_t kHeaderCacheBytes = 65536u;
+    static constexpr uint32_t kStreamWinBytes = 32768u;
+    static constexpr uint32_t kSeqWinBytes = 4096u;
+    static constexpr uint32_t kMaxBgmCacheBytes = 1024u * 1024u; // 1.0 MB RAM cache for active looped BGM (keeps >= 4 MB free RAM!)
+    HANDLE m_romFile = INVALID_HANDLE_VALUE;
+    std::vector<uint8_t> m_romHeader;
+    std::vector<uint8_t> m_streamBuf[kNumChannels];
+    uint32_t m_streamBase[kNumChannels] = {};
+    uint32_t m_streamLen[kNumChannels] = {};
+    std::vector<uint8_t> m_bgmBuf;
+    uint32_t m_bgmBase = 0xFFFFFFFFu;
+    uint32_t m_bgmLen = 0;
+    uint8_t m_seqBuf[kSeqWinBytes] = {};
+    uint32_t m_seqBase = 0xFFFFFFFFu;
+    uint32_t m_seqLen = 0;
+    uint8_t ReadRomFileByte(uint32_t offset) const;
+    bool EnsureChannelWindow(int ch, uint32_t byteOff, bool isLooped);
 #endif
 
     uint8_t Rom(uint32_t offset) const {
-        return rom[offset & (romSize - 1u)];
+        if (rom) {
+            return rom[offset & (romSize - 1u)];
+        }
+#ifdef NXDK
+        const uint32_t off = offset & (romSize - 1u);
+        if (off < m_romHeader.size()) {
+            return m_romHeader[off];
+        }
+        return ReadRomFileByte(off);
+#else
+        return 0xFF;
+#endif
     }
     uint32_t PhraseOffset(unsigned phrase) const {
         return (Rom(4 * phrase + 1) << 16) | (Rom(4 * phrase + 2) << 8) | Rom(4 * phrase + 3);

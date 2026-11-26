@@ -61,12 +61,8 @@ bool LoadMushisamRoms(spelunk::Cv1000 &board) {
         debugPrint("Mushihimesama: failed D:\\mushisam\\mushisam_u4\n");
         return false;
     }
-    if (!LoadFileSwapped("D:\\mushisam\\u23", board.soundRom, 0)) {
-        debugPrint("Mushihimesama: failed D:\\mushisam\\u23\n");
-        return false;
-    }
-    if (!LoadFileSwapped("D:\\mushisam\\u24", board.soundRom, 0x400000)) {
-        debugPrint("Mushihimesama: failed D:\\mushisam\\u24\n");
+    if (!board.sound.AttachRomFile("D:\\mushisam\\sound_rom.bin")) {
+        debugPrint("Mushihimesama: failed streaming D:\\mushisam\\sound_rom.bin\n");
         return false;
     }
     if (!board.nand.AttachFile("D:\\mushisam\\mushisam_u2")) {
@@ -154,26 +150,19 @@ int main(void) {
     bool prevL3 = false;
     bool prevR3 = false;
     uint32_t loadedStagePack = 0xFFFFFFFFu;
+    uint32_t lastVbl = pb_get_vbl_counter();
+    uint64_t lastWallTick = spelunk_xbox::XboxTimer::NowTicks();
 
     while (true) {
+        const uint64_t tLoop0 = spelunk_xbox::XboxTimer::NowTicks();
         spelunk_xbox::PadState pad{};
         input.Poll(pad);
 
-        bool displayChanged = false;
-        if (pad.black && !prevRb) {
-            tateMode = !tateMode;
-            displayChanged = true;
-        }
+        if (pad.black && !prevRb) tateMode = !tateMode;
         prevRb = pad.black;
-        if (pad.white && !prevLb) {
-            bilinear = !bilinear;
-            displayChanged = true;
-        }
+        if (pad.white && !prevLb) bilinear = !bilinear;
         prevLb = pad.white;
-        if (pad.l3 && !prevL3) {
-            integerScale = !integerScale;
-            displayChanged = true;
-        }
+        if (pad.l3 && !prevL3) integerScale = !integerScale;
         prevL3 = pad.l3;
         if (pad.r3 && !prevR3) {
             fakePlay.enabled = !fakePlay.enabled;
@@ -181,112 +170,116 @@ int main(void) {
         }
         prevR3 = pad.r3;
 
-        // Overlap SH-3 CPU emulation of frame N with NV2A GPU rasterization of frame N-1.
-        uint64_t cpuTicks = 0;
-        bool stepped = false;
-        if (timer.ConsumeArcadeFrame()) {
-            uint32_t p1 = 0;
-            uint32_t sys = 0;
-            if (fakePlay.enabled) {
-                fakePlay.Update(board, p1, sys);
-            } else {
-                if (pad.up) p1 |= spelunk::kInUp;
-                if (pad.down) p1 |= spelunk::kInDown;
-                if (pad.left) p1 |= spelunk::kInLeft;
-                if (pad.right) p1 |= spelunk::kInRight;
-                if (pad.a) p1 |= spelunk::kInButton1;
-                if (pad.b) p1 |= spelunk::kInButton2;
-                if (pad.x) p1 |= spelunk::kInButton3;
-                if (pad.y) p1 |= spelunk::kInButton4;
-                if (pad.back) sys |= spelunk::kSysCoin1;
-                if (pad.start) sys |= spelunk::kSysStart1;
-            }
-            board.inputs[0] = p1;
-            board.system = sys;
-
-            const uint64_t tCpu0 = spelunk_xbox::XboxTimer::NowTicks();
-            const uint64_t pmc0_a = spelunk_xbox::P3Pmc::Read(0);
-            const uint64_t pmc1_a = spelunk_xbox::P3Pmc::Read(1);
-            board.RunFrame();
-            const uint64_t pmc0_b = spelunk_xbox::P3Pmc::Read(0) - pmc0_a;
-            const uint64_t pmc1_b = spelunk_xbox::P3Pmc::Read(1) - pmc1_a;
-            if (!programFreed && board.frame >= 60u && (board.cpu.PC & 0xFF800000u) == 0x0C000000u) {
-                // Reclaim 2 MB U4 flash buffer after boot copy completes (saves 2 MB on 64 MB retail Xbox).
-                std::vector<uint8_t>().swap(board.program);
-                programFreed = true;
-            }
-            if ((board.frame & 127u) == 0u) {
-                eeprom.FlushIfDirty(board.rtc);
-            }
-            if (spelunk_xbox::MushisamFakePlay::InPlay(board)) {
-                const uint32_t st = spelunk_xbox::MushisamFakePlay::Stage(board);
-                if (st != loadedStagePack) {
-                    char packPath[64];
-                    std::snprintf(packPath, sizeof(packPath), "D:\\mushisam\\pak_s%u.bin", st + 1u);
-                    if (board.nand.AttachStagePack(packPath)) {
-                        loadedStagePack = st;
-                    }
-                }
-            }
-            cpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tCpu0;
-            stepped = true;
-            (void)pmc0_b;
-            (void)pmc1_b;
+        // 1:1 Hardware VBlank-locked arcade frame (overlaps SH-3 CPU frame N with NV2A GPU frame N-1).
+        uint32_t p1 = 0;
+        uint32_t sys = 0;
+        if (fakePlay.enabled) {
+            fakePlay.Update(board, p1, sys);
+        } else {
+            if (pad.up) p1 |= spelunk::kInUp;
+            if (pad.down) p1 |= spelunk::kInDown;
+            if (pad.left) p1 |= spelunk::kInLeft;
+            if (pad.right) p1 |= spelunk::kInRight;
+            if (pad.a) p1 |= spelunk::kInButton1;
+            if (pad.b) p1 |= spelunk::kInButton2;
+            if (pad.x) p1 |= spelunk::kInButton3;
+            if (pad.y) p1 |= spelunk::kInButton4;
+            if (pad.back) sys |= spelunk::kSysCoin1;
+            if (pad.start) sys |= spelunk::kSysStart1;
         }
+        board.inputs[0] = p1;
+        board.system = sys;
 
-        if (stepped || displayChanged) {
-            const uint64_t tGpu0 = spelunk_xbox::XboxTimer::NowTicks();
-            while (pb_busy()) {
-            }
-            const uint64_t gpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tGpu0;
-
-            pb_reset();
-            pb_target_back_buffer();
-
-            const uint64_t tRen0 = spelunk_xbox::XboxTimer::NowTicks();
-            renderer.Render(board.blitter, nativeList, tateMode, bilinear, integerScale);
-            while (pb_finished()) {
-            }
-            const uint64_t renTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
-
-            if (stepped) {
-                spelunk_xbox::g_xboxPerf.RecordFrame(
-                    static_cast<uint32_t>(timer.TicksToMicros(cpuTicks)),
-                    static_cast<uint32_t>(timer.TicksToMicros(renTicks)),
-                    static_cast<uint32_t>(timer.TicksToMicros(gpuTicks)),
-                    static_cast<uint32_t>(timer.RdtscToMicros(board.profSh3Tsc)),
-                    static_cast<uint32_t>(timer.RdtscToMicros(board.profAudioTsc)),
-                    static_cast<uint32_t>(timer.RdtscToMicros(board.profBlitterTsc)),
-                    board.cpu.nativeBlocks,
-                    board.cpu.interpretedBlocks,
-                    spelunk_xbox::MushisamFakePlay::InPlay(board) ? 1u : 0u,
-                    spelunk_xbox::MushisamFakePlay::Stage(board),
-                    renderer.ActiveVramPages(),
-                    static_cast<uint32_t>(board.nand.reads),
-                    static_cast<uint32_t>(board.nand.cacheMisses),
-                    static_cast<uint32_t>(renderer.LastDrawCount()),
-                    static_cast<uint32_t>(renderer.LastQuadCount()),
-                    renderer.LastBatchCount(),
-                    renderer.LastStateChanges(),
-                    renderer.LastUploadCount(),
-                    renderer.SwapCount(),
-                    spelunk_xbox::P3Pmc::Read(0),
-                    spelunk_xbox::P3Pmc::Read(1),
-                    audio.QueuedSamples(),
-                    audio.PeakAmp(),
-                    audio.Ac97CivLviSr(),
-                    audio.Underruns(),
-                    audio.BuffersSubmitted(),
-                    board.cpu.lastInterpretedPc,
-                    static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastBlitVramTsc())),
-                    static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastAtlasCopyTsc())),
-                    static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastPbSubmitTsc())),
-                    renderer.LastAtlasHits(),
-                    renderer.LastAtlasMisses());
+        const uint64_t tCpu0 = spelunk_xbox::XboxTimer::NowTicks();
+        const uint64_t pmc0_a = spelunk_xbox::P3Pmc::Read(0);
+        const uint64_t pmc1_a = spelunk_xbox::P3Pmc::Read(1);
+        board.RunFrame();
+        const uint64_t pmc0_b = spelunk_xbox::P3Pmc::Read(0) - pmc0_a;
+        const uint64_t pmc1_b = spelunk_xbox::P3Pmc::Read(1) - pmc1_a;
+        if (!programFreed && board.frame >= 60u && (board.cpu.PC & 0xFF800000u) == 0x0C000000u) {
+            // Reclaim 2 MB U4 flash buffer after boot copy completes (saves 2 MB on 64 MB retail Xbox).
+            std::vector<uint8_t>().swap(board.program);
+            programFreed = true;
+        }
+        const bool inPlayNow = spelunk_xbox::MushisamFakePlay::InPlay(board);
+        const uint32_t curStage = spelunk_xbox::MushisamFakePlay::Stage(board);
+        // Never write EEPROM to HDD during active gameplay (zero gameplay disk I/O).
+        if (!inPlayNow && (board.frame & 127u) == 0u) {
+            eeprom.FlushIfDirty(board.rtc);
+        }
+        if (inPlayNow && curStage != loadedStagePack) {
+            char packPath[64];
+            std::snprintf(packPath, sizeof(packPath), "D:\\mushisam\\pak_s%u.bin", curStage + 1u);
+            if (board.nand.AttachStagePack(packPath)) {
+                loadedStagePack = curStage;
             }
         }
+        const uint64_t cpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tCpu0;
+        (void)pmc0_b;
+        (void)pmc1_b;
 
-        pb_wait_for_vbl();
+        // Overlap NV2A rasterization of frame N-1 with BOTH SH-3 CPU AND CPU-side tilemap/atlas prep of frame N!
+        const uint64_t tRen0 = spelunk_xbox::XboxTimer::NowTicks();
+        renderer.Render(board.blitter, nativeList, tateMode, bilinear, integerScale);
+        while (pb_finished()) {
+        }
+        const uint64_t renTotalTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
+        const uint32_t gpuWaitUs = static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastGpuWaitTsc()));
+        const uint32_t renTotalUs = static_cast<uint32_t>(timer.TicksToMicros(renTotalTicks));
+        const uint32_t renOnlyUs = (renTotalUs > gpuWaitUs) ? (renTotalUs - gpuWaitUs) : 0u;
+        const uint64_t workTicks = spelunk_xbox::XboxTimer::NowTicks() - tLoop0;
+
+        // Adaptive 1:1 VBlank sync: wait ONLY if we finished before the next VBlank; never double-sleep to 33.3 ms!
+        uint32_t vblNow = pb_get_vbl_counter();
+        if (vblNow == lastVbl) {
+            vblNow = pb_wait_for_vbl();
+        }
+        const uint32_t vblDelta = vblNow - lastVbl;
+        lastVbl = vblNow;
+
+        const uint64_t nowWallTick = spelunk_xbox::XboxTimer::NowTicks();
+        const uint32_t wallFrameUs = static_cast<uint32_t>(timer.TicksToMicros(nowWallTick - lastWallTick));
+        lastWallTick = nowWallTick;
+        LARGE_INTEGER sysTime{};
+        KeQuerySystemTime(&sysTime);
+
+        spelunk_xbox::g_xboxPerf.RecordFrame(
+            static_cast<uint32_t>(timer.TicksToMicros(cpuTicks)),
+            renOnlyUs,
+            gpuWaitUs,
+            static_cast<uint32_t>(timer.RdtscToMicros(board.profSh3Tsc)),
+            static_cast<uint32_t>(timer.RdtscToMicros(board.profAudioTsc)),
+            static_cast<uint32_t>(timer.RdtscToMicros(board.profBlitterTsc)),
+            board.cpu.nativeBlocks,
+            board.cpu.interpretedBlocks,
+            inPlayNow ? 1u : 0u,
+            curStage,
+            renderer.ActiveVramPages(),
+            static_cast<uint32_t>(board.nand.reads),
+            static_cast<uint32_t>(board.nand.cacheMisses),
+            static_cast<uint32_t>(renderer.LastDrawCount()),
+            static_cast<uint32_t>(renderer.LastQuadCount()),
+            renderer.LastBatchCount(),
+            renderer.LastStateChanges(),
+            renderer.LastUploadCount(),
+            renderer.SwapCount(),
+            spelunk_xbox::P3Pmc::Read(0),
+            spelunk_xbox::P3Pmc::Read(1),
+            audio.QueuedSamples(),
+            audio.PeakAmp(),
+            audio.Ac97CivLviSr(),
+            audio.Underruns(),
+            audio.BuffersSubmitted(),
+            board.cpu.lastInterpretedPc,
+            static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastBlitVramTsc())),
+            static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastAtlasCopyTsc())),
+            static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastPbSubmitTsc())),
+            renderer.LastAtlasHits(),
+            renderer.LastAtlasMisses(),
+            wallFrameUs,
+            static_cast<uint32_t>(timer.TicksToMicros(workTicks)),
+            vblDelta,
+            static_cast<uint64_t>(sysTime.QuadPart));
     }
 
     renderer.Shutdown();

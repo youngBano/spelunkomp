@@ -29,6 +29,7 @@ public:
     static constexpr int kMaxSamples = 1152; // (a frame's, each channel's)
 
     explicit AmmDecoder(const uint8_t *data);
+    void SetData(const uint8_t *data) { m_data = data; }
 
     // Decodes the frame at bit `bit` of the data, or the first after it (by its sync word), reading no bit at or past
     // `end`, into `pcm` (16-bit, the channels interleaved). Returns the samples made for each channel (0 for a frame

@@ -13,4 +13,7 @@ void xbox_resample_mono_to_stereo_asm(const int16_t *ring, uint32_t ringMask,
 // Fast i686/MMX 16-bit A1R5G5B5 row copy into write-combined NV2A atlas memory.
 void xbox_copy_u16_row_asm(const uint16_t *src, uint16_t *dst, uint32_t pixelCount);
 
+// Branchless 4-pixel MMX transparent A1R5G5B5 row blit (writes dst[i] = src[i] where bit 15 == 1).
+void xbox_blit_trans_u16_row_asm(const uint16_t *src, uint16_t *dst, uint32_t pixelCount);
+
 } // extern "C"

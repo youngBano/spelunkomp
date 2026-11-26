@@ -17,10 +17,122 @@ Ymz770::Ymz770() {
     }
 }
 
-Ymz770::~Ymz770() = default;
+Ymz770::~Ymz770() {
+#ifdef NXDK
+    CloseRomFile();
+#endif
+}
+
+#ifdef NXDK
+bool Ymz770::AttachRomFile(const char *path) {
+    CloseRomFile();
+    m_romFile = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (m_romFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(m_romFile, &sz) || sz.QuadPart <= 0) {
+        CloseRomFile();
+        return false;
+    }
+    rom = nullptr;
+    romSize = static_cast<uint32_t>(sz.QuadPart);
+    const uint32_t hdrLen = std::min(romSize, kHeaderCacheBytes);
+    m_romHeader.resize(hdrLen);
+    DWORD got = 0;
+    if (!ReadFile(m_romFile, m_romHeader.data(), hdrLen, &got, nullptr) || got != hdrLen) {
+        CloseRomFile();
+        return false;
+    }
+    for (int i = 0; i < kNumChannels; ++i) {
+        m_streamBuf[i].resize(kStreamWinBytes);
+        m_streamBase[i] = 0xFFFFFFFFu;
+        m_streamLen[i] = 0;
+    }
+    m_bgmBuf.clear();
+    m_bgmBase = 0xFFFFFFFFu;
+    m_bgmLen = 0;
+    m_seqBase = 0xFFFFFFFFu;
+    m_seqLen = 0;
+    return true;
+}
+
+void Ymz770::CloseRomFile() {
+    if (m_romFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_romFile);
+        m_romFile = INVALID_HANDLE_VALUE;
+    }
+    m_romHeader.clear();
+    m_bgmBuf.clear();
+    m_bgmBase = 0xFFFFFFFFu;
+    m_bgmLen = 0;
+    for (int i = 0; i < kNumChannels; ++i) {
+        m_streamBuf[i].clear();
+        m_streamBase[i] = 0xFFFFFFFFu;
+        m_streamLen[i] = 0;
+    }
+    m_seqBase = 0xFFFFFFFFu;
+    m_seqLen = 0;
+}
+
+uint8_t Ymz770::ReadRomFileByte(uint32_t offset) const {
+    if (m_romFile == INVALID_HANDLE_VALUE || offset >= romSize) {
+        return 0xFF;
+    }
+    auto *self = const_cast<Ymz770 *>(this);
+    if (offset < self->m_seqBase || offset >= self->m_seqBase + self->m_seqLen) {
+        self->m_seqBase = offset;
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(offset);
+        SetFilePointerEx(self->m_romFile, pos, nullptr, FILE_BEGIN);
+        DWORD got = 0;
+        const DWORD want = static_cast<DWORD>(std::min<uint32_t>(kSeqWinBytes, romSize - offset));
+        self->m_seqLen = ReadFile(self->m_romFile, self->m_seqBuf, want, &got, nullptr) ? static_cast<uint32_t>(got) : 0u;
+    }
+    return (offset >= self->m_seqBase && offset < self->m_seqBase + self->m_seqLen)
+               ? self->m_seqBuf[offset - self->m_seqBase]
+               : 0xFF;
+}
+
+bool Ymz770::EnsureChannelWindow(int ch, uint32_t byteOff, bool isLooped) {
+    if (m_romFile == INVALID_HANDLE_VALUE || byteOff >= romSize) {
+        return false;
+    }
+    if (isLooped) {
+        // Load entire looped BGM chunk (up to 1.5 MB) once into RAM so active gameplay has ZERO DVD audio reads!
+        if (m_bgmBase != 0xFFFFFFFFu && byteOff >= m_bgmBase &&
+            (byteOff + 2048u <= m_bgmBase + m_bgmLen || m_bgmBase + m_bgmLen >= romSize)) {
+            return true;
+        }
+        m_bgmBase = byteOff;
+        const uint32_t want = std::min<uint32_t>(kMaxBgmCacheBytes, romSize - byteOff);
+        m_bgmBuf.resize(want);
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(byteOff);
+        SetFilePointerEx(m_romFile, pos, nullptr, FILE_BEGIN);
+        DWORD got = 0;
+        m_bgmLen = ReadFile(m_romFile, m_bgmBuf.data(), static_cast<DWORD>(want), &got, nullptr)
+                       ? static_cast<uint32_t>(got)
+                       : 0u;
+        return m_bgmLen > 0;
+    }
+    if (m_streamBase[ch] != 0xFFFFFFFFu && byteOff >= m_streamBase[ch] &&
+        (byteOff + 2048u <= m_streamBase[ch] + m_streamLen[ch] || m_streamBase[ch] + m_streamLen[ch] >= romSize)) {
+        return true;
+    }
+    m_streamBase[ch] = byteOff;
+    LARGE_INTEGER pos{};
+    pos.QuadPart = static_cast<LONGLONG>(byteOff);
+    SetFilePointerEx(m_romFile, pos, nullptr, FILE_BEGIN);
+    DWORD got = 0;
+    const DWORD want = static_cast<DWORD>(std::min<uint32_t>(kStreamWinBytes, romSize - byteOff));
+    m_streamLen[ch] = ReadFile(m_romFile, m_streamBuf[ch].data(), want, &got, nullptr) ? static_cast<uint32_t>(got) : 0u;
+    return m_streamLen[ch] > 0;
+}
+#endif
 
 void Ymz770::Reset() {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < kNumChannels; i++) {
         m_channels[i] = Channel{};
         m_decoders[i] = std::make_unique<AmmDecoder>(rom);
 #ifdef XBOX_FAST_CPU
@@ -43,7 +155,12 @@ void Ymz770::Reset() {
 }
 
 void Ymz770::RunTo(uint64_t cycles, uint64_t cpuHz) {
-    if (!rom || held || cycles <= m_madeFrom) {
+    const bool hasRom = (rom != nullptr)
+#ifdef NXDK
+                        || (m_romFile != INVALID_HANDLE_VALUE)
+#endif
+        ;
+    if (!hasRom || held || cycles <= m_madeFrom) {
         return;
     }
     const uint64_t due = (cycles - m_madeFrom) * sampleRate / cpuHz;
@@ -63,7 +180,12 @@ void Ymz770::RunTo(uint64_t cycles, uint64_t cpuHz) {
 }
 
 uint32_t Ymz770::GenerateSamples(int16_t *dst, uint32_t count) {
-    if (!rom || held || !dst || count == 0) {
+    const bool hasRom = (rom != nullptr)
+#ifdef NXDK
+                        || (m_romFile != INVALID_HANDLE_VALUE)
+#endif
+        ;
+    if (!hasRom || held || !dst || count == 0) {
         if (dst && count > 0) {
             std::fill_n(dst, count, static_cast<int16_t>(0));
         }
@@ -118,7 +240,7 @@ void Ymz770::RunSequencer() {
 int16_t Ymz770::Sample() {
     RunSequencer();
     int32_t mix = 0;
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < kNumChannels; i++) {
         Channel &c = m_channels[i];
         if (c.remaining == 0 && c.playing) {
             for (;;) {
@@ -167,8 +289,27 @@ int16_t Ymz770::Sample() {
                 } else
 #endif
                 {
-                    made = m_decoders[i]->DecodeFrame(c.position, static_cast<int>(romSize * 8), m_block[i].data(), c.tableIndex);
-                    rate = m_decoders[i]->Rate();
+#ifdef NXDK
+                    if (!rom) {
+                        const uint32_t byteOff = static_cast<uint32_t>(c.position) >> 3;
+                        const bool isLooped = (c.loop != 0);
+                        if (EnsureChannelWindow(i, byteOff, isLooped)) {
+                            const uint8_t *winPtr = isLooped ? m_bgmBuf.data() : m_streamBuf[i].data();
+                            const uint32_t winBase = isLooped ? m_bgmBase : m_streamBase[i];
+                            const uint32_t winLen = isLooped ? m_bgmLen : m_streamLen[i];
+                            m_decoders[i]->SetData(winPtr);
+                            int localBit = c.position - static_cast<int>(winBase * 8u);
+                            const int localEnd = static_cast<int>(winLen * 8u);
+                            made = m_decoders[i]->DecodeFrame(localBit, localEnd, m_block[i].data(), c.tableIndex);
+                            c.position = static_cast<int>(winBase * 8u) + localBit;
+                            rate = m_decoders[i]->Rate();
+                        }
+                    } else
+#endif
+                    {
+                        made = m_decoders[i]->DecodeFrame(c.position, static_cast<int>(romSize * 8), m_block[i].data(), c.tableIndex);
+                        rate = m_decoders[i]->Rate();
+                    }
 #ifdef XBOX_FAST_CPU
                     if (m_capturing[i]) {
                         if (rate > 0) m_captureRate[i] = static_cast<uint32_t>(rate);
@@ -322,7 +463,7 @@ void Ymz770::Serialize(Archive &ar) {
 }
 
 void Ymz770::KeepDecoders(int which) {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < kNumChannels; i++) {
         m_keptHas[which][i] = m_decoders[i] != nullptr;
         if (m_decoders[i]) {
             if (m_keptDecoders[which][i]) {
@@ -335,7 +476,7 @@ void Ymz770::KeepDecoders(int which) {
 }
 
 void Ymz770::PutBackDecoders(int which) {
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < kNumChannels; i++) {
         if (!m_keptHas[which][i]) {
             m_decoders[i].reset();
         } else if (m_decoders[i]) {

@@ -25,9 +25,9 @@ namespace spelunk_xbox {
 
 class XboxAudio {
 public:
-    static constexpr uint32_t kNumBuffers = 8;        // 8 x 1024 stereo frames @ 48 kHz = 170.7 ms cushion
-    static constexpr uint32_t kTargetInFlight = 6;    // Keep 6 buffers queued (~128 ms ahead of hardware CIV)
-    static constexpr uint32_t kBufFrames48k = 1024;   // 21.33 ms per descriptor
+    static constexpr uint32_t kNumBuffers = 8;        // 8 x 1024 stereo frames @ 48 kHz = 170.7 ms total ring
+    static constexpr uint32_t kTargetInFlight = 4;    // Keep 4 buffers queued (~85.3 ms cushion, 0 underruns across boot/loads)
+    static constexpr uint32_t kBufFrames48k = 1024;   // 21.33 ms per descriptor (low single-core preemption overhead)
     static constexpr uint32_t kBufBytes = kBufFrames48k * 2 * sizeof(int16_t); // 4096 bytes
     static constexpr uint32_t kCmdQueueSize = 2048;   // Lock-free SPSC YMZ770 register write queue
     static constexpr uint32_t kCmdQueueMask = kCmdQueueSize - 1;
@@ -254,8 +254,8 @@ private:
                 }
             }
 
-            // Sleep 4 ms (~5x faster than 21.33 ms per descriptor): negligible CPU, instant SFX response!
-            Sleep(4);
+            // Sleep 6 ms (~3.5x faster than 21.33 ms per descriptor): minimal single-core context switches, 0 underruns!
+            Sleep(6);
         }
     }
 

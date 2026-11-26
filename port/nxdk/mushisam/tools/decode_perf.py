@@ -101,6 +101,24 @@ def main():
                 f"MAX Tot={pmax_t}us CPU={pmax_c}us Ren={pmax_r}us"
             )
             print(f"  Percentiles: p50={pct_us(0.50)} | p95={pct_us(0.95)} | p99={pct_us(0.99)} | hist={list(hist)}")
+
+    if len(d) >= 576:
+        w_frame, w_work, pvbl, pdrop, pmax_w, pmax_wk = struct.unpack_from("<6I", d, 520)
+        psum_w, psum_wk, t_start, t_last = struct.unpack_from("<4Q", d, 544)
+        print("--- v4 Real-Time Wall-Clock & Hardware VBlank Truth ---")
+        print(f"Last Frame: wall={w_frame}us | work={w_work}us")
+        if pf > 0:
+            drop_pct = (100.0 * pdrop / max(pvbl, 1)) if pvbl else 0.0
+            wall_fps = 0.0
+            if t_last > t_start:
+                wall_sec = (t_last - t_start) / 1e7
+                wall_fps = pf / wall_sec if wall_sec > 0 else 0.0
+            qpc_fps = (1e6 * pf / psum_w) if psum_w > 0 else 0.0
+            print(
+                f"Gameplay VBlanks: total={pvbl} dropped={pdrop} ({drop_pct:.2f}%) | "
+                f"WallAVG={psum_w/pf:.1f}us (max {pmax_w}us) | WorkAVG={psum_wk/pf:.1f}us (max {pmax_wk}us)"
+            )
+            print(f"Real-Time FPS: SysTime={wall_fps:.2f} FPS | QPC={qpc_fps:.2f} FPS")
     return 0
 
 

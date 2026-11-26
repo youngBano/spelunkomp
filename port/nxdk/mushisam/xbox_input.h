@@ -55,7 +55,12 @@ public:
     }
 
     void Poll(PadState &out) {
-        usbh_pooling_hubs();
+        // Only poll USB OHCI hub registers every 60 frames once a controller is attached;
+        // live button packets arrive automatically via OHCI interrupt callback OnReadComplete().
+        if (!padDev_ || (++hubPollDiv_ >= 60u)) {
+            hubPollDiv_ = 0;
+            usbh_pooling_hubs();
+        }
         out = {};
         if (!padDev_ || !hasPacket_) {
             return;
@@ -142,6 +147,7 @@ private:
     uint8_t padLine1_[28] = {};
     volatile bool hasPacket_ = false;
     uint8_t padLine2_[31] = {};
+    uint32_t hubPollDiv_ = 0;
     volatile xid_gamepad_in raw_{};
 };
 

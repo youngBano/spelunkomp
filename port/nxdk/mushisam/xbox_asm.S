@@ -54,6 +54,58 @@ _xbox_copy_u16_row_asm:
     ret
 
 // -----------------------------------------------------------------------------
+// void xbox_blit_trans_u16_row_asm(const uint16_t *src, uint16_t *dst, uint32_t pixelCount)
+// Branchless 4-pixel MMX A1R5G5B5 alpha-test blit (bit 15 == 1 -> opaque).
+// -----------------------------------------------------------------------------
+.globl _xbox_blit_trans_u16_row_asm
+.align 16
+_xbox_blit_trans_u16_row_asm:
+    pushl   %esi
+    pushl   %edi
+    movl    12(%esp), %esi      // src
+    movl    16(%esp), %edi      // dst
+    movl    20(%esp), %ecx      // pixelCount
+    cmpl    $4, %ecx
+    jb      .Ltrans_tail
+    movl    %ecx, %eax
+    shrl    $2, %ecx            // 4 pixels (8 bytes) per iteration
+    pxor    %mm7, %mm7          // mm7 = 0
+.align 16
+.Ltrans_mmx4:
+    movq    (%esi), %mm0        // src[0..3]
+    movq    %mm7, %mm2          // 0
+    pcmpgtw %mm0, %mm2          // mm2 = 0xFFFF where src < 0 (bit 15 == 1), else 0x0000
+    movq    %mm2, %mm1          // save mask
+    pand    %mm0, %mm1          // mm1 = src & mask
+    pandn   (%edi), %mm2        // mm2 = (~mask) & dst
+    por     %mm1, %mm2          // mm2 = (src & mask) | (dst & ~mask)
+    movq    %mm2, (%edi)
+    addl    $8, %esi
+    addl    $8, %edi
+    decl    %ecx
+    jnz     .Ltrans_mmx4
+    emms
+    movl    %eax, %ecx
+    andl    $3, %ecx
+.Ltrans_tail:
+    testl   %ecx, %ecx
+    jz      .Ltrans_done
+.Ltrans_scalar:
+    movzwl  (%esi), %eax
+    testl   $0x8000, %eax
+    jz      .Ltrans_skip
+    movw    %ax, (%edi)
+.Ltrans_skip:
+    addl    $2, %esi
+    addl    $2, %edi
+    decl    %ecx
+    jnz     .Ltrans_scalar
+.Ltrans_done:
+    popl    %edi
+    popl    %esi
+    ret
+
+// -----------------------------------------------------------------------------
 // void xbox_resample_mono_to_stereo_asm(const int16_t *ring, uint32_t ringMask,
 //                                       volatile uint32_t *ioRead, uint32_t writePos,
 //                                       uint32_t *ioPhase16, int16_t *ioLastSample,

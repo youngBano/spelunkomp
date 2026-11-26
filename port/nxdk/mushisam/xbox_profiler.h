@@ -47,7 +47,7 @@ struct P3Pmc {
 
 struct alignas(32) XboxPerfStats {
     static constexpr uint32_t kMagic = 0x50455246u; // "PERF"
-    static constexpr uint32_t kVersion = 3u;
+    static constexpr uint32_t kVersion = 4u;
     static constexpr uint32_t kCv1kBudgetUs = 16662u;
     static constexpr int kMaxStageSlots = 6; // Stages 1..5 + extra
     static constexpr int kHistBuckets = 10;  // <4, 4-6, 6-8, 8-10, 10-12, 12-14, 14-16.66, 16.66-20, 20-33, >33 ms
@@ -147,6 +147,18 @@ struct alignas(32) XboxPerfStats {
     uint64_t sumAtlasHits = 0;
     uint64_t sumAtlasMisses = 0;
 
+    // --- v4 block (offset 520..575): ground-truth real-time wall-clock & hardware VBlank telemetry ---
+    uint32_t lastWallFrameUs = 0;
+    uint32_t lastWallWorkUs = 0;
+    uint32_t playVblanks = 0;
+    uint32_t playDroppedVblanks = 0;
+    uint32_t playMaxWallUs = 0;
+    uint32_t playMaxWorkUs = 0;
+    uint64_t playSumWallUs = 0;
+    uint64_t playSumWorkUs = 0;
+    uint64_t playWallStart100ns = 0;
+    uint64_t playWallLast100ns = 0;
+
     void Reset() {
         std::memset(this, 0, sizeof(*this));
         magic = kMagic;
@@ -192,8 +204,10 @@ struct alignas(32) XboxPerfStats {
                      uint32_t audQueued = 0, uint32_t audPeak = 0, uint32_t civLviSr = 0,
                      uint32_t audUnderruns = 0, uint32_t audBufs = 0, uint32_t interpPc = 0,
                      uint32_t blitVramUs = 0, uint32_t atlasCopyUs = 0, uint32_t pbSubUs = 0,
-                     uint32_t atlasHits = 0, uint32_t atlasMisses = 0) {
-        const uint32_t totalUs = cpuUs + renderUs + gpuWaitUs;
+                     uint32_t atlasHits = 0, uint32_t atlasMisses = 0,
+                     uint32_t wallFrameUs = 0, uint32_t wallWorkUs = 0,
+                     uint32_t vblDelta = 1u, uint64_t sysTime100ns = 0) {
+        const uint32_t totalUs = (wallWorkUs > 0) ? wallWorkUs : (cpuUs + renderUs + gpuWaitUs);
         const uint32_t dispDelta = (natBlocks >= nativeBlocks)
                                        ? static_cast<uint32_t>(natBlocks - nativeBlocks)
                                        : 0u;
@@ -228,6 +242,8 @@ struct alignas(32) XboxPerfStats {
         lastPbSubmitUs = pbSubUs;
         sumAtlasHits += atlasHits;
         sumAtlasMisses += atlasMisses;
+        lastWallFrameUs = wallFrameUs;
+        lastWallWorkUs = totalUs;
 
         if ((frames & 63u) == 1u) {
             SampleRamStats();
@@ -280,15 +296,27 @@ struct alignas(32) XboxPerfStats {
             playSumTotalUs += totalUs;
             playSumCpuUs += cpuUs;
             playSumRenderUs += renderUs;
-            if (totalUs > kCv1kBudgetUs) ++playLagFrames;
+            playSumWallUs += wallFrameUs;
+            playSumWorkUs += totalUs;
+            playVblanks += vblDelta;
+            if (vblDelta > 1u) {
+                playDroppedVblanks += (vblDelta - 1u);
+            }
+            if (totalUs > kCv1kBudgetUs || vblDelta > 1u) ++playLagFrames;
             if (totalUs > playMaxTotalUs) playMaxTotalUs = totalUs;
             if (cpuUs > playMaxCpuUs) playMaxCpuUs = cpuUs;
             if (renderUs > playMaxRenderUs) playMaxRenderUs = renderUs;
+            if (wallFrameUs > playMaxWallUs) playMaxWallUs = wallFrameUs;
+            if (totalUs > playMaxWorkUs) playMaxWorkUs = totalUs;
+            if (sysTime100ns != 0) {
+                if (playWallStart100ns == 0) playWallStart100ns = sysTime100ns;
+                playWallLast100ns = sysTime100ns;
+            }
             ++playHist[BucketForUs(totalUs)];
         }
     }
 };
-static_assert(sizeof(XboxPerfStats) == 544, "XboxPerfStats v3 size mismatch with decode_perf.py");
+static_assert(sizeof(XboxPerfStats) == 576, "XboxPerfStats v4 size mismatch with decode_perf.py");
 
 inline XboxPerfStats g_xboxPerf;
 

@@ -38,13 +38,14 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 832; // 832 * 32 KB = 26 MB hot RAM pool (~1.9 MB free, ~0 gameplay swaps!)
+    static constexpr int kRetailMaxAllocPages = 928; // 928 * 32 KB = 29 MB hot RAM pool (100% Stage 1 & 2 resident, >= 3.5 MB free!)
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
-    // 1024x(1024+4) A1R5G5B5 NV2A shelf atlas (2 MB + 8 KB) + 8,192-slot Mix64 hash table:
-    // Holds sprites & tilemap rects persistently across frames; FlushMidFrameAndResetShelf() handles overflow cleanly.
+    // Dual-bank 1024x(2048+4) A1R5G5B5 NV2A shelf atlas (2 x 1024x1024 = 4 MB + 8 KB) + 8,192-slot Mix64 hash table:
+    // 1024 rows per bank guarantees ZERO mid-frame pb_busy() flushes and ZERO full-atlas wipe spikes!
     static constexpr int kAtlasW = 1024;
-    static constexpr int kAtlasH = 1024;
+    static constexpr int kAtlasH = 2048;
+    static constexpr int kBankH = kAtlasH / 2; // 1024 rows per bank (Bank 0: 0..1023, Bank 1: 1024..2047)
     static constexpr int kAtlasGuardRows = 4;
     static constexpr int kAtlasAllocH = kAtlasH + kAtlasGuardRows;
     static constexpr size_t kAtlasBytes = static_cast<size_t>(kAtlasW) * kAtlasAllocH * sizeof(uint16_t);
@@ -97,21 +98,17 @@ public:
 
         pageTable_.assign(kTotalLogicalPages, -1);
         pagePtrs_.assign(kTotalLogicalPages, nullptr);
-        pageOnDisk_.assign(kTotalLogicalPages, 0);
         std::memset(pageGen_, 0, sizeof(pageGen_));
         pageLru_.reserve(maxAllocPages_);
         pageOwner_.reserve(maxAllocPages_);
-        pageDirty_.reserve(maxAllocPages_);
         pageData_.reserve(maxAllocPages_);
         rectHash_.assign(kRectHashSlots, {});
         batches_.reserve(256);
 
-        // Open lossless 64 MB VRAM swap backing file on Xbox utility cache partition (Z: -> fallback E:).
-        OpenSwapFile();
-
         lruClock_ = 0;
-        rectEpoch_ = 1;
-        tileEpoch_ = 1;
+        activeBank_ = 0;
+        bankEpoch_[0] = 1;
+        bankEpoch_[1] = 1;
         shelfX_ = 0;
         shelfY_ = 0;
         shelfRowH_ = 0;
@@ -125,7 +122,6 @@ public:
     }
 
     void Shutdown() {
-        CloseSwapFile();
         if (vbAlloc_) {
             MmFreeContiguousMemory(vbAlloc_);
             vbAlloc_ = nullptr;
@@ -140,10 +136,8 @@ public:
         pageData_.clear();
         pageTable_.clear();
         pagePtrs_.clear();
-        pageOnDisk_.clear();
         pageLru_.clear();
         pageOwner_.clear();
-        pageDirty_.clear();
         rectHash_.clear();
         batches_.clear();
         stateInitialized_ = false;
@@ -174,19 +168,25 @@ public:
         const int dispX = static_cast<int>(blitter.scrollX & 0x1FFFu);
         const int dispY = static_cast<int>(blitter.scrollY & 0x0FFFu);
 
-        // 1. Cycle 4-row texture offset & flip double-buffered VB UP FRONT (zero WC readbacks!).
-        // Keep the 1024x2048 (4 MB) atlas persistent across frames; only recycle at frame start when >75% full
-        // (safe because pb_busy() already completed before Render() is entered!).
+        // 1. Flip double-buffered VB UP FRONT (CPU writes VB B while NV2A finishes reading VB A!).
+        //    Only wait on pb_busy() before recycling a bank or submitting the new pushbuffer — hides ~2 ms GpuWait!
         atlasPhase_ = (atlasPhase_ + 1u) & 3u;
         atlasVBias_ = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
         vbPhase_ ^= 1u;
         vbCur_ = vbAlloc_ + (vbPhase_ ? kMaxVertsPerFrame : 0u);
         vbCount_ = 0;
-        if (shelfY_ > (kAtlasH * 3) / 4) {
+        gpuReadyThisFrame_ = false;
+        lastGpuWaitTsc_ = 0;
+        // Dual-bank generational atlas: when the active 1024-row bank crosses 75% full, sync GPU once,
+        // switch to the opposite bank, and invalidate ONLY that bank — sprites in the other bank stay 100% resident!
+        const int bankStartY = static_cast<int>(activeBank_) * kBankH;
+        if (shelfY_ > bankStartY + (kBankH * 3) / 4) {
+            EnsureGpuReadyForSubmit();
+            activeBank_ ^= 1u;
             shelfX_ = 0;
-            shelfY_ = 0;
+            shelfY_ = static_cast<int>(activeBank_) * kBankH;
             shelfRowH_ = 0;
-            InvalidateRectHash();
+            InvalidateBankHash(activeBank_);
         }
         batches_.clear();
         lastDrawCount_ = list.draws.size();
@@ -219,7 +219,8 @@ public:
         // 3. Flush write-combined A1R5G5B5 atlas & hardware vertex buffer writes before NV2A DMA.
         _mm_sfence();
 
-        // 4. Push frame header (if not already pushed by a mid-frame overflow flush) & submit hardware batches.
+        // 4. Sync GPU (now already idle after CPU work!), reset pushbuffer, and submit hardware batches.
+        EnsureGpuReadyForSubmit();
         const uint64_t tPb0 = ReadRdtsc();
         if (!frameHeaderPushed_) {
             PushFrameHeader(screenW, screenH, bilinear);
@@ -238,6 +239,7 @@ public:
     uint64_t LastBlitVramTsc() const { return lastBlitVramTsc_; }
     uint64_t LastAtlasCopyTsc() const { return lastAtlasCopyTsc_; }
     uint64_t LastPbSubmitTsc() const { return lastPbSubmitTsc_; }
+    uint64_t LastGpuWaitTsc() const { return lastGpuWaitTsc_; }
     uint32_t LastAtlasHits() const { return lastAtlasHits_; }
     uint32_t LastAtlasMisses() const { return lastAtlasMisses_; }
 
@@ -296,20 +298,33 @@ private:
         return (v << 2) | (v >> 4);
     }
 
-    void InvalidateRectHash() {
-        if (++rectEpoch_ == 0 || ++tileEpoch_ == 0) {
-            rectEpoch_ = 1;
-            tileEpoch_ = 1;
+    void InvalidateBankHash(uint32_t bank) {
+        if (++bankEpoch_[bank] == 0) {
+            bankEpoch_[0] = 1;
+            bankEpoch_[1] = 1;
             std::memset(rectHash_.data(), 0, rectHash_.size() * sizeof(RectHashSlot));
         }
     }
 
-    void InvalidateTileHash() {
-        if (++tileEpoch_ == 0) {
-            tileEpoch_ = 1;
-            rectEpoch_ = 1;
+    void InvalidateRectHash() {
+        if (++bankEpoch_[0] == 0 || ++bankEpoch_[1] == 0) {
+            bankEpoch_[0] = 1;
+            bankEpoch_[1] = 1;
             std::memset(rectHash_.data(), 0, rectHash_.size() * sizeof(RectHashSlot));
         }
+    }
+
+    void EnsureGpuReadyForSubmit() {
+        if (gpuReadyThisFrame_) {
+            return;
+        }
+        const uint64_t t0 = ReadRdtsc();
+        while (pb_busy()) {
+        }
+        lastGpuWaitTsc_ += ReadRdtsc() - t0;
+        pb_reset();
+        pb_target_back_buffer();
+        gpuReadyThisFrame_ = true;
     }
 
     void PushFrameHeader(float screenW, float screenH, bool bilinear) {
@@ -356,6 +371,7 @@ private:
     // Safety net: if a single extreme frame ever fills the 1024x2048 atlas or 2048-quad VB,
     // submit queued quads and wait for PGRAPH completion before recycling shelf (0, 0).
     void FlushMidFrameAndResetShelf() {
+        EnsureGpuReadyForSubmit();
         _mm_sfence();
         if (!frameHeaderPushed_) {
             PushFrameHeader(curScreenW_, curScreenH_, curBilinear_);
@@ -365,10 +381,11 @@ private:
         }
         batches_.clear();
         vbCount_ = 0;
+        activeBank_ ^= 1u;
         shelfX_ = 0;
-        shelfY_ = 0;
+        shelfY_ = static_cast<int>(activeBank_) * kBankH;
         shelfRowH_ = 0;
-        InvalidateRectHash();
+        InvalidateBankHash(activeBank_);
         atlasPhase_ = (atlasPhase_ + 1u) & 3u;
         atlasVBias_ = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
         const uint32_t activeTexPhys =
@@ -469,12 +486,7 @@ private:
                             }
                         } else {
                             for (int r = 0; r < rowSpan; ++r, srcPtr += kPageSize, dstPtr += kPageSize) {
-                                for (int i = 0; i < colSpan; ++i) {
-                                    const uint16_t p = srcPtr[i];
-                                    if (p & 0x8000u) {
-                                        dstPtr[i] = p;
-                                    }
-                                }
+                                xbox_blit_trans_u16_row_asm(srcPtr, dstPtr, static_cast<uint32_t>(colSpan));
                             }
                         }
                     }
@@ -586,61 +598,8 @@ private:
         // Per-page generation counter invalidated only on pages actually written by GetPageWrite().
     }
 
-    void OpenSwapFile() {
-        CloseSwapFile();
-        if (!nxIsDriveMounted('Z')) {
-            nxMountDrive('Z', "\\Device\\Harddisk0\\Partition5\\");
-        }
-        swapHandle_ = CreateFileA("Z:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (swapHandle_ == INVALID_HANDLE_VALUE) {
-            if (!nxIsDriveMounted('E')) {
-                nxMountDrive('E', "\\Device\\Harddisk0\\Partition1\\");
-            }
-            swapHandle_ = CreateFileA("E:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        }
-    }
-
-    void CloseSwapFile() {
-        if (swapHandle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(swapHandle_);
-            swapHandle_ = INVALID_HANDLE_VALUE;
-        }
-    }
-
-    void SwapOutPage(int logical, const uint16_t *src) {
-        if (swapHandle_ == INVALID_HANDLE_VALUE) {
-            return;
-        }
-        LARGE_INTEGER pos{};
-        pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
-        if (SetFilePointerEx(swapHandle_, pos, nullptr, FILE_BEGIN)) {
-            DWORD written = 0;
-            if (WriteFile(swapHandle_, src, kPageBytes, &written, nullptr) && written == kPageBytes) {
-                pageOnDisk_[logical] = 1;
-                ++swapCount_;
-            }
-        }
-    }
-
-    bool SwapInPage(int logical, uint16_t *dst) {
-        if (swapHandle_ == INVALID_HANDLE_VALUE || !pageOnDisk_[logical]) {
-            return false;
-        }
-        LARGE_INTEGER pos{};
-        pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
-        if (SetFilePointerEx(swapHandle_, pos, nullptr, FILE_BEGIN)) {
-            DWORD got = 0;
-            if (ReadFile(swapHandle_, dst, kPageBytes, &got, nullptr) && got == kPageBytes) {
-                ++swapCount_;
-                return true;
-            }
-        }
-        return false;
-    }
-
-    uint16_t *AllocateOrEvictPage(int logical, bool forWrite) {
+    // 100% RAM-resident sparse page pool (zero HDD swap file I/O!).
+    uint16_t *AllocateOrEvictPage(int logical) {
         int slot = -1;
         uint16_t *dst = nullptr;
         if (static_cast<int>(pageData_.size()) < maxAllocPages_) {
@@ -648,7 +607,6 @@ private:
             pageData_.emplace_back(kPageSize * kPageSize, 0u);
             pageLru_.push_back(++lruClock_);
             pageOwner_.push_back(logical);
-            pageDirty_.push_back(forWrite ? 1u : 0u);
             dst = pageData_[slot].data();
         } else {
             int victim = 0;
@@ -661,19 +619,14 @@ private:
             }
             const int oldLogical = pageOwner_[victim];
             uint16_t *victimPtr = pageData_[victim].data();
-            if (pageDirty_[victim] || !pageOnDisk_[oldLogical]) {
-                SwapOutPage(oldLogical, victimPtr);
-            }
             pageTable_[oldLogical] = -1;
             pagePtrs_[oldLogical] = nullptr;
             slot = victim;
             pageOwner_[slot] = logical;
             pageLru_[slot] = ++lruClock_;
-            pageDirty_[slot] = forWrite ? 1u : 0u;
             dst = victimPtr;
-        }
-        if (!SwapInPage(logical, dst)) {
             std::memset(dst, 0, kPageBytes);
+            ++swapCount_;
         }
         pageTable_[logical] = slot;
         pagePtrs_[logical] = dst;
@@ -686,10 +639,9 @@ private:
         const int phys = pageTable_[logical];
         if (phys >= 0) {
             pageLru_[phys] = ++lruClock_;
-            pageDirty_[phys] = 1;
             return pagePtrs_[logical];
         }
-        return AllocateOrEvictPage(logical, true);
+        return AllocateOrEvictPage(logical);
     }
 
     inline uint16_t PageGenForRect(int x0, int y0, int w, int h) const {
@@ -721,9 +673,6 @@ private:
         if (phys >= 0) {
             pageLru_[phys] = ++lruClock_;
             return pagePtrs_[logical];
-        }
-        if (pageOnDisk_[logical]) {
-            return AllocateOrEvictPage(logical, false);
         }
         return nullptr;
     }
@@ -834,7 +783,8 @@ private:
         bool hit = false;
         for (uint32_t pr = 0; pr < 128; ++pr) {
             RectHashSlot &cand = rectHash_[(hBase + pr) & kRectHashMask];
-            if (cand.epoch != rectEpoch_) {
+            const uint32_t slotBank = (cand.v0 >= kBankH) ? 1u : 0u;
+            if (cand.epoch != bankEpoch_[slotBank]) {
                 slot = &cand;
                 break;
             }
@@ -845,7 +795,6 @@ private:
             }
         }
         if (!slot) {
-            // Hash probe full: bump ONLY the hash epoch (do NOT reset shelfX_/shelfY_ on top of queued quads!).
             InvalidateRectHash();
             slot = &rectHash_[hBase];
         }
@@ -854,14 +803,15 @@ private:
         } else {
             ++lastAtlasMisses_;
             const int padW = std::min(kAtlasW, w + 1); // 1px gutter prevents adjacent shelf UV bleed
-            const int padH = std::min(kAtlasH, h + 1);
+            const int padH = std::min(kBankH, h + 1);
             if (shelfX_ + padW > kAtlasW) {
                 shelfX_ = 0;
                 shelfY_ += shelfRowH_;
                 shelfRowH_ = 0;
             }
-            if (shelfY_ + padH > kAtlasH) {
-                // Flush queued quads to GPU and wait before recycling shelf (0, 0) — zero mid-frame overwrites!
+            const int bankEndY = static_cast<int>(activeBank_ + 1u) * kBankH;
+            if (shelfY_ + padH > bankEndY) {
+                // Mid-frame bank overflow: flush queued quads, flip to opposite bank, and recycle ONLY that bank!
                 FlushMidFrameAndResetShelf();
                 slot = &rectHash_[hBase];
             }
@@ -889,7 +839,7 @@ private:
             slot->u0 = static_cast<uint16_t>(dstX);
             slot->v0 = static_cast<uint16_t>(dstY);
             slot->pageGen = rectPageGen;
-            slot->epoch = rectEpoch_;
+            slot->epoch = bankEpoch_[activeBank_];
         }
 
         // Compute tint & blend state for NV2A Stage-0 SHIFTLEFTBY1 (2x overdrive) Register Combiner:
@@ -1206,19 +1156,16 @@ private:
 
     std::vector<int> pageTable_;
     std::vector<uint16_t *> pagePtrs_;
-    std::vector<uint8_t> pageOnDisk_;
     std::vector<uint32_t> pageLru_;
     std::vector<int> pageOwner_;
-    std::vector<uint8_t> pageDirty_;
     std::vector<std::vector<uint16_t>> pageData_;
-    HANDLE swapHandle_ = INVALID_HANDLE_VALUE;
     uint32_t lruClock_ = 0;
 
     std::vector<RectHashSlot> rectHash_;
     std::vector<DrawBatch> batches_;
     std::vector<uint16_t> vramBlitScratch_;
-    uint16_t rectEpoch_ = 1;
-    uint16_t tileEpoch_ = 1;
+    uint32_t activeBank_ = 0;
+    uint16_t bankEpoch_[2] = {1, 1};
     uint16_t pageGen_[kTotalLogicalPages] = {};
     int shelfX_ = 0, shelfY_ = 0, shelfRowH_ = 0;
     int maxAllocPages_ = kRetailMaxAllocPages;
@@ -1229,6 +1176,8 @@ private:
     uint64_t lastBlitVramTsc_ = 0;
     uint64_t lastAtlasCopyTsc_ = 0;
     uint64_t lastPbSubmitTsc_ = 0;
+    uint64_t lastGpuWaitTsc_ = 0;
+    bool gpuReadyThisFrame_ = false;
     uint32_t lastAtlasHits_ = 0;
     uint32_t lastAtlasMisses_ = 0;
 

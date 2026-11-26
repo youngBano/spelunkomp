@@ -305,13 +305,13 @@ def emit_insn_direct(name, op, a, oracle, used_regs, use_t_ref):
         v = oracle.read32(lit)
         if v is not None:
             return [f"{R(n)} = 0x{v:08X}u;"]
-        return [f"{R(n)} = recomp::R32(c, 0x{lit:08X}u, cyc);"]
+        return [f"{R(n)} = recomp::R32(c, 0x{lit:08X}u, rem);"]
     if name == "MOVW_PC":
         lit = u32(a + 4 + i8 * 2)
         v = oracle.read16s(lit)
         if v is not None:
             return [f"{R(n)} = 0x{v:08X}u;"]
-        return [f"{R(n)} = {se16(f'recomp::R16(c, 0x{lit:08X}u, cyc)')};"]
+        return [f"{R(n)} = {se16(f'recomp::R16(c, 0x{lit:08X}u, rem)')};"]
     if name == "MOVA":
         return [f"{R(0)} = 0x{u32((a & ~3) + 4 + i8 * 4):08X}u;"]
 
@@ -396,64 +396,64 @@ def emit_insn_direct(name, op, a, oracle, used_regs, use_t_ref):
     if name == "LDS_PR": return [f"c.PR = {R(n)};"]
     if name == "STSL_PR":
         rn = R(n)
-        return [f"{{ const uint32 _a = {rn} - 4u; recomp::W32(c, _a, c.PR, cyc); {rn} = _a; }}"]
+        return [f"{{ const uint32 _a = {rn} - 4u; recomp::W32(c, _a, c.PR, rem); {rn} = _a; }}"]
     if name == "LDSL_PR":
         rn = R(n)
-        return [f"c.PR = recomp::R32(c, {rn}, cyc);", f"{rn} += 4u;"]
+        return [f"c.PR = recomp::R32(c, {rn}, rem);", f"{rn} += 4u;"]
     if name == "STSL_MACL":
         rn = R(n)
-        return [f"{{ const uint32 _a = {rn} - 4u; recomp::W32(c, _a, c.MACL, cyc); {rn} = _a; }}"]
+        return [f"{{ const uint32 _a = {rn} - 4u; recomp::W32(c, _a, c.MACL, rem); {rn} = _a; }}"]
     if name == "LDSL_MACL":
         rn = R(n)
-        return [f"c.MACL = recomp::R32(c, {rn}, cyc);", f"{rn} += 4u;"]
+        return [f"c.MACL = recomp::R32(c, {rn}, rem);", f"{rn} += 4u;"]
     if name == "STSL_MACH":
         rn = R(n)
-        return [f"{{ const uint32 _a = {rn} - 4u; recomp::W32(c, _a, c.MACH, cyc); {rn} = _a; }}"]
+        return [f"{{ const uint32 _a = {rn} - 4u; recomp::W32(c, _a, c.MACH, rem); {rn} = _a; }}"]
     if name == "LDSL_MACH":
         rn = R(n)
-        return [f"c.MACH = recomp::R32(c, {rn}, cyc);", f"{rn} += 4u;"]
-    if name == "MOVL_L": return [f"{R(n)} = recomp::R32(c, {R(m)}, cyc);"]
-    if name == "MOVL_L4": return [f"{R(n)} = recomp::R32(c, {R(m)} + {i4 * 4}u, cyc);"]
-    if name == "MOVL_L0": return [f"{R(n)} = recomp::R32(c, {R(m)} + {R(0)}, cyc);"]
-    if name == "MOVL_S": return [f"recomp::W32(c, {R(n)}, {R(m)}, cyc);"]
-    if name == "MOVL_S4": return [f"recomp::W32(c, {R(n)} + {i4 * 4}u, {R(m)}, cyc);"]
-    if name == "MOVL_S0": return [f"recomp::W32(c, {R(n)} + {R(0)}, {R(m)}, cyc);"]
+        return [f"c.MACH = recomp::R32(c, {rn}, rem);", f"{rn} += 4u;"]
+    if name == "MOVL_L": return [f"{R(n)} = recomp::R32(c, {R(m)}, rem);"]
+    if name == "MOVL_L4": return [f"{R(n)} = recomp::R32(c, {R(m)} + {i4 * 4}u, rem);"]
+    if name == "MOVL_L0": return [f"{R(n)} = recomp::R32(c, {R(m)} + {R(0)}, rem);"]
+    if name == "MOVL_S": return [f"recomp::W32(c, {R(n)}, {R(m)}, rem);"]
+    if name == "MOVL_S4": return [f"recomp::W32(c, {R(n)} + {i4 * 4}u, {R(m)}, rem);"]
+    if name == "MOVL_S0": return [f"recomp::W32(c, {R(n)} + {R(0)}, {R(m)}, rem);"]
     if name == "MOVL_P":
-        return [f"{R(n)} = recomp::R32(c, {R(m)}, cyc);"] if n == m else \
-               [f"{{ const uint32 _v = recomp::R32(c, {R(m)}, cyc); {R(m)} += 4u; {R(n)} = _v; }}"]
+        return [f"{R(n)} = recomp::R32(c, {R(m)}, rem);"] if n == m else \
+               [f"{{ const uint32 _v = recomp::R32(c, {R(m)}, rem); {R(m)} += 4u; {R(n)} = _v; }}"]
     if name == "MOVL_M":
         rn = R(n)
-        return [f"{{ const uint32 _a = {rn} - 4u; recomp::W32(c, _a, {R(m)}, cyc); {rn} = _a; }}"]
-    if name == "MOVB_L": return [f"{R(n)} = {se8(f'recomp::R8(c, {R(m)}, cyc)')};"]
-    if name == "MOVB_L0": return [f"{R(n)} = {se8(f'recomp::R8(c, {R(m)} + {R(0)}, cyc)')};"]
-    if name == "MOVB_L4": return [f"{R(0)} = {se8(f'recomp::R8(c, {R(m)} + {i4}u, cyc)')};"]
+        return [f"{{ const uint32 _a = {rn} - 4u; recomp::W32(c, _a, {R(m)}, rem); {rn} = _a; }}"]
+    if name == "MOVB_L": return [f"{R(n)} = {se8(f'recomp::R8(c, {R(m)}, rem)')};"]
+    if name == "MOVB_L0": return [f"{R(n)} = {se8(f'recomp::R8(c, {R(m)} + {R(0)}, rem)')};"]
+    if name == "MOVB_L4": return [f"{R(0)} = {se8(f'recomp::R8(c, {R(m)} + {i4}u, rem)')};"]
     if name == "MOVB_P":
-        return [f"{R(n)} = {se8(f'recomp::R8(c, {R(m)}, cyc)')};"] if n == m else \
-               [f"{{ const uint32 _v = {se8(f'recomp::R8(c, {R(m)}, cyc)')}; {R(m)} += 1u; {R(n)} = _v; }}"]
+        return [f"{R(n)} = {se8(f'recomp::R8(c, {R(m)}, rem)')};"] if n == m else \
+               [f"{{ const uint32 _v = {se8(f'recomp::R8(c, {R(m)}, rem)')}; {R(m)} += 1u; {R(n)} = _v; }}"]
     if name == "MOVB_M":
         rn = R(n)
-        return [f"{{ const uint32 _a = {rn} - 1u; recomp::W8(c, _a, static_cast<uint8>({R(m)}), cyc); {rn} = _a; }}"]
-    if name == "MOVB_S": return [f"recomp::W8(c, {R(n)}, static_cast<uint8>({R(m)}), cyc);"]
-    if name == "MOVB_S0": return [f"recomp::W8(c, {R(n)} + {R(0)}, static_cast<uint8>({R(m)}), cyc);"]
-    if name == "MOVB_S4": return [f"recomp::W8(c, {R(m)} + {i4}u, static_cast<uint8>({R(0)}), cyc);"]
-    if name == "MOVW_L": return [f"{R(n)} = {se16(f'recomp::R16(c, {R(m)}, cyc)')};"]
-    if name == "MOVW_L0": return [f"{R(n)} = {se16(f'recomp::R16(c, {R(m)} + {R(0)}, cyc)')};"]
-    if name == "MOVW_L4": return [f"{R(0)} = {se16(f'recomp::R16(c, {R(m)} + {i4 * 2}u, cyc)')};"]
+        return [f"{{ const uint32 _a = {rn} - 1u; recomp::W8(c, _a, static_cast<uint8>({R(m)}), rem); {rn} = _a; }}"]
+    if name == "MOVB_S": return [f"recomp::W8(c, {R(n)}, static_cast<uint8>({R(m)}), rem);"]
+    if name == "MOVB_S0": return [f"recomp::W8(c, {R(n)} + {R(0)}, static_cast<uint8>({R(m)}), rem);"]
+    if name == "MOVB_S4": return [f"recomp::W8(c, {R(m)} + {i4}u, static_cast<uint8>({R(0)}), rem);"]
+    if name == "MOVW_L": return [f"{R(n)} = {se16(f'recomp::R16(c, {R(m)}, rem)')};"]
+    if name == "MOVW_L0": return [f"{R(n)} = {se16(f'recomp::R16(c, {R(m)} + {R(0)}, rem)')};"]
+    if name == "MOVW_L4": return [f"{R(0)} = {se16(f'recomp::R16(c, {R(m)} + {i4 * 2}u, rem)')};"]
     if name == "MOVW_P":
-        return [f"{R(n)} = {se16(f'recomp::R16(c, {R(m)}, cyc)')};"] if n == m else \
-               [f"{{ const uint32 _v = {se16(f'recomp::R16(c, {R(m)}, cyc)')}; {R(m)} += 2u; {R(n)} = _v; }}"]
+        return [f"{R(n)} = {se16(f'recomp::R16(c, {R(m)}, rem)')};"] if n == m else \
+               [f"{{ const uint32 _v = {se16(f'recomp::R16(c, {R(m)}, rem)')}; {R(m)} += 2u; {R(n)} = _v; }}"]
     if name == "MOVW_M":
         rn = R(n)
-        return [f"{{ const uint32 _a = {rn} - 2u; recomp::W16(c, _a, static_cast<uint16>({R(m)}), cyc); {rn} = _a; }}"]
-    if name == "MOVW_S": return [f"recomp::W16(c, {R(n)}, static_cast<uint16>({R(m)}), cyc);"]
-    if name == "MOVW_S0": return [f"recomp::W16(c, {R(n)} + {R(0)}, static_cast<uint16>({R(m)}), cyc);"]
-    if name == "MOVW_S4": return [f"recomp::W16(c, {R(m)} + {i4 * 2}u, static_cast<uint16>({R(0)}), cyc);"]
-    if name == "MOVL_LG": return [f"{R(0)} = recomp::R32(c, c.GBR + {i8 * 4}u, cyc);"]
-    if name == "MOVW_LG": return [f"{R(0)} = {se16(f'recomp::R16(c, c.GBR + {i8 * 2}u, cyc)')};"]
-    if name == "MOVB_LG": return [f"{R(0)} = {se8(f'recomp::R8(c, c.GBR + {i8}u, cyc)')};"]
-    if name == "MOVL_SG": return [f"recomp::W32(c, c.GBR + {i8 * 4}u, {R(0)}, cyc);"]
-    if name == "MOVW_SG": return [f"recomp::W16(c, c.GBR + {i8 * 2}u, static_cast<uint16>({R(0)}), cyc);"]
-    if name == "MOVB_SG": return [f"recomp::W8(c, c.GBR + {i8}u, static_cast<uint8>({R(0)}), cyc);"]
+        return [f"{{ const uint32 _a = {rn} - 2u; recomp::W16(c, _a, static_cast<uint16>({R(m)}), rem); {rn} = _a; }}"]
+    if name == "MOVW_S": return [f"recomp::W16(c, {R(n)}, static_cast<uint16>({R(m)}), rem);"]
+    if name == "MOVW_S0": return [f"recomp::W16(c, {R(n)} + {R(0)}, static_cast<uint16>({R(m)}), rem);"]
+    if name == "MOVW_S4": return [f"recomp::W16(c, {R(m)} + {i4 * 2}u, static_cast<uint16>({R(0)}), rem);"]
+    if name == "MOVL_LG": return [f"{R(0)} = recomp::R32(c, c.GBR + {i8 * 4}u, rem);"]
+    if name == "MOVW_LG": return [f"{R(0)} = {se16(f'recomp::R16(c, c.GBR + {i8 * 2}u, rem)')};"]
+    if name == "MOVB_LG": return [f"{R(0)} = {se8(f'recomp::R8(c, c.GBR + {i8}u, rem)')};"]
+    if name == "MOVL_SG": return [f"recomp::W32(c, c.GBR + {i8 * 4}u, {R(0)}, rem);"]
+    if name == "MOVW_SG": return [f"recomp::W16(c, c.GBR + {i8 * 2}u, static_cast<uint16>({R(0)}), rem);"]
+    if name == "MOVB_SG": return [f"recomp::W8(c, c.GBR + {i8}u, static_cast<uint8>({R(0)}), rem);"]
     return None
 
 
@@ -479,9 +479,9 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
         pad = " " * indent
         if target_pc in member_set:
             if target_pc <= branch_pc:
-                # Backward edge (loop): check blockStop / interruptReady before continuing!
+                # Backward edge (loop): 32-bit countdown check (single test/jg on Pentium III!)
                 return [
-                    f"{pad}if (cyc < c.blockStop && !c.interruptReady) goto L_{target_pc:08X};",
+                    f"{pad}if (rem > 0 && !c.interruptReady) goto L_{target_pc:08X};",
                     f"{pad}c.PC = 0x{target_pc:08X}u;",
                     f"{pad}__FLUSH_RETURN__",
                 ]
@@ -491,7 +491,7 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
             return [
                 f"{pad}c.PC = 0x{target_pc:08X}u;",
                 f"{pad}__FLUSH__",
-                f"{pad}if (cyc < c.blockStop && !c.interruptReady) {{ F_{target_pc:08X}(c); return; }}",
+                f"{pad}if (rem > 0 && !c.interruptReady) {{ F_{target_pc:08X}(c); return; }}",
                 f"{pad}return;",
             ]
         return [f"{pad}c.PC = 0x{target_pc:08X}u;", f"{pad}__FLUSH_RETURN__"]
@@ -531,7 +531,7 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
             # so SyncTimer / Blitter sees exact cycle count!
             if name.startswith(("MOVB_", "MOVW_", "MOVL_", "STSL_", "LDSL_", "STCL_", "LDCL_", "MAC", "TASB", "ANDB_G", "ORB_G", "XORB_G", "TSTB_G")):
                 if pending_cyc:
-                    blines.append(f"    cyc += {pending_cyc}u;")
+                    blines.append(f"    rem -= {pending_cyc};")
                     pending_cyc = 0
             blines.extend(emit_one(name, op, a, 4))
             pending_cyc += cyc
@@ -539,16 +539,16 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
         tname, top, ta, tcyc, tslot, ttgt, tfall = blk["term"]
         if tname == "FALL":
             if pending_cyc:
-                blines.append(f"    cyc += {pending_cyc}u;")
+                blines.append(f"    rem -= {pending_cyc};")
             blines.extend(emit_edge(ttgt, ta, 4))
         elif tname in ("BT", "BF"):
             use_t[0] = True
             cond = "T" if tname == "BT" else "!T"
             blines.append(f"    if ({cond}) {{")
-            blines.append(f"        cyc += {pending_cyc + tcyc + 1}u;")
+            blines.append(f"        rem -= {pending_cyc + tcyc + 1};")
             blines.extend(emit_edge(ttgt, ta, 8))
             blines.append("    } else {")
-            blines.append(f"        cyc += {pending_cyc + tcyc}u;")
+            blines.append(f"        rem -= {pending_cyc + tcyc};")
             blines.extend(emit_edge(tfall, ta, 8))
             blines.append("    }")
         elif tname in ("BTS", "BFS"):
@@ -557,20 +557,20 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
             cond = "T" if tname == "BTS" else "!T"
             blines.append(f"    if ({cond}) {{")
             if pending_cyc:
-                blines.append(f"        cyc += {pending_cyc}u;")
+                blines.append(f"        rem -= {pending_cyc};")
             blines.extend(emit_one(sname, tslot, u32(ta + 2), 8))
-            blines.append(f"        cyc += {scyc + tcyc}u;")
+            blines.append(f"        rem -= {scyc + tcyc};")
             blines.extend(emit_edge(ttgt, ta, 8))
             blines.append("    } else {")
-            blines.append(f"        cyc += {pending_cyc + tcyc}u;")
+            blines.append(f"        rem -= {pending_cyc + tcyc};")
             blines.extend(emit_edge(tfall, ta, 8))
             blines.append("    }")
         elif tname == "BRA":
             sname, scyc = table[tslot]
             if pending_cyc:
-                blines.append(f"    cyc += {pending_cyc}u;")
+                blines.append(f"    rem -= {pending_cyc};")
             blines.extend(emit_one(sname, tslot, u32(ta + 2), 4))
-            blines.append(f"    cyc += {scyc + tcyc}u;")
+            blines.append(f"    rem -= {scyc + tcyc};")
             blines.extend(emit_edge(ttgt, ta, 4))
         elif tname in ("BSR", "JSR"):
             sname, scyc = table[tslot]
@@ -579,15 +579,15 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
                 used_regs.add(rn)
                 blines.append(f"    _tgt = r{rn};")
             if pending_cyc:
-                blines.append(f"    cyc += {pending_cyc}u;")
+                blines.append(f"    rem -= {pending_cyc};")
             blines.append(f"    c.PR = 0x{tfall:08X}u;")
             blines.extend(emit_one(sname, tslot, u32(ta + 2), 4))
-            blines.append(f"    cyc += {scyc + tcyc}u;")
+            blines.append(f"    rem -= {scyc + tcyc};")
             # Direct C++ call if target is a known compiled function root!
             if ttgt is not None and ttgt in func_roots_set:
                 blines.append(f"    c.PC = 0x{ttgt:08X}u;")
                 blines.append("    __FLUSH__")
-                blines.append(f"    if (cyc < c.blockStop && !c.interruptReady) {{")
+                blines.append(f"    if (rem > 0 && !c.interruptReady) {{")
                 blines.append(f"        F_{ttgt:08X}(c);")
                 blines.append("        if (c.PC == 0x%08Xu && c.cycles < c.blockStop && !c.interruptReady) {" % tfall)
                 if tfall in member_set:
@@ -622,14 +622,14 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
                 blines.append("    c.SetSR(c.SSR);")
                 blines.append("    __RELOAD__")
             if pending_cyc:
-                blines.append(f"    cyc += {pending_cyc}u;")
+                blines.append(f"    rem -= {pending_cyc};")
             blines.extend(emit_one(sname, tslot, u32(ta + 2), 4))
-            blines.append(f"    cyc += {scyc + tcyc}u;")
+            blines.append(f"    rem -= {scyc + tcyc};")
             blines.append("    c.PC = _tgt;")
             blines.append("    __FLUSH_RETURN__")
         elif tname in BARRIERS:
             if pending_cyc:
-                blines.append(f"    cyc += {pending_cyc}u;")
+                blines.append(f"    rem -= {pending_cyc};")
             blines.append(f"    c.PC = 0x{ta:08X}u;")
             blines.append("    c.branched = false;")
             blines.append("    __FLUSH__")
@@ -643,7 +643,7 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
     sorted_regs = sorted(used_regs)
 
     def make_load(pad):
-        ls = [f"{pad}uint64 cyc = c.cycles;"]
+        ls = [f"{pad}sint32 rem = static_cast<sint32>(static_cast<sint64>(c.blockStop) - static_cast<sint64>(c.cycles));"]
         for k in sorted_regs:
             ls.append(f"{pad}uint32 r{k} = c.R[{k}];")
         if use_t[0]:
@@ -651,7 +651,7 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
         return ls
 
     def make_reload(pad):
-        ls = [f"{pad}cyc = c.cycles;"]
+        ls = [f"{pad}rem = static_cast<sint32>(static_cast<sint64>(c.blockStop) - static_cast<sint64>(c.cycles));"]
         for k in sorted_regs:
             ls.append(f"{pad}r{k} = c.R[{k}];")
         if use_t[0]:
@@ -659,7 +659,7 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
         return ls
 
     def make_flush(pad):
-        ls = [f"{pad}c.cycles = cyc;"]
+        ls = [f"{pad}c.cycles = static_cast<uint64>(static_cast<sint64>(c.blockStop) - rem);"]
         for k in sorted_regs:
             ls.append(f"{pad}c.R[{k}] = r{k};")
         if use_t[0]:

@@ -28,7 +28,12 @@ Cv1000::Cv1000()
 #else
     , program(0x400000, 0xFF)
 #endif
-    , soundRom(0x800000, 0xFF) {
+#ifdef NXDK
+    , soundRom()
+#else
+    , soundRom(0x800000, 0xFF)
+#endif
+{
     blitter.keepStats = g_blitLog != nullptr;
     cpu.ram = ram.data();
     cpu.bus = this;
@@ -39,8 +44,10 @@ void Cv1000::Reset() {
     blitter.ramMask = boardD ? 0x00FFFFFFu : 0x007FFFFFu;
     cpu.Reset();
     cpu.cycles = 0;
-    sound.rom = soundRom.data();
-    sound.romSize = static_cast<uint32_t>(soundRom.size());
+    if (!soundRom.empty()) {
+        sound.rom = soundRom.data();
+        sound.romSize = static_cast<uint32_t>(soundRom.size());
+    }
     sound.Reset();
     m_blitterDone = 0;
     m_frameEnd = 0;
