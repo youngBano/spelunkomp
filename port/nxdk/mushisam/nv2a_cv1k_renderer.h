@@ -98,12 +98,16 @@ public:
 
         pageTable_.assign(kTotalLogicalPages, -1);
         pagePtrs_.assign(kTotalLogicalPages, nullptr);
+        pageOnDisk_.assign(kTotalLogicalPages, 0);
         std::memset(pageGen_, 0, sizeof(pageGen_));
         pageLru_.reserve(maxAllocPages_);
         pageOwner_.reserve(maxAllocPages_);
+        pageDirty_.reserve(maxAllocPages_);
         pageData_.reserve(maxAllocPages_);
         rectHash_.assign(kRectHashSlots, {});
         batches_.reserve(256);
+
+        OpenSwapFile();
 
         lruClock_ = 0;
         activeBank_ = 0;
@@ -122,6 +126,7 @@ public:
     }
 
     void Shutdown() {
+        CloseSwapFile();
         if (vbAlloc_) {
             MmFreeContiguousMemory(vbAlloc_);
             vbAlloc_ = nullptr;
@@ -136,8 +141,10 @@ public:
         pageData_.clear();
         pageTable_.clear();
         pagePtrs_.clear();
+        pageOnDisk_.clear();
         pageLru_.clear();
         pageOwner_.clear();
+        pageDirty_.clear();
         rectHash_.clear();
         batches_.clear();
         stateInitialized_ = false;
@@ -598,8 +605,62 @@ private:
         // Per-page generation counter invalidated only on pages actually written by GetPageWrite().
     }
 
-    // 100% RAM-resident sparse page pool (zero HDD swap file I/O!).
-    uint16_t *AllocateOrEvictPage(int logical) {
+    void OpenSwapFile() {
+        CloseSwapFile();
+        if (!nxIsDriveMounted('Z')) {
+            nxMountDrive('Z', "\\Device\\Harddisk0\\Partition5\\");
+        }
+        swapHandle_ = CreateFileA("Z:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (swapHandle_ == INVALID_HANDLE_VALUE) {
+            if (!nxIsDriveMounted('E')) {
+                nxMountDrive('E', "\\Device\\Harddisk0\\Partition1\\");
+            }
+            swapHandle_ = CreateFileA("E:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+    }
+
+    void CloseSwapFile() {
+        if (swapHandle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(swapHandle_);
+            swapHandle_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    void SwapOutPage(int logical, const uint16_t *src) {
+        if (swapHandle_ == INVALID_HANDLE_VALUE) {
+            return;
+        }
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
+        if (SetFilePointerEx(swapHandle_, pos, nullptr, FILE_BEGIN)) {
+            DWORD written = 0;
+            if (WriteFile(swapHandle_, src, kPageBytes, &written, nullptr) && written == kPageBytes) {
+                pageOnDisk_[logical] = 1;
+                ++swapCount_;
+            }
+        }
+    }
+
+    bool SwapInPage(int logical, uint16_t *dst) {
+        if (swapHandle_ == INVALID_HANDLE_VALUE || !pageOnDisk_[logical]) {
+            return false;
+        }
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
+        if (SetFilePointerEx(swapHandle_, pos, nullptr, FILE_BEGIN)) {
+            DWORD got = 0;
+            if (ReadFile(swapHandle_, dst, kPageBytes, &got, nullptr) && got == kPageBytes) {
+                ++swapCount_;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // 29 MB hot RAM pool with lossless Z:\mushivrm.bin backing so evicted shared sprites are never lost!
+    uint16_t *AllocateOrEvictPage(int logical, bool forWrite) {
         int slot = -1;
         uint16_t *dst = nullptr;
         if (static_cast<int>(pageData_.size()) < maxAllocPages_) {
@@ -607,6 +668,7 @@ private:
             pageData_.emplace_back(kPageSize * kPageSize, 0u);
             pageLru_.push_back(++lruClock_);
             pageOwner_.push_back(logical);
+            pageDirty_.push_back(forWrite ? 1u : 0u);
             dst = pageData_[slot].data();
         } else {
             int victim = 0;
@@ -619,15 +681,21 @@ private:
             }
             const int oldLogical = pageOwner_[victim];
             uint16_t *victimPtr = pageData_[victim].data();
+            if (pageDirty_[victim] || !pageOnDisk_[oldLogical]) {
+                SwapOutPage(oldLogical, victimPtr);
+            }
             pageTable_[oldLogical] = -1;
             pagePtrs_[oldLogical] = nullptr;
             slot = victim;
             pageOwner_[slot] = logical;
             pageLru_[slot] = ++lruClock_;
+            pageDirty_[slot] = forWrite ? 1u : 0u;
             dst = victimPtr;
-            std::memset(dst, 0, kPageBytes);
-            ++swapCount_;
         }
+        if (!SwapInPage(logical, dst)) {
+            std::memset(dst, 0, kPageBytes);
+        }
+        ++pageGen_[logical];
         pageTable_[logical] = slot;
         pagePtrs_[logical] = dst;
         return dst;
@@ -639,9 +707,10 @@ private:
         const int phys = pageTable_[logical];
         if (phys >= 0) {
             pageLru_[phys] = ++lruClock_;
+            pageDirty_[phys] = 1;
             return pagePtrs_[logical];
         }
-        return AllocateOrEvictPage(logical);
+        return AllocateOrEvictPage(logical, true);
     }
 
     inline uint16_t PageGenForRect(int x0, int y0, int w, int h) const {
@@ -673,6 +742,9 @@ private:
         if (phys >= 0) {
             pageLru_[phys] = ++lruClock_;
             return pagePtrs_[logical];
+        }
+        if (pageOnDisk_[logical]) {
+            return AllocateOrEvictPage(logical, false);
         }
         return nullptr;
     }
@@ -752,10 +824,9 @@ private:
         const int dy1 = dy0 + h;
         if (dx1 <= 0 || dx0 >= kSrcWidth || dy1 <= 0 || dy0 >= kSrcHeight) {
             // Only software-composite draws targeting genuine off-screen VRAM caches (e.g. x=7456..8191 tilemap
-            // ring buffer). Never software-blit clipped screen sprites/bullets in the (0..1023, 0..511) display area!
-            const int ux = d.x0 & (kVramW - 1);
-            const int uy = d.y0 & (kVramH - 1);
-            if (ux >= 1024 || uy >= 512) {
+            // ring buffer). Reject negative d.x0/d.y0 so clipped off-screen sprites never wrap into x=8160..8191!
+            if (d.x0 >= 0 && d.y0 >= 0 && d.x0 < kVramW && d.y0 < kVramH &&
+                (d.x0 >= 1024 || d.y0 >= 512)) {
                 const uint64_t tB0 = ReadRdtsc();
                 BlitVramToVram(d);
                 lastBlitVramTsc_ += ReadRdtsc() - tB0;
@@ -1156,9 +1227,12 @@ private:
 
     std::vector<int> pageTable_;
     std::vector<uint16_t *> pagePtrs_;
+    std::vector<uint8_t> pageOnDisk_;
     std::vector<uint32_t> pageLru_;
     std::vector<int> pageOwner_;
+    std::vector<uint8_t> pageDirty_;
     std::vector<std::vector<uint16_t>> pageData_;
+    HANDLE swapHandle_ = INVALID_HANDLE_VALUE;
     uint32_t lruClock_ = 0;
 
     std::vector<RectHashSlot> rectHash_;
