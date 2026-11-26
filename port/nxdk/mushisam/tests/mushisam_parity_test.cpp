@@ -115,6 +115,7 @@ int main(int argc, char **argv) {
     int frames = 1200;
     std::string dumpRamPath;
     std::string dumpBlocksPath;
+    std::string dumpAssetsPath;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -130,6 +131,8 @@ int main(int argc, char **argv) {
             dumpRamPath = argv[++i];
         } else if (a == "--record" && i + 1 < argc) {
             dumpBlocksPath = argv[++i];
+        } else if (a == "--dump-assets" && i + 1 < argc) {
+            dumpAssetsPath = argv[++i];
         }
     }
 
@@ -258,11 +261,39 @@ int main(int argc, char **argv) {
     uint64_t audioNonZeroSamples = 0;
     bool dumpedRam = false;
 
+    // Asset & VRAM page profiler per bucket: 0=Boot/Menu, 1=Stage1, 2=Stage2, 3=Stage3, 4=Stage4, 5=Stage5
+    struct AssetProf {
+        int curBucket = 0;
+        std::vector<uint8_t> nandSeen[6];
+        std::vector<uint8_t> vramRead[6];
+        std::vector<uint8_t> vramWrite[6];
+        uint64_t blitVramDraws = 0, blitVramOpaque = 0, blitVramOverlap = 0, blitVramPixels = 0;
+        AssetProf() {
+            for (int i = 0; i < 6; ++i) {
+                nandSeen[i].assign(65536, 0);
+                vramRead[i].assign(2048, 0);
+                vramWrite[i].assign(2048, 0);
+            }
+        }
+    } aprof;
+    if (!dumpAssetsPath.empty()) {
+        board.nand.onPageReadCtx = &aprof;
+        board.nand.onPageRead = [](void *ctx, uint32_t page) {
+            auto *ap = static_cast<AssetProf *>(ctx);
+            if (page < 65536u) ap->nandSeen[ap->curBucket][page] = 1;
+        };
+    }
+
     for (int f = 1; f <= frames; ++f) {
         uint32_t p1 = 0, sys = 0;
         fp.Update(board, p1, sys);
         board.inputs[0] = p1;
         board.system = sys;
+        if (!dumpAssetsPath.empty()) {
+            const bool ip = spelunk_xbox::MushisamFakePlay::InPlay(board);
+            const uint32_t st = spelunk_xbox::MushisamFakePlay::Stage(board);
+            aprof.curBucket = ip ? static_cast<int>(st < 5u ? (st + 1u) : 5u) : 0;
+        }
         nl.Clear();
         board.RunFrame();
         const bool inPlayNow = spelunk_xbox::MushisamFakePlay::InPlay(board);
@@ -288,12 +319,48 @@ int main(int argc, char **argv) {
             for (const auto &st : nl.steps) {
                 if (st.upload) {
                     if (seenDraw) ++midFrameUploadsAfterDraws;
+                    if (!dumpAssetsPath.empty()) {
+                        const auto &up = nl.uploads[st.first];
+                        for (int y = up.y; y < up.y + up.height; y += 64) {
+                            const int py = (y & 4095) >> 7;
+                            for (int x = up.x; x < up.x + up.width; x += 64) {
+                                const int px = (x & 8191) >> 7;
+                                aprof.vramWrite[aprof.curBucket][py * 64 + px] = 1;
+                            }
+                        }
+                    }
                 } else {
                     seenDraw = true;
                     for (uint32_t i = 0; i < st.count; ++i) {
                         const auto &d = nl.draws[st.first + i];
                         const int dx0 = d.x0 - scrX, dy0 = d.y0 - scrY;
                         const int w = d.x1 - d.x0 + 1, h = d.y1 - d.y0 + 1;
+                        if (!dumpAssetsPath.empty() && w > 0 && h > 0) {
+                            const bool flipX = (d.flags & spelunk::NativeDraw::kFlipX) != 0;
+                            const bool flipY = (d.flags & spelunk::NativeDraw::kFlipY) != 0;
+                            const int sx0 = flipX ? (d.sx - d.x1) : (d.sx + d.x0);
+                            const int sy0 = flipY ? (d.sy - d.y1) : (d.sy + d.y0);
+                            const bool offscr = (dx0 + w <= 0 || dx0 >= 320 || dy0 + h <= 0 || dy0 >= 240);
+                            if (offscr) {
+                                const int ux = d.x0 & 8191, uy = d.y0 & 4095;
+                                if (ux >= 1024 || uy >= 512) {
+                                    ++aprof.blitVramDraws;
+                                    aprof.blitVramPixels += static_cast<uint64_t>(w) * h;
+                                    const bool trans = (d.flags & spelunk::NativeDraw::kTransparent) != 0;
+                                    const bool tinted = (d.flags & spelunk::NativeDraw::kTinted) != 0;
+                                    const bool blendOn = (d.flags & 64) == 0;
+                                    if (!trans && !tinted && !blendOn) ++aprof.blitVramOpaque;
+                                    const int usx = sx0 & 8191, usy = sy0 & 4095;
+                                    if (usx < ux + w && ux < usx + w && usy < uy + h && uy < usy + h) ++aprof.blitVramOverlap;
+                                    aprof.vramWrite[aprof.curBucket][((uy) >> 7) * 64 + ((ux) >> 7)] = 1;
+                                    aprof.vramRead[aprof.curBucket][((usy) >> 7) * 64 + ((usx) >> 7)] = 1;
+                                }
+                            } else {
+                                const int usx = sx0 & 8191, usy = sy0 & 4095;
+                                aprof.vramRead[aprof.curBucket][(usy >> 7) * 64 + (usx >> 7)] = 1;
+                                aprof.vramRead[aprof.curBucket][(((usy + h - 1) & 4095) >> 7) * 64 + (((usx + w - 1) & 8191) >> 7)] = 1;
+                            }
+                        }
                         if (dx0 + w <= 0 || dx0 >= 320 || dy0 + h <= 0 || dy0 >= 240) {
                             ++offscreenDraws;
                             if (dx0 + w < -64 || dx0 > 384 || dy0 + h < -64 || dy0 > 304) {
@@ -361,6 +428,39 @@ int main(int argc, char **argv) {
     if (!dumpBlocksPath.empty()) {
         board.cpu.SaveRecording(dumpBlocksPath.c_str());
         std::printf("Saved block recording to %s\n", dumpBlocksPath.c_str());
+    }
+    if (!dumpAssetsPath.empty()) {
+        FILE *af = std::fopen(dumpAssetsPath.c_str(), "w");
+        const char *bNames[6] = {"BootMenu", "Stage1", "Stage2", "Stage3", "Stage4", "Stage5"};
+        std::printf("=== ASSET & VRAM WORKING-SET PROFILE (%d frames) ===\n", frames);
+        std::printf("BlitVramToVram: draws=%llu (%.1f/frame), opaque=%.1f%%, overlap=%.2f%%, avgPx=%.1f\n",
+                    (unsigned long long)aprof.blitVramDraws,
+                    static_cast<double>(aprof.blitVramDraws) / frames,
+                    aprof.blitVramDraws ? 100.0 * aprof.blitVramOpaque / aprof.blitVramDraws : 0.0,
+                    aprof.blitVramDraws ? 100.0 * aprof.blitVramOverlap / aprof.blitVramDraws : 0.0,
+                    aprof.blitVramDraws ? static_cast<double>(aprof.blitVramPixels) / aprof.blitVramDraws : 0.0);
+        for (int b = 0; b < 6; ++b) {
+            int nCnt = 0, vrCnt = 0, vwCnt = 0, vuCnt = 0;
+            for (int p = 0; p < 65536; ++p) if (aprof.nandSeen[b][p]) ++nCnt;
+            for (int p = 0; p < 2048; ++p) {
+                if (aprof.vramRead[b][p]) ++vrCnt;
+                if (aprof.vramWrite[b][p]) ++vwCnt;
+                if (aprof.vramRead[b][p] || aprof.vramWrite[b][p]) ++vuCnt;
+            }
+            if (nCnt || vuCnt) {
+                std::printf("  %-8s: NAND=%5d pages (%.2f MB) | VRAM read=%4d (%.1f MB) write=%4d (%.1f MB) union=%4d (%.1f MB)\n",
+                            bNames[b], nCnt, nCnt * 2112.0 / (1024.0 * 1024.0),
+                            vrCnt, vrCnt * 32.0 / 1024.0, vwCnt, vwCnt * 32.0 / 1024.0,
+                            vuCnt, vuCnt * 32.0 / 1024.0);
+                if (af) {
+                    std::fprintf(af, "BUCKET %d %s %d\n", b, bNames[b], nCnt);
+                    for (int p = 0; p < 65536; ++p) {
+                        if (aprof.nandSeen[b][p]) std::fprintf(af, "%u\n", static_cast<unsigned>(p));
+                    }
+                }
+            }
+        }
+        if (af) std::fclose(af);
     }
     if (!dumpRamPath.empty()) {
         const std::string endPath = dumpRamPath + ".end";

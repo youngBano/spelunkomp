@@ -153,6 +153,7 @@ int main(void) {
     bool prevLb = false;
     bool prevL3 = false;
     bool prevR3 = false;
+    uint32_t loadedStagePack = 0xFFFFFFFFu;
 
     while (true) {
         spelunk_xbox::PadState pad{};
@@ -216,6 +217,16 @@ int main(void) {
             }
             if ((board.frame & 127u) == 0u) {
                 eeprom.FlushIfDirty(board.rtc);
+            }
+            if (spelunk_xbox::MushisamFakePlay::InPlay(board)) {
+                const uint32_t st = spelunk_xbox::MushisamFakePlay::Stage(board);
+                if (st != loadedStagePack) {
+                    char packPath[64];
+                    std::snprintf(packPath, sizeof(packPath), "D:\\mushisam\\pak_s%u.bin", st + 1u);
+                    if (board.nand.AttachStagePack(packPath)) {
+                        loadedStagePack = st;
+                    }
+                }
             }
             cpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tCpu0;
             stepped = true;

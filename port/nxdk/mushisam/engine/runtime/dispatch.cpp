@@ -349,15 +349,6 @@ void SH3::InstallTranslations() {
                 codeAddrEnd = pageEnd;
             }
         }
-        std::vector<Translation *> &slots = m_pages[first];
-        if (slots.empty()) {
-            slots.assign(2048, nullptr);
-            m_pagePtrs[first] = slots.data();
-        }
-        Translation *&head = slots[(phys & 0xFFF) >> 1];
-        t.next = head;
-        head = &t;
-
         // Populate zero-indirection direct function-pointer table for canonical 0x0Cxxxxxx RAM blocks.
         if (!blocks[i].bytes && (blocks[i].address & 0xFF800000u) == 0x0C000000u) {
             std::vector<BlockFn> &fnSlots = m_fnPages[first];
@@ -366,7 +357,19 @@ void SH3::InstallTranslations() {
                 m_pageFnPtrs[first] = fnSlots.data();
             }
             fnSlots[(phys & 0xFFF) >> 1] = blocks[i].run;
+#ifdef XBOX_FAST_CPU
+            // On Xbox, canonical 0x0Cxxxxxx blocks always hit m_pageFnPtrs directly; skip duplicate m_pages (~1.8 MB saved!).
+            continue;
+#endif
         }
+        std::vector<Translation *> &slots = m_pages[first];
+        if (slots.empty()) {
+            slots.assign(2048, nullptr);
+            m_pagePtrs[first] = slots.data();
+        }
+        Translation *&head = slots[(phys & 0xFFF) >> 1];
+        t.next = head;
+        head = &t;
     }
 }
 

@@ -38,7 +38,7 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 768; // 768 * 32 KB = 24 MB hot RAM pool (3.1 MB free on 64 MB Xbox)
+    static constexpr int kRetailMaxAllocPages = 832; // 832 * 32 KB = 26 MB hot RAM pool (~1.9 MB free, ~0 gameplay swaps!)
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
     // 1024x(1024+4) A1R5G5B5 NV2A shelf atlas (2 MB + 8 KB) + 8,192-slot Mix64 hash table:
@@ -182,7 +182,7 @@ public:
         vbPhase_ ^= 1u;
         vbCur_ = vbAlloc_ + (vbPhase_ ? kMaxVertsPerFrame : 0u);
         vbCount_ = 0;
-        if (shelfY_ > (kAtlasH / 2)) {
+        if (shelfY_ > (kAtlasH * 3) / 4) {
             shelfX_ = 0;
             shelfY_ = 0;
             shelfRowH_ = 0;
@@ -426,6 +426,64 @@ private:
         const uint8_t tr = static_cast<uint8_t>((d.colours >> 10) & 0x3F);
         const uint8_t tg = static_cast<uint8_t>((d.colours >> 16) & 0x3F);
         const uint8_t tb = static_cast<uint8_t>((d.colours >> 22) & 0x3F);
+
+        // Fast path (~99% of CV1000 off-screen tilemap blits): non-overlapping, unflipped, untinted, unblended.
+        // Hoists GetPageRead/GetPageWrite per 128x128 page strip (32x fewer lookups) and skips scratch double-copy!
+        const int ux0 = d.x0 & (kVramW - 1);
+        const int uy0 = d.y0 & (kVramH - 1);
+        const int usx0 = (d.sx + d.x0) & (kVramW - 1);
+        const int usy0 = (d.sy + d.y0) & (kVramH - 1);
+        const bool overlaps = (usx0 < ux0 + w && ux0 < usx0 + w && usy0 < uy0 + h && uy0 < usy0 + h);
+        if (!flipX && !flipY && !tinted && !blendOn && !overlaps) {
+            int row = 0;
+            while (row < h) {
+                const int sy = (usy0 + row) & (kVramH - 1);
+                const int dy = (uy0 + row) & (kVramH - 1);
+                const int spy = sy >> kPageShift, sly = sy & kPageMask;
+                const int dpy = dy >> kPageShift, dly = dy & kPageMask;
+                const int rowSpan = std::min(h - row, std::min(kPageSize - sly, kPageSize - dly));
+
+                int col = 0;
+                while (col < w) {
+                    const int sx = (usx0 + col) & (kVramW - 1);
+                    const int dx = (ux0 + col) & (kVramW - 1);
+                    const int spx = sx >> kPageShift, slx = sx & kPageMask;
+                    const int dpx = dx >> kPageShift, dlx = dx & kPageMask;
+                    const int colSpan = std::min(w - col, std::min(kPageSize - slx, kPageSize - dlx));
+
+                    const uint16_t *spg = GetPageRead(spx, spy);
+                    uint16_t *dpg = GetPageWrite(dpx, dpy);
+                    uint16_t *dstPtr = dpg + static_cast<size_t>(dly) * kPageSize + dlx;
+                    if (!spg) {
+                        if (!trans) {
+                            const size_t bytes = static_cast<size_t>(colSpan) * sizeof(uint16_t);
+                            for (int r = 0; r < rowSpan; ++r, dstPtr += kPageSize) {
+                                std::memset(dstPtr, 0, bytes);
+                            }
+                        }
+                    } else {
+                        const uint16_t *srcPtr = spg + static_cast<size_t>(sly) * kPageSize + slx;
+                        if (!trans) {
+                            for (int r = 0; r < rowSpan; ++r, srcPtr += kPageSize, dstPtr += kPageSize) {
+                                xbox_copy_u16_row_asm(srcPtr, dstPtr, static_cast<uint32_t>(colSpan));
+                            }
+                        } else {
+                            for (int r = 0; r < rowSpan; ++r, srcPtr += kPageSize, dstPtr += kPageSize) {
+                                for (int i = 0; i < colSpan; ++i) {
+                                    const uint16_t p = srcPtr[i];
+                                    if (p & 0x8000u) {
+                                        dstPtr[i] = p;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    col += colSpan;
+                }
+                row += rowSpan;
+            }
+            return;
+        }
 
         // Read source rect first into a stack/scratch buffer so overlapping VRAM-to-VRAM blits never alias.
         if (static_cast<size_t>(w) * static_cast<size_t>(h) > vramBlitScratch_.size()) {

@@ -35,7 +35,61 @@ public:
     std::vector<uint8_t> data;     // Optional full in-memory image (host); empty when streaming from file on Xbox
     std::set<uint32_t> written;    // blocks the game has programmed or erased
 
-    ~Nand() { CloseFile(); }
+    ~Nand() {
+        DetachStagePack();
+        CloseFile();
+    }
+
+    // Attach a contiguous per-stage NAND asset pack (MPAK) to eliminate scattered 132 MB seeks during stage load.
+    bool AttachStagePack(const char *path) {
+        DetachStagePack();
+#ifdef NXDK
+        m_packHandle = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (m_packHandle == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        uint32_t hdr[2] = {};
+        DWORD got = 0;
+        if (!ReadFile(m_packHandle, hdr, sizeof(hdr), &got, nullptr) || got != sizeof(hdr) ||
+            hdr[0] != 0x4B41504Du || hdr[1] == 0 || hdr[1] >= 65535u) {
+            DetachStagePack();
+            return false;
+        }
+        const uint32_t count = hdr[1];
+        std::vector<uint32_t> pages(count);
+        const DWORD tblBytes = count * static_cast<DWORD>(sizeof(uint32_t));
+        if (!ReadFile(m_packHandle, pages.data(), tblBytes, &got, nullptr) || got != tblBytes) {
+            DetachStagePack();
+            return false;
+        }
+        m_packLut.assign(kPages, 0xFFFFu);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (pages[i] < kPages) {
+                m_packLut[pages[i]] = static_cast<uint16_t>(i);
+            }
+        }
+        m_packDataOff = sizeof(hdr) + tblBytes;
+        m_packRaOff = 0;
+        m_packRaLen = 0;
+        return true;
+#else
+        (void)path;
+        return false;
+#endif
+    }
+
+    void DetachStagePack() {
+#ifdef NXDK
+        if (m_packHandle != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_packHandle);
+            m_packHandle = INVALID_HANDLE_VALUE;
+        }
+#endif
+        m_packLut.clear();
+        m_packDataOff = 0;
+        m_packRaOff = 0;
+        m_packRaLen = 0;
+    }
 
     bool AttachFile(const char *path) {
         CloseFile();
@@ -119,6 +173,9 @@ public:
                 m_streamCol = m_column;
                 m_mode = Mode::Reading;
                 reads++;
+                if (onPageRead) {
+                    onPageRead(onPageReadCtx, m_page);
+                }
             }
             break;
         case 0x05: // (another column of the page being read)
@@ -296,6 +353,8 @@ public:
     }
     uint64_t reads = 0; // page reads started (the checks: how much loading a frame did)
     uint64_t cacheMisses = 0; // streaming disk/DVD misses (for Phase 3 verification)
+    void (*onPageRead)(void *ctx, uint32_t page) = nullptr;
+    void *onPageReadCtx = nullptr;
 
     void Serialize(Archive &ar) {
         ar.Mark(0x4E414E44);
@@ -361,6 +420,33 @@ private:
         slot.page = pageIdx;
         slot.lru = ++m_lruClock;
         ++cacheMisses;
+#ifdef NXDK
+        // Fast contiguous per-stage pack lookup (zero random seeks across 132 MB mushisam_u2!).
+        if (m_packHandle != INVALID_HANDLE_VALUE && pageIdx < m_packLut.size() && m_packLut[pageIdx] != 0xFFFFu) {
+            const size_t pOff = m_packDataOff + static_cast<size_t>(m_packLut[pageIdx]) * kPageTotal;
+            if (pOff < m_packRaOff || pOff + kPageTotal > m_packRaOff + m_packRaLen) {
+                m_packRaOff = pOff;
+                LARGE_INTEGER pos{};
+                pos.QuadPart = static_cast<LONGLONG>(m_packRaOff);
+                SetFilePointerEx(m_packHandle, pos, nullptr, FILE_BEGIN);
+                DWORD got = 0;
+                m_packRaLen = ReadFile(m_packHandle, m_raBuf, static_cast<DWORD>(sizeof(m_raBuf)), &got, nullptr)
+                                  ? static_cast<size_t>(got)
+                                  : 0u;
+            }
+            const size_t avail = (pOff < m_packRaOff + m_packRaLen) ? (m_packRaOff + m_packRaLen - pOff) : 0;
+            const size_t copyLen = avail < kPageTotal ? avail : kPageTotal;
+            if (copyLen > 0) {
+                std::memcpy(slot.bytes, m_raBuf + (pOff - m_packRaOff), copyLen);
+            }
+            if (copyLen < kPageTotal) {
+                std::memset(slot.bytes + copyLen, 0xFF, kPageTotal - copyLen);
+            }
+            m_curPageIdx = pageIdx;
+            m_curPageBuf = slot.bytes;
+            return m_curPageBuf;
+        }
+#endif
         const size_t off = static_cast<size_t>(pageIdx) * kPageTotal;
         if (off < m_fileSize) {
             // 128 KB sequential read-ahead eliminates per-page Xbox DVD fseek/fread stalls.
@@ -432,9 +518,14 @@ private:
 
 #ifdef NXDK
     HANDLE m_handle = INVALID_HANDLE_VALUE;
+    HANDLE m_packHandle = INVALID_HANDLE_VALUE;
 #else
     FILE *m_file = nullptr;
 #endif
+    std::vector<uint16_t> m_packLut;
+    size_t m_packDataOff = 0;
+    size_t m_packRaOff = 0;
+    size_t m_packRaLen = 0;
     size_t m_fileSize = 0;
     size_t m_raOff = 0;
     size_t m_raLen = 0;
