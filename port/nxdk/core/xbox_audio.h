@@ -98,12 +98,13 @@ private:
     }
 
     int16_t *dmaBuf_[kNumDmaBuffers] = {};
-    int16_t ring_[kRingSize] = {};
-    volatile uint32_t ringRead_ = 0;
-    volatile uint32_t ringWrite_ = 0;
+    // 32-byte Pentium III cache-line separation prevents false sharing between DPC consumer and game producer.
+    alignas(32) int16_t ring_[kRingSize] = {};
+    alignas(32) volatile uint32_t ringRead_ = 0;
     uint32_t phase16_ = 0;
     int16_t lastSample_ = 0;
     int curDma_ = 0;
+    alignas(32) volatile uint32_t ringWrite_ = 0;
     bool initialized_ = false;
 };
 
