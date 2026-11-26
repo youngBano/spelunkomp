@@ -42,9 +42,10 @@ DEPS := $(CURDIR)/main.cpp.d $(ALL_ENGINE_OBJS:.obj=.cpp.d)
 # Target Original Xbox Pentium III (Coppermine-128: i686 + MMX + SSE1, 16KB L1 + 128KB L2).
 XBOX_ARCH_FLAGS := -O3 -march=pentium3 -mtune=pentium3 -mmmx -msse -mfpmath=sse -fomit-frame-pointer -Wno-parentheses-equality
 NXDK_CXXFLAGS += $(XBOX_ARCH_FLAGS) -std=c++20 -DGAME_ddonpach=1 -DHEADLESS_BUILD=1 \
+  $(if $(filter 1,$(FAKE_PLAY)),-DXBOX_FAKE_PLAY=1,) \
   -I$(ENGINE_ROOT) -I$(ENGINE_ROOT)/machine -I$(ENGINE_ROOT)/runtime -I$(GEN_DIR)
 
-$(CURDIR)/main.obj: $(CURDIR)/nv2a_cave_renderer.h $(CURDIR)/nv2a_presenter.h $(CURDIR)/xbox_audio.h $(CURDIR)/xbox_input.h $(CURDIR)/xbox_timer.h $(CURDIR)/xbox_asm.h
+$(CURDIR)/main.obj: $(CURDIR)/nv2a_cave_renderer.h $(CURDIR)/nv2a_presenter.h $(CURDIR)/xbox_audio.h $(CURDIR)/xbox_input.h $(CURDIR)/xbox_timer.h $(CURDIR)/xbox_asm.h $(CURDIR)/xbox_profiler.h $(CURDIR)/ddp_fake_play.h
 main.exe: $(ALL_ENGINE_OBJS)
 
 $(ENGINE_OBJ_DIR)/%.obj: $(ENGINE_ROOT)/%.cpp

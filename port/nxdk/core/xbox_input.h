@@ -23,6 +23,7 @@ struct PadState {
     bool white = false; // LB
     bool black = false; // RB
     bool l3 = false;
+    bool r3 = false;
 };
 
 class XboxInput {
@@ -70,6 +71,7 @@ public:
         constexpr uint16_t kStart = 0x0010;
         constexpr uint16_t kBack = 0x0020;
         constexpr uint16_t kL3 = 0x0040;
+        constexpr uint16_t kR3 = 0x0080;
         constexpr uint8_t kAnalogThreshold = 0x20;
         constexpr int16_t kStickDeadzone = 8000;
 
@@ -80,6 +82,7 @@ public:
         out.start = (pkt.dButtons & kStart) != 0;
         out.back = (pkt.dButtons & kBack) != 0;
         out.l3 = (pkt.dButtons & kL3) != 0;
+        out.r3 = (pkt.dButtons & kR3) != 0;
         out.a = pkt.a > kAnalogThreshold;
         out.b = pkt.b > kAnalogThreshold;
         out.x = pkt.x > kAnalogThreshold;

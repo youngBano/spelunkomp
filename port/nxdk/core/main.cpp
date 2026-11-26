@@ -1,10 +1,12 @@
 // Native Original Xbox runner for the statically-recompiled Cave 68000 core:
 // zero SDL2, zero CPU software rasterizer (direct NV2A primitives), native XAudio,
 // native USB XID gamepad, and native Xbox MCPX hardware timer pacing (57.44485 Hz).
+#include "ddp_fake_play.h"
 #include "machine/cave68k.h"
 #include "nv2a_cave_renderer.h"
 #include "xbox_audio.h"
 #include "xbox_input.h"
+#include "xbox_profiler.h"
 #include "xbox_timer.h"
 
 #include <hal/debug.h>
@@ -268,29 +270,26 @@ int main(void) {
     spelunk_xbox::XboxTimer timer;
     timer.Init();
 
+    spelunk_xbox::g_xboxPerf.Reset();
+
+    spelunk_xbox::DdpFakePlay fakePlay;
+    fakePlay.Reset();
+#ifdef XBOX_FAKE_PLAY
+    fakePlay.enabled = true;
+    fakePlay.stageHopFrames = 600; // Cycle through all 6 stages every ~10s for whole-game stress testing.
+#endif
+
     bool tateMode = false;
     bool bilinear = false;
     bool integerScale = false;
     bool prevRb = false;
     bool prevLb = false;
     bool prevL3 = false;
+    bool prevR3 = false;
 
     while (true) {
         spelunk_xbox::PadState pad{};
         input.Poll(pad);
-
-        uint32_t p1 = 0;
-        uint32_t sys = 0;
-        if (pad.up) p1 |= spelunk::kInUp;
-        if (pad.down) p1 |= spelunk::kInDown;
-        if (pad.left) p1 |= spelunk::kInLeft;
-        if (pad.right) p1 |= spelunk::kInRight;
-        if (pad.a) p1 |= spelunk::kInButton1;
-        if (pad.b) p1 |= spelunk::kInButton2;
-        if (pad.x) p1 |= spelunk::kInButton3;
-        if (pad.y) p1 |= spelunk::kInButton4;
-        if (pad.back) sys |= spelunk::kSysCoin1;
-        if (pad.start) sys |= spelunk::kSysStart1;
 
         if (pad.black && !prevRb) {
             tateMode = !tateMode;
@@ -304,6 +303,28 @@ int main(void) {
             integerScale = !integerScale;
         }
         prevL3 = pad.l3;
+        if (pad.r3 && !prevR3) {
+            fakePlay.enabled = !fakePlay.enabled;
+            fakePlay.Reset();
+        }
+        prevR3 = pad.r3;
+
+        uint32_t p1 = 0;
+        uint32_t sys = 0;
+        if (fakePlay.enabled) {
+            fakePlay.Update(board, p1, sys);
+        } else {
+            if (pad.up) p1 |= spelunk::kInUp;
+            if (pad.down) p1 |= spelunk::kInDown;
+            if (pad.left) p1 |= spelunk::kInLeft;
+            if (pad.right) p1 |= spelunk::kInRight;
+            if (pad.a) p1 |= spelunk::kInButton1;
+            if (pad.b) p1 |= spelunk::kInButton2;
+            if (pad.x) p1 |= spelunk::kInButton3;
+            if (pad.y) p1 |= spelunk::kInButton4;
+            if (pad.back) sys |= spelunk::kSysCoin1;
+            if (pad.start) sys |= spelunk::kSysStart1;
+        }
 
         board.inputs[0] = p1;
         board.system = sys;
@@ -312,22 +333,47 @@ int main(void) {
         pb_reset();
         pb_target_back_buffer();
 
-        // Pace Cave 68000 execution to exact 57.44485 Hz arcade timing via Xbox MCPX hardware timer.
+        // Pace Cave 68000 execution to exact 57.44485 Hz arcade timing via Xbox MCPX hardware timer
+        // and profile per-stage CPU vs NV2A timing lag against Cave's 17,408 us budget.
+        uint64_t cpuTicks = 0;
+        bool stepped = false;
+        uint32_t prevPictures = board.pictures;
         if (timer.ConsumeArcadeFrame()) {
+            const uint64_t tCpu0 = spelunk_xbox::XboxTimer::NowTicks();
             board.RunFrame();
             auto &pcm = board.SoundOut();
             if (!pcm.empty()) {
                 audio.PushMono44k(pcm.data(), pcm.size());
                 pcm.clear();
             }
+            cpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tCpu0;
+            stepped = true;
             static uint32_t frameNum = 0;
             ++frameNum;
         }
 
+        const uint64_t tRen0 = spelunk_xbox::XboxTimer::NowTicks();
         renderer.Render(board.video, nativeFrame, tateMode, bilinear, integerScale);
+        const uint64_t renTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
+
+        const uint64_t tGpu0 = spelunk_xbox::XboxTimer::NowTicks();
         while (pb_busy()) {
         }
         while (pb_finished()) {
+        }
+        const uint64_t gpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tGpu0;
+
+        if (stepped) {
+            spelunk_xbox::g_xboxPerf.RecordFrame(
+                static_cast<uint32_t>(timer.TicksToMicros(cpuTicks)),
+                static_cast<uint32_t>(timer.TicksToMicros(renTicks)),
+                static_cast<uint32_t>(timer.TicksToMicros(gpuTicks)),
+                spelunk_xbox::DdpFakePlay::Mode(board),
+                spelunk_xbox::DdpFakePlay::Stage(board),
+                spelunk_xbox::DdpFakePlay::Loop(board),
+                static_cast<uint32_t>(nativeFrame.sprites.size()),
+                static_cast<uint32_t>(renderer.LastQuadCount()),
+                board.pictures != prevPictures);
         }
     }
 
