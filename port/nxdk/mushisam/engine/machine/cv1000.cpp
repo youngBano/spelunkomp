@@ -62,9 +62,11 @@ void Cv1000::RunFrame() {
     const uint64_t subTsc = profBlitterTsc + profAudioTsc;
     profSh3Tsc = (cpuTotal > subTsc) ? (cpuTotal - subTsc) : 0;
 #ifndef XBOX_AUDIO_OFF
-    const uint64_t tAud0 = ReadTsc();
-    sound.RunTo(cpu.cycles, kCpuHz);
-    profAudioTsc += ReadTsc() - tAud0;
+    if (!onSoundWrite) {
+        const uint64_t tAud0 = ReadTsc();
+        sound.RunTo(cpu.cycles, kCpuHz);
+        profAudioTsc += ReadTsc() - tAud0;
+    }
 #endif
     frame++;
 #ifdef SPELUNK_SHADOW_TIMING
@@ -194,7 +196,9 @@ void Cv1000::Write(uint32 address, uint32 value, unsigned size) {
         if ((address & 1) == 0) {
             m_soundRegister = static_cast<uint8_t>(value);
         } else {
-            if (!sound.held) {
+            if (onSoundWrite) {
+                onSoundWrite(onSoundWriteContext, m_soundRegister, static_cast<uint8_t>(value));
+            } else if (!sound.held) {
 #ifndef XBOX_AUDIO_OFF
                 const uint64_t tAud0 = ReadTsc();
                 sound.RunTo(cpu.cycles, kCpuHz);

@@ -53,6 +53,9 @@ public:
     // game gets is as new as it can be)
     void (*onInputRead)(void *context) = nullptr;
     void *onInputReadContext = nullptr;
+    // Optional asynchronous sound register sink (when set, bypasses synchronous Ymz770::RunTo on main thread).
+    void (*onSoundWrite)(void *context, uint8_t reg, uint8_t value) = nullptr;
+    void *onSoundWriteContext = nullptr;
 
     // One frame of the board's time (262 lines of 407 pixels at 6.4 MHz: 60.0184 Hz), from one vertical sync, with
     // its interrupt, to the next

@@ -62,6 +62,23 @@ void Ymz770::RunTo(uint64_t cycles, uint64_t cpuHz) {
     }
 }
 
+uint32_t Ymz770::GenerateSamples(int16_t *dst, uint32_t count) {
+    if (!rom || held || !dst || count == 0) {
+        if (dst && count > 0) {
+            std::fill_n(dst, count, static_cast<int16_t>(0));
+        }
+        return count;
+    }
+    const uint32_t startRate = sampleRate;
+    for (uint32_t i = 0; i < count; ++i) {
+        dst[i] = Sample();
+    }
+    if (sampleRate != startRate) {
+        rateChanged = true;
+    }
+    return count;
+}
+
 // The sequences: a register and a value at a time from the ROM; 0x0E waits (the sequence's timer, in 32 samples),
 // 0x0F ends or loops
 void Ymz770::RunSequencer() {

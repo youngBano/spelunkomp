@@ -116,7 +116,11 @@ int main(void) {
 
     auto audioPtr = std::make_unique<spelunk_xbox::XboxAudio>();
     auto &audio = *audioPtr;
-    audio.Init(board.sound.sampleRate);
+    if (audio.Init(board.sound.sampleRate)) {
+        board.onSoundWrite = &spelunk_xbox::XboxAudio::SoundWriteCallback;
+        board.onSoundWriteContext = &audio;
+        audio.StartAsync(&board.sound);
+    }
 
     auto rendererPtr = std::make_unique<spelunk_xbox::Nv2aCv1kRenderer>();
     auto &renderer = *rendererPtr;
@@ -213,21 +217,11 @@ int main(void) {
             if ((board.frame & 127u) == 0u) {
                 eeprom.FlushIfDirty(board.rtc);
             }
-            if (board.sound.rateChanged) {
-                audio.SetSampleRate(board.sound.sampleRate);
-                board.sound.rateChanged = false;
-            }
-            if (!board.sound.out.empty()) {
-                audio.PushMono(board.sound.out.data(), board.sound.out.size());
-                board.sound.out.clear();
-            }
-            audio.Pump();
             cpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tCpu0;
             stepped = true;
             (void)pmc0_b;
             (void)pmc1_b;
         }
-        audio.Pump();
 
         if (stepped || displayChanged) {
             const uint64_t tGpu0 = spelunk_xbox::XboxTimer::NowTicks();
@@ -243,7 +237,6 @@ int main(void) {
             while (pb_finished()) {
             }
             const uint64_t renTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
-            audio.Pump();
 
             if (stepped) {
                 spelunk_xbox::g_xboxPerf.RecordFrame(

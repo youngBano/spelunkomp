@@ -38,7 +38,7 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 768; // 768 * 32 KB = 24 MB hot RAM pool (eliminates Stage 1 disk swaps)
+    static constexpr int kRetailMaxAllocPages = 768; // 768 * 32 KB = 24 MB hot RAM pool (3.1 MB free on 64 MB Xbox)
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
     // 1024x(1024+4) A1R5G5B5 NV2A shelf atlas (2 MB + 8 KB) + 8,192-slot Mix64 hash table:
@@ -98,6 +98,7 @@ public:
         pageTable_.assign(kTotalLogicalPages, -1);
         pagePtrs_.assign(kTotalLogicalPages, nullptr);
         pageOnDisk_.assign(kTotalLogicalPages, 0);
+        std::memset(pageGen_, 0, sizeof(pageGen_));
         pageLru_.reserve(maxAllocPages_);
         pageOwner_.reserve(maxAllocPages_);
         pageDirty_.reserve(maxAllocPages_);
@@ -181,7 +182,7 @@ public:
         vbPhase_ ^= 1u;
         vbCur_ = vbAlloc_ + (vbPhase_ ? kMaxVertsPerFrame : 0u);
         vbCount_ = 0;
-        if (shelfY_ > (kAtlasH * 3) / 4) {
+        if (shelfY_ > (kAtlasH / 2)) {
             shelfX_ = 0;
             shelfY_ = 0;
             shelfRowH_ = 0;
@@ -202,12 +203,11 @@ public:
         curBilinear_ = bilinear;
 
         // 2. Process all blitter steps in exact game order:
-        //    - Uploads & off-screen VRAM composite draws update sparse VRAM pages and invalidate ONLY the hash epoch
-        //      (NEVER resetting shelfX_/shelfY_ mid-frame on top of already-emitted quads!).
+        //    - Uploads & off-screen VRAM composite draws update sparse VRAM pages and bump per-page pageGen_[]
+        //      (NEVER wiping unrelated cached sprites from the 8,192-slot atlas hash table!).
         for (const auto &step : list.steps) {
             if (step.upload) {
                 ApplyUpload(list.uploads[step.first], list.pixels);
-                InvalidateRectHash();
             } else {
                 for (uint32_t i = 0; i < step.count; ++i) {
                     ProcessDraw(list.draws[step.first + i], scrX, scrY, dispX, dispY, bilinear);
@@ -257,7 +257,7 @@ private:
         uint16_t u0 = 0;
         uint16_t v0 = 0;
         uint16_t epoch = 0;
-        uint16_t isTile = 0;
+        uint16_t pageGen = 0;
     };
 
     static constexpr uint32_t kFloatZeroBits = 0x00000000u;
@@ -525,11 +525,7 @@ private:
                 col += span;
             }
         }
-        if ((d.x0 & (kVramW - 1)) >= 7456) {
-            InvalidateTileHash();
-        } else {
-            InvalidateRectHash();
-        }
+        // Per-page generation counter invalidated only on pages actually written by GetPageWrite().
     }
 
     void OpenSwapFile() {
@@ -628,6 +624,7 @@ private:
 
     uint16_t *GetPageWrite(int px, int py) {
         const int logical = py * kPagesX + px;
+        ++pageGen_[logical];
         const int phys = pageTable_[logical];
         if (phys >= 0) {
             pageLru_[phys] = ++lruClock_;
@@ -635,6 +632,29 @@ private:
             return pagePtrs_[logical];
         }
         return AllocateOrEvictPage(logical, true);
+    }
+
+    inline uint16_t PageGenForRect(int x0, int y0, int w, int h) const {
+        const int vx0 = x0 & (kVramW - 1);
+        const int vy0 = y0 & (kVramH - 1);
+        const int lx = vx0 & kPageMask;
+        const int ly = vy0 & kPageMask;
+        if (lx + w <= kPageSize && ly + h <= kPageSize) [[likely]] {
+            return pageGen_[(vy0 >> kPageShift) * kPagesX + (vx0 >> kPageShift)];
+        }
+        const int px0 = vx0 >> kPageShift;
+        const int py0 = vy0 >> kPageShift;
+        const int px1 = ((vx0 + w - 1) & (kVramW - 1)) >> kPageShift;
+        const int py1 = ((vy0 + h - 1) & (kVramH - 1)) >> kPageShift;
+        uint32_t g = 0x9E37u;
+        for (int py = py0;; py = (py + 1) & (kPagesY - 1)) {
+            for (int px = px0;; px = (px + 1) & (kPagesX - 1)) {
+                g = (g * 33u) ^ pageGen_[py * kPagesX + px];
+                if (px == px1) break;
+            }
+            if (py == py1) break;
+        }
+        return static_cast<uint16_t>(g);
     }
 
     inline const uint16_t *GetPageRead(int px, int py) {
@@ -724,12 +744,11 @@ private:
         const int dx1 = dx0 + w;
         const int dy1 = dy0 + h;
         if (dx1 <= 0 || dx0 >= kSrcWidth || dy1 <= 0 || dy0 >= kSrcHeight) {
-            // If this draw targets an off-screen VRAM cache (outside both +/-32px screen margins, e.g. x=7456..8191
-            // background tilemap ring buffer), composite it into sparse VRAM pages so later screen draws see fresh tiles!
-            const bool nearActive = !(dx1 <= -32 || dx0 >= kSrcWidth + 32 || dy1 <= -32 || dy0 >= kSrcHeight + 32);
-            const int sdx0 = d.x0 - dispX, sdy0 = d.y0 - dispY;
-            const bool nearDisplay = !(sdx0 + w <= -32 || sdx0 >= kSrcWidth + 32 || sdy0 + h <= -32 || sdy0 >= kSrcHeight + 32);
-            if (!nearActive && !nearDisplay) {
+            // Only software-composite draws targeting genuine off-screen VRAM caches (e.g. x=7456..8191 tilemap
+            // ring buffer). Never software-blit clipped screen sprites/bullets in the (0..1023, 0..511) display area!
+            const int ux = d.x0 & (kVramW - 1);
+            const int uy = d.y0 & (kVramH - 1);
+            if (ux >= 1024 || uy >= 512) {
                 const uint64_t tB0 = ReadRdtsc();
                 BlitVramToVram(d);
                 lastBlitVramTsc_ += ReadRdtsc() - tB0;
@@ -751,21 +770,19 @@ private:
                              (static_cast<uint64_t>(h & 0xFFFu) << 28) |
                              (static_cast<uint64_t>(srcX0 & 0x1FFFu) << 13) |
                              static_cast<uint64_t>(srcY0 & 0x0FFFu);
-        const uint16_t isTile = ((srcX0 & (kVramW - 1)) >= 7456) ? 1u : 0u;
-        const uint16_t wantEpoch = isTile ? tileEpoch_ : rectEpoch_;
+        const uint16_t rectPageGen = PageGenForRect(srcX0, srcY0, w, h);
         const uint32_t hBase = Mix64(key) & kRectHashMask;
         RectHashSlot *slot = nullptr;
         bool hit = false;
         for (uint32_t pr = 0; pr < 128; ++pr) {
             RectHashSlot &cand = rectHash_[(hBase + pr) & kRectHashMask];
-            const uint16_t candWant = cand.isTile ? tileEpoch_ : rectEpoch_;
-            if (cand.epoch != candWant) {
+            if (cand.epoch != rectEpoch_) {
                 slot = &cand;
                 break;
             }
-            if (cand.key == key && cand.isTile == isTile) {
+            if (cand.key == key) {
                 slot = &cand;
-                hit = true;
+                hit = (cand.pageGen == rectPageGen);
                 break;
             }
         }
@@ -813,8 +830,8 @@ private:
             slot->key = key;
             slot->u0 = static_cast<uint16_t>(dstX);
             slot->v0 = static_cast<uint16_t>(dstY);
-            slot->isTile = isTile;
-            slot->epoch = isTile ? tileEpoch_ : rectEpoch_;
+            slot->pageGen = rectPageGen;
+            slot->epoch = rectEpoch_;
         }
 
         // Compute tint & blend state for NV2A Stage-0 SHIFTLEFTBY1 (2x overdrive) Register Combiner:
@@ -1144,6 +1161,7 @@ private:
     std::vector<uint16_t> vramBlitScratch_;
     uint16_t rectEpoch_ = 1;
     uint16_t tileEpoch_ = 1;
+    uint16_t pageGen_[kTotalLogicalPages] = {};
     int shelfX_ = 0, shelfY_ = 0, shelfRowH_ = 0;
     int maxAllocPages_ = kRetailMaxAllocPages;
     uint32_t swapCount_ = 0;

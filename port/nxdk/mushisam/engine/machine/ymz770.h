@@ -36,6 +36,8 @@ public:
     void WriteRegister(uint8_t reg, uint8_t value);
     // Makes samples up to `time` (in CPU cycles of `cpuHz`), into `out` (16-bit, one channel, at `sampleRate`)
     void RunTo(uint64_t cycles, uint64_t cpuHz);
+    // Direct zero-allocation sample generator for real-time asynchronous audio thread.
+    uint32_t GenerateSamples(int16_t *dst, uint32_t count);
     // Run-ahead: while set, the chip stands still (no samples, writes dropped): the frames run ahead are run again
     // for real, and heard then
     bool held = false;
