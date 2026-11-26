@@ -1,4 +1,4 @@
-# Executables / build output
+# Executables, link maps, & build output
 *.exe
 *.xbe
 *.iso
@@ -10,21 +10,40 @@
 *.lib
 *.a
 *.elf
+*.map
+*.pdb
+*.ilk
+*.log
+*.swp
+*.state
 bin/
 build/
-# ROMs, BIOS, disc/HDD images (copyrighted)
+build-*/
+__pycache__/
+
+# ROMs, BIOS, disc/HDD images, and derived game assets (copyrighted — never committed)
 *.zip
 *.7z
 *.rar
 *.rom
 *.bin
+*.pak
 *.chd
 *.img
 *.qcow2
+*.u[0-9]*
+mushisam_u*
+u23
+u24
+pak_s*.bin
+sound_rom.bin
+mcpx*.bin
+*bios*.bin
+ddonpach*
 roms/
 bios/
-mcpx*.bin
-ddonpach*
+
+# Toolchains & generated AOT code derived from player ROMs
 /nxdk/
 port/nxdk/core/gen/
 port/nxdk/core/obj/
@@ -32,6 +51,3 @@ port/nxdk/mushisam/gen/
 port/nxdk/mushisam/obj/
 port/nxdk/mushisam/work/
 port/nxdk/mushisam/tests/obj/
-*.map
-*.log
-__pycache__/
