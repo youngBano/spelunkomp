@@ -7,28 +7,84 @@
 #include <pbkit/pbkit.h>
 #include <SDL.h>
 #include <windows.h>
+#include <xboxkrnl/xboxkrnl.h>
 
 #include <cstdio>
+#include <cstdarg>
 #include <vector>
 
 namespace {
 
-bool ReadFileBytes(const char *path, std::vector<uint8_t> &out) {
+std::vector<uint8_t> ReadFileBytes(const char *path) {
     FILE *f = std::fopen(path, "rb");
     if (!f) {
-        return false;
+        return {};
     }
     std::fseek(f, 0, SEEK_END);
     const long sz = std::ftell(f);
     std::fseek(f, 0, SEEK_SET);
     if (sz <= 0) {
         std::fclose(f);
-        return false;
+        return {};
     }
-    out.resize(static_cast<size_t>(sz));
+    std::vector<uint8_t> out(static_cast<size_t>(sz));
     const size_t n = std::fread(out.data(), 1, out.size(), f);
     std::fclose(f);
-    return n == out.size();
+    out.resize(n);
+    return out;
+}
+
+inline uint8_t InB(uint16_t port) {
+    uint8_t val;
+    __asm__ volatile("inb %1, %0" : "=a"(val) : "Nd"(port));
+    return val;
+}
+
+inline void OutB(uint16_t port, uint8_t val) {
+    __asm__ volatile("outb %0, %1" : : "a"(val), "Nd"(port));
+}
+
+inline void SerialWriteByte(uint8_t val) {
+    for (int spin = 0; spin < 10000; ++spin) {
+        if ((InB(0x3F8 + 5) & 0x20) != 0) {
+            break;
+        }
+    }
+    OutB(0x3F8, val);
+}
+
+void SerialPrintf(const char* fmt, ...) {
+    static bool uartInit = false;
+    if (!uartInit) {
+        uartInit = true;
+        // Enable COM1 (0x3F8) in LPC47M157 SuperIO
+        OutB(0x2E, 0x55);
+        OutB(0x2E, 0x07); OutB(0x2F, 0x04); // LDN 4: Serial Port 1
+        OutB(0x2E, 0x60); OutB(0x2F, 0x03); // Base high 0x03
+        OutB(0x2E, 0x61); OutB(0x2F, 0xF8); // Base low 0xF8
+        OutB(0x2E, 0x70); OutB(0x2F, 0x04); // IRQ 4
+        OutB(0x2E, 0x30); OutB(0x2F, 0x01); // Activate
+        OutB(0x2E, 0xAA);
+        OutB(0x3F8 + 1, 0x00);
+        OutB(0x3F8 + 3, 0x80);
+        OutB(0x3F8 + 0, 0x01);
+        OutB(0x3F8 + 1, 0x00);
+        OutB(0x3F8 + 3, 0x03);
+        OutB(0x3F8 + 2, 0xC7);
+        OutB(0x3F8 + 4, 0x0B);
+    }
+    char buf[512];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    DbgPrint("%s", buf);
+    for (const char* p = buf; *p; ++p) {
+        if (*p == '\n') {
+            SerialWriteByte('\r');
+        }
+        SerialWriteByte(static_cast<uint8_t>(*p));
+    }
 }
 
 void SwapWords(uint8_t *data, size_t size) {
@@ -39,15 +95,11 @@ void SwapWords(uint8_t *data, size_t size) {
     }
 }
 
-bool LoadDdonpachRoms(spelunk::Cave68k &board, const char *dir) {
-    auto path = [&](const char *name) {
-        return std::string(dir) + "\\" + name;
-    };
-
-    std::vector<uint8_t> even, odd;
-    if (!ReadFileBytes(path("b1.u27").c_str(), even) ||
-        !ReadFileBytes(path("b2.u26").c_str(), odd) ||
-        even.size() != odd.size()) {
+bool LoadDdonpachRoms(spelunk::Cave68k &board) {
+    const auto even = ReadFileBytes("D:\\ddonpach\\b1.u27");
+    const auto odd = ReadFileBytes("D:\\ddonpach\\b2.u26");
+    if (even.empty() || even.size() != odd.size()) {
+        SerialPrintf("LoadDdonpachRoms: failed b1.u27 (%zu) / b2.u26 (%zu)\n", even.size(), odd.size());
         return false;
     }
     board.program.resize(even.size() * 2);
@@ -56,10 +108,17 @@ bool LoadDdonpachRoms(spelunk::Cave68k &board, const char *dir) {
         board.program[i * 2 + 1] = odd[i];
     }
 
+    const char *spNames[] = {
+        "D:\\ddonpach\\u50.bin",
+        "D:\\ddonpach\\u51.bin",
+        "D:\\ddonpach\\u52.bin",
+        "D:\\ddonpach\\u53.bin",
+    };
     std::vector<uint8_t> packed;
-    for (const char *sp : {"u50.bin", "u51.bin", "u52.bin", "u53.bin"}) {
-        std::vector<uint8_t> part;
-        if (!ReadFileBytes(path(sp).c_str(), part)) {
+    for (const char *name : spNames) {
+        auto part = ReadFileBytes(name);
+        if (part.empty()) {
+            SerialPrintf("LoadDdonpachRoms: failed %s\n", name);
             return false;
         }
         packed.insert(packed.end(), part.begin(), part.end());
@@ -75,25 +134,31 @@ bool LoadDdonpachRoms(spelunk::Cave68k &board, const char *dir) {
         board.video.spritePixels[i * 2 + 1] = packed[i] & 15;
     }
 
+    const char *layerNames[] = {
+        "D:\\ddonpach\\u60.bin",
+        "D:\\ddonpach\\u61.bin",
+        "D:\\ddonpach\\u62.bin",
+    };
     board.video.layers = 3;
     for (int n = 0; n < 3; ++n) {
-        const char *lfile = (n == 0) ? "u60.bin" : (n == 1) ? "u61.bin" : "u62.bin";
-        if (!ReadFileBytes(path(lfile).c_str(), packed)) {
+        const auto layer = ReadFileBytes(layerNames[n]);
+        if (layer.empty()) {
+            SerialPrintf("LoadDdonpachRoms: failed %s\n", layerNames[n]);
             return false;
         }
         auto &kind = board.video.kinds[n];
         if (n == 2) {
-            kind.pixels.resize(packed.size());
-            for (size_t at = 0; at + 1 < packed.size(); at += 2) {
-                kind.pixels[at] = static_cast<uint8_t>((packed[at + 1] & 0xF0) | (packed[at] >> 4));
-                kind.pixels[at + 1] = static_cast<uint8_t>(((packed[at + 1] & 15) << 4) | (packed[at] & 15));
+            kind.pixels.resize(layer.size());
+            for (size_t at = 0; at + 1 < layer.size(); at += 2) {
+                kind.pixels[at] = static_cast<uint8_t>((layer[at + 1] & 0xF0) | (layer[at] >> 4));
+                kind.pixels[at + 1] = static_cast<uint8_t>(((layer[at + 1] & 15) << 4) | (layer[at] & 15));
             }
             kind.only8 = true;
         } else {
-            kind.pixels.resize(packed.size() * 2);
-            for (size_t at = 0; at < packed.size(); ++at) {
-                kind.pixels[at * 2] = packed[at] >> 4;
-                kind.pixels[at * 2 + 1] = packed[at] & 15;
+            kind.pixels.resize(layer.size() * 2);
+            for (size_t at = 0; at < layer.size(); ++at) {
+                kind.pixels[at * 2] = layer[at] >> 4;
+                kind.pixels[at * 2 + 1] = layer[at] & 15;
             }
             kind.only8 = false;
         }
@@ -103,16 +168,21 @@ bool LoadDdonpachRoms(spelunk::Cave68k &board, const char *dir) {
     }
 
     board.soundRom.clear();
-    for (const char *sf : {"u6.bin", "u7.bin"}) {
-        std::vector<uint8_t> part;
-        if (!ReadFileBytes(path(sf).c_str(), part)) {
+    const char *soundNames[] = {
+        "D:\\ddonpach\\u6.bin",
+        "D:\\ddonpach\\u7.bin",
+    };
+    for (const char *name : soundNames) {
+        auto part = ReadFileBytes(name);
+        if (part.empty()) {
+            SerialPrintf("LoadDdonpachRoms: failed %s\n", name);
             return false;
         }
         board.soundRom.insert(board.soundRom.end(), part.begin(), part.end());
     }
 
-    std::vector<uint8_t> eep;
-    if (ReadFileBytes(path("eeprom-ddonpach.bin").c_str(), eep) && eep.size() == 128) {
+    const auto eep = ReadFileBytes("D:\\ddonpach\\eeprom-ddonpach.bin");
+    if (eep.size() == 128) {
         for (int i = 0; i < 64; ++i) {
             board.eeprom.words[i] = static_cast<uint16_t>((eep[i * 2] << 8) | eep[i * 2 + 1]);
         }
@@ -123,16 +193,21 @@ bool LoadDdonpachRoms(spelunk::Cave68k &board, const char *dir) {
 } // namespace
 
 int main(void) {
+    SerialPrintf("Cave 68000 core: main() entered\n");
     XVideoSetMode(640, 480, 32, REFRESH_DEFAULT);
 
     spelunk::Cave68k board;
-    if (!board.SetBoard("ddonpach")) {
-        debugPrint("Cave 68000 core: board setup failed\n");
-        return 1;
+    if (!LoadDdonpachRoms(board)) {
+        debugPrint("Cave 68000 core: ROM load failed\n");
+        while (true) {
+            Sleep(1000);
+        }
     }
 
-    if (!LoadDdonpachRoms(board, "D:\\ddonpach")) {
-        debugPrint("Cave 68000 core: ROM load failed\n");
+    // SetBoard() maps m_parts[0..N] from board.program.size(), so it MUST run after LoadDdonpachRoms().
+    if (!board.SetBoard("ddonpach")) {
+        debugPrint("Cave 68000 core: board setup failed\n");
+        SerialPrintf("Cave 68000 core: board setup failed\n");
         while (true) {
             Sleep(1000);
         }
@@ -141,7 +216,19 @@ int main(void) {
     debugPrint("Cave 68000 core: ROMs loaded (prog=%uKB sprites=%uKB)\n",
                static_cast<unsigned>(board.program.size() / 1024),
                static_cast<unsigned>(board.video.spritePixels.size() / 1024));
+    SerialPrintf("Cave 68000 core: ROMs loaded (prog=%uKB sprites=%uKB)\n",
+             static_cast<unsigned>(board.program.size() / 1024),
+             static_cast<unsigned>(board.video.spritePixels.size() / 1024));
     board.Reset();
+
+    // Fast-forward initial black/POST frames so video appears immediately on boot.
+    board.noPicture = true;
+    for (int bootFrame = 0; bootFrame < 300; ++bootFrame) {
+        board.RunFrame();
+        board.SoundOut().clear();
+    }
+    board.noPicture = false;
+    board.Redraw();
 
     if (pb_init() != 0) {
         debugPrint("Cave 68000 core: pb_init failed\n");
@@ -253,6 +340,40 @@ int main(void) {
         }
         pcm.clear();
         board.Picture(presenter.TexBuffer());
+        static uint32_t frameNum = 0;
+        ++frameNum;
+        if (frameNum == 1 || frameNum == 10 || (frameNum % 60) == 0) {
+            const uint32_t *fb = presenter.TexBuffer();
+            const int w = spelunk_xbox::Nv2aPresenter::kSrcWidth;
+            const int h = spelunk_xbox::Nv2aPresenter::kSrcHeight;
+            uint32_t nonBlack = 0;
+            uint32_t hash = 2166136261u;
+            for (int i = 0; i < w * h; ++i) {
+                const uint32_t px = fb[i];
+                if ((px & 0x00FFFFFFu) != 0) {
+                    ++nonBlack;
+                }
+                hash ^= px;
+                hash *= 16777619u;
+            }
+            SerialPrintf("FB frame=%u nonBlack=%u/%d hash=0x%08X\n",
+                     frameNum, nonBlack, w * h, hash);
+            static const char kRamp[] = " .:-=+*#%@";
+            for (int y = 0; y < h; y += 20) {
+                char row[33];
+                int col = 0;
+                for (int x = 0; x < w && col < 32; x += 10) {
+                    const uint32_t px = fb[y * w + x];
+                    const uint32_t r = px & 0xFFu;
+                    const uint32_t g = (px >> 8) & 0xFFu;
+                    const uint32_t b = (px >> 16) & 0xFFu;
+                    const uint32_t luma = (r * 3u + g * 6u + b) / 10u;
+                    row[col++] = kRamp[(luma * 9u) / 255u];
+                }
+                row[col] = '\0';
+                SerialPrintf("FB[%03d]: %s\n", y, row);
+            }
+        }
 
         presenter.Present(tateMode, bilinear, integerScale);
         while (pb_busy()) {
