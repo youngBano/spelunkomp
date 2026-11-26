@@ -226,6 +226,7 @@ int main(void) {
     // Run native statically-recompiled x86 Pentium III blocks with native NV2A primitive rendering
     // (disables CPU software CaveVideo::Draw() rasterizer completely).
     spelunk::NativeFrame68k nativeFrame;
+    nativeFrame.zeroCopy = true;
     board.video.rasterize = false;
     board.video.native = &nativeFrame;
     board.mode = spelunk::M68K::Mode::Native;

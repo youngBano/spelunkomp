@@ -92,7 +92,8 @@ public:
 
     void Render(const spelunk::CaveVideo &video, const spelunk::NativeFrame68k &frame,
                 bool tateMode, bool bilinear, bool integerScale) {
-        if (!atlas_ || frame.palette.size() < 0x10000) {
+        const auto &palRam = frame.zeroCopy ? video.paletteRam : frame.palette;
+        if (!atlas_ || palRam.size() < 0x10000) {
             return;
         }
 
@@ -106,8 +107,8 @@ public:
             stateInitialized_ = false;
         }
 
-        // 1. Dirty-hash & MMX-convert 15-bit Cave palette only when changed.
-        UpdatePalette(frame.palette);
+        // 1. Dirty-hash & MMX-convert 15-bit Cave palette only when changed (zero-copy directly from video.paletteRam).
+        UpdatePalette(palRam);
 
         // 2. Clear full screen black only on layout change; fill game viewport with Cave background color.
         if (clearFramesRemaining_ > 0) {
@@ -144,7 +145,8 @@ public:
         for (int n = 0; n < video.layers; ++n) {
             auto &l = layers[n];
             const uint16_t *regs = frame.layerRegs[n];
-            l.on = !(regs[2] & 0x10) && !video.kinds[n].pixels.empty() && !frame.layerRam[n].empty();
+            const auto &ram = frame.zeroCopy ? video.layerRam[n] : frame.layerRam[n];
+            l.on = !(regs[2] & 0x10) && !video.kinds[n].pixels.empty() && !ram.empty();
             if (!l.on) {
                 continue;
             }
@@ -428,7 +430,7 @@ private:
     void EmitLayerTilesSinglePass(const spelunk::CaveVideo &video, const spelunk::NativeFrame68k &frame,
                                   int layerIdx, bool big, bool flipX, bool flipY, int scrollX, int scrollY) {
         const auto &kind = video.kinds[layerIdx];
-        const auto &ram = frame.layerRam[layerIdx];
+        const auto &ram = frame.zeroCopy ? video.layerRam[layerIdx] : frame.layerRam[layerIdx];
         const size_t tileCount = kind.pixels.size() / 64;
         if (tileCount == 0) {
             return;

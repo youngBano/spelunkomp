@@ -1,4 +1,4 @@
-#include "../../../spelunkomp/machine/wide_math.h"
+#include "../core/engine/machine/wide_math.h"
 
 #include <cassert>
 #include <cstdint>
