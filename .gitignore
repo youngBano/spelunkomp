@@ -26,3 +26,5 @@ bios/
 mcpx*.bin
 ddonpach*
 /nxdk/
+port/nxdk/core/gen/
+port/nxdk/core/obj/
