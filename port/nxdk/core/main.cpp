@@ -329,7 +329,6 @@ int main(void) {
         pb_wait_for_vbl();
         pb_reset();
         pb_target_back_buffer();
-        pb_fill(0, 0, 640, 480, 0xFF000000);
 
         board.RunFrame();
         auto &pcm = board.SoundOut();
@@ -339,9 +338,18 @@ int main(void) {
             }
         }
         pcm.clear();
-        board.Picture(presenter.TexBuffer());
+
+        // Stream framebuffer into write-combined NV2A texture without polluting PIII L1/L2 cache
+        // when direct source pointer is available; otherwise copy directly into WC buffer.
+        if constexpr (requires { board.PictureData(); }) {
+            presenter.UploadFrameSSE(board.PictureData());
+        } else {
+            board.Picture(presenter.TexBuffer());
+        }
+
         static uint32_t frameNum = 0;
         ++frameNum;
+#ifdef XBOX_DEBUG_FB_DUMP
         if (frameNum == 1 || frameNum == 10 || (frameNum % 60) == 0) {
             const uint32_t *fb = presenter.TexBuffer();
             const int w = spelunk_xbox::Nv2aPresenter::kSrcWidth;
@@ -358,22 +366,8 @@ int main(void) {
             }
             SerialPrintf("FB frame=%u nonBlack=%u/%d hash=0x%08X\n",
                      frameNum, nonBlack, w * h, hash);
-            static const char kRamp[] = " .:-=+*#%@";
-            for (int y = 0; y < h; y += 20) {
-                char row[33];
-                int col = 0;
-                for (int x = 0; x < w && col < 32; x += 10) {
-                    const uint32_t px = fb[y * w + x];
-                    const uint32_t r = px & 0xFFu;
-                    const uint32_t g = (px >> 8) & 0xFFu;
-                    const uint32_t b = (px >> 16) & 0xFFu;
-                    const uint32_t luma = (r * 3u + g * 6u + b) / 10u;
-                    row[col++] = kRamp[(luma * 9u) / 255u];
-                }
-                row[col] = '\0';
-                SerialPrintf("FB[%03d]: %s\n", y, row);
-            }
         }
+#endif
 
         presenter.Present(tateMode, bilinear, integerScale);
         while (pb_busy()) {

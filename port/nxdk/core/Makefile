@@ -37,7 +37,9 @@ CORE_OBJS := $(patsubst $(CORE_ROOT)/%.cpp,$(CORE_OBJ_DIR)/%.obj,$(CORE_SRCS))
 # Keep main.obj at the path nxdk already tracks; only core objects need staging out.
 OBJS := $(CURDIR)/main.obj $(CORE_OBJS)
 DEPS := $(CURDIR)/main.cpp.d $(CORE_OBJS:.obj=.cpp.d)
-NXDK_CXXFLAGS += -O2 -std=c++20 -DGAME_ddonpach=1 -DHEADLESS_BUILD=1 -I$(CORE_ROOT) -I$(CORE_ROOT)/machine -I$(CORE_ROOT)/runtime -I$(CORE_ROOT)/third_party -I$(CORE_ROOT)/generated/ddonpach
+# Target Original Xbox Pentium III (Coppermine-128: i686 + MMX + SSE1, 16KB L1 + 128KB L2).
+XBOX_ARCH_FLAGS := -O3 -march=pentium3 -mtune=pentium3 -mmmx -msse -mfpmath=sse -fomit-frame-pointer
+NXDK_CXXFLAGS += $(XBOX_ARCH_FLAGS) -std=c++20 -DGAME_ddonpach=1 -DHEADLESS_BUILD=1 -I$(CORE_ROOT) -I$(CORE_ROOT)/machine -I$(CORE_ROOT)/runtime -I$(CORE_ROOT)/third_party -I$(CORE_ROOT)/generated/ddonpach
 $(CURDIR)/main.obj: $(CURDIR)/nv2a_presenter.h
 main.exe: $(CORE_OBJS)
 
