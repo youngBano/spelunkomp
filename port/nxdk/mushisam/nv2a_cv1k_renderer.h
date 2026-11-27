@@ -431,6 +431,18 @@ private:
         }
     }
 
+    RectHashSlot *FindFreeRectSlot(uint32_t hBase) {
+        for (uint32_t pr = 0; pr < 128; ++pr) {
+            RectHashSlot &cand = rectHash_[(hBase + pr) & kRectHashMask];
+            const uint32_t slotBank = (cand.v0 >= kBankH) ? 1u : 0u;
+            if (cand.epoch != bankEpoch_[slotBank]) {
+                return &cand;
+            }
+        }
+        InvalidateRectHash();
+        return &rectHash_[hBase];
+    }
+
     void EnsureGpuReadyForSubmit() {
         if (gpuReadyThisFrame_) {
             return;
@@ -497,6 +509,7 @@ private:
         while (pb_busy()) {
         }
         lastGpuWaitTsc_ += ReadRdtsc() - tFlush0;
+        pb_reset();
         batches_.clear();
         vbCount_ = 0;
         activeBank_ ^= 1u;
@@ -568,7 +581,8 @@ private:
         const int uy0 = d.y0 & (kVramH - 1);
         const int usx0 = (d.sx + d.x0) & (kVramW - 1);
         const int usy0 = (d.sy + d.y0) & (kVramH - 1);
-        const bool overlaps = (usx0 < ux0 + w && ux0 < usx0 + w && usy0 < uy0 + h && uy0 < usy0 + h);
+        const bool wraps = (ux0 + w > kVramW) || (uy0 + h > kVramH) || (usx0 + w > kVramW) || (usy0 + h > kVramH);
+        const bool overlaps = wraps || (usx0 < ux0 + w && ux0 < usx0 + w && usy0 < uy0 + h && uy0 < usy0 + h);
         if (!flipX && !flipY && !tinted && !blendOn && !overlaps) {
             int row = 0;
             while (row < h) {
@@ -1161,10 +1175,12 @@ private:
                 slot = &cand;
                 if (cand.pageGen == rectPageGen) {
                     hit = true;
-                } else if (cand.lastFrame < frameId_ &&
-                           (cand.lastFrame + 2u <= frameId_ || gpuReadyThisFrame_ || !pb_busy())) {
-                    // Same (w,h,srcX0,srcY0) updated in VRAM (e.g. scrolling BG strip) and NV2A is done
-                    // reading the prior frame: overwrite its existing atlas rect in-place (zero shelf growth!).
+                } else if (cand.lastFrame < frameId_) {
+                    // Same (w,h,srcX0,srcY0) updated in VRAM (e.g. scrolling BG strip): sync NV2A if it may
+                    // still be reading the prior frame so we always overwrite in-place (zero shelf growth!).
+                    if (cand.lastFrame + 2u > frameId_ && !gpuReadyThisFrame_ && pb_busy()) {
+                        EnsureGpuReadyForSubmit();
+                    }
                     canReuseInPlace = true;
                 }
                 break;
@@ -1197,7 +1213,7 @@ private:
             if (shelfY_ + padH > bankEndY) {
                 // Mid-frame bank overflow: flush queued quads, flip to opposite bank, and recycle ONLY that bank!
                 FlushMidFrameAndResetShelf();
-                slot = &rectHash_[hBase];
+                slot = FindFreeRectSlot(hBase);
             }
             const int dstX = shelfX_;
             const int dstY = shelfY_;

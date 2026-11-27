@@ -95,6 +95,9 @@ void Cv1000::Event() {
 // due by then has been raised already (SH3::Run raises a due event before it returns), so the list's end alone says it
 // (not state of its own)
 void Cv1000::ScheduleIrq1() {
+    m_busyPollCount = 0;
+    m_lastBusyPollPc = 0;
+    m_lastBusyPollCycle = 0;
     cpu.eventAt = cpu.timing && m_blitterDone > cpu.cycles ? m_blitterDone : ~0ull;
 }
 
