@@ -11,6 +11,7 @@
 #include "machine/blitter.h"
 #include "xbox_asm.h"
 
+#include <nxdk/mount.h>
 #include <pbkit/pbkit.h>
 #include <windows.h>
 #include <xboxkrnl/xboxkrnl.h>
@@ -37,8 +38,8 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 640; // 640 * 32 KB = 20 MB hot RAM pool + RLE16 cold RAM tier (0 HDD swaps ever!)
-    static constexpr size_t kMaxColdRamBytes = 5120u * 1024u; // 5.0 MB compressed cold tier (~20 MB uncompressed equivalent!)
+    static constexpr int kRetailMaxAllocPages = 576; // 576 * 32 KB = 18 MB hot RAM pool + RLE16 cold RAM tier (leaves ~5 MB headroom!)
+    static constexpr size_t kMaxColdRamBytes = 3584u * 1024u; // 3.5 MB compressed cold RAM (~14-18 MB raw) + lossless Z:\ spill if ever exceeded
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
     // Dual-bank 1024x(2048+4) A1R5G5B5 NV2A shelf atlas (2 x 1024x1024 = 4 MB + 8 KB) + 8,192-slot Mix64 hash table:
@@ -111,6 +112,8 @@ public:
         rectHash_.assign(kRectHashSlots, {});
         batches_.reserve(256);
         rleScratch_.reserve(kPageSize * kPageSize + 64u);
+        spillScratch_.resize(kPageSize * kPageSize, 0u);
+        swapHandle_ = INVALID_HANDLE_VALUE;
 
         clockHand_ = 0;
         frameId_ = 1;
@@ -131,6 +134,7 @@ public:
     }
 
     void Shutdown() {
+        CloseSwapFile();
         if (vbAlloc_) {
             MmFreeContiguousMemory(vbAlloc_);
             vbAlloc_ = nullptr;
@@ -153,6 +157,7 @@ public:
         pageOwner_.clear();
         pageDirty_.clear();
         rleScratch_.clear();
+        spillScratch_.clear();
         rectHash_.clear();
         batches_.clear();
         stateInitialized_ = false;
@@ -670,11 +675,120 @@ private:
         // Per-page generation counter invalidated only on pages actually written by GetPageWrite().
     }
 
+    // Lazy lossless spill file (Z:\mushivrm.bin): ONLY opened if both Hot RAM (18 MB) and
+    // Cold RLE16 RAM (3.5 MB) are completely full, so a VRAM sprite/tile page is NEVER deleted!
+    void EnsureSwapFileOpen() {
+        if (swapHandle_ != INVALID_HANDLE_VALUE) {
+            return;
+        }
+        nxMountDrive('Z', "\\Device\\Harddisk0\\Partition5");
+        swapHandle_ = CreateFileA("Z:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (swapHandle_ == INVALID_HANDLE_VALUE) {
+            nxMountDrive('E', "\\Device\\Harddisk0\\Partition1");
+            swapHandle_ = CreateFileA("E:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
+                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+    }
+
+    void CloseSwapFile() {
+        if (swapHandle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(swapHandle_);
+            swapHandle_ = INVALID_HANDLE_VALUE;
+        }
+    }
+
+    bool SpillPageToDisk(int logical, const uint16_t *src) {
+        EnsureSwapFileOpen();
+        if (swapHandle_ == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(static_cast<uint32_t>(logical)) * kPageBytes;
+        IO_STATUS_BLOCK iosb{};
+        NTSTATUS st = NtWriteFile(swapHandle_, nullptr, nullptr, nullptr, &iosb,
+                                  const_cast<uint16_t *>(src), kPageBytes, &pos);
+        if (st == STATUS_PENDING) {
+            NtWaitForSingleObject(swapHandle_, FALSE, nullptr);
+            st = iosb.Status;
+        }
+        return NT_SUCCESS(st) && iosb.Information == kPageBytes;
+    }
+
+    bool LoadPageFromDisk(int logical, uint16_t *dst) {
+        if (swapHandle_ == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+        LARGE_INTEGER pos{};
+        pos.QuadPart = static_cast<LONGLONG>(static_cast<uint32_t>(logical)) * kPageBytes;
+        IO_STATUS_BLOCK iosb{};
+        NTSTATUS st = NtReadFile(swapHandle_, nullptr, nullptr, nullptr, &iosb,
+                                 dst, kPageBytes, &pos);
+        if (st == STATUS_PENDING) {
+            NtWaitForSingleObject(swapHandle_, FALSE, nullptr);
+            st = iosb.Status;
+        }
+        return NT_SUCCESS(st) && iosb.Information == kPageBytes;
+    }
+
+    // Spill the oldest RLE16 cold page from RAM to lossless Z:\mushivrm.bin (NEVER deletes pixel data!).
+    bool DemoteOldestColdPageToDisk() {
+        int oldestLog = -1;
+        uint32_t oldestTick = UINT32_MAX;
+        for (int p = 0; p < kTotalLogicalPages; ++p) {
+            if (coldState_[p] == 1u && coldClock_[p] < oldestTick) {
+                oldestTick = coldClock_[p];
+                oldestLog = p;
+            }
+        }
+        if (oldestLog < 0) {
+            return false;
+        }
+        // Decompress oldest cold page into spillScratch_ and persist losslessly to disk.
+        DecodeRle16Buffer(coldPages_[oldestLog].data(), coldPages_[oldestLog].size(), spillScratch_.data());
+        if (!SpillPageToDisk(oldestLog, spillScratch_.data())) {
+            return false;
+        }
+        coldTotalBytes_ -= coldPages_[oldestLog].size() * sizeof(uint16_t);
+        std::vector<uint16_t>().swap(coldPages_[oldestLog]);
+        coldState_[oldestLog] = 2u; // Losslessly backed on disk
+        return true;
+    }
+
+    static void DecodeRle16Buffer(const uint16_t *src, size_t srcLen, uint16_t *dst) {
+        constexpr uint32_t kN = kPageSize * kPageSize;
+        size_t sp = 0;
+        uint32_t dp = 0;
+        while (sp < srcLen && dp < kN) {
+            const uint16_t tok = src[sp++];
+            if (tok & 0x8000u) {
+                if (sp >= srcLen) break;
+                const uint32_t run = static_cast<uint32_t>(tok & 0x7FFFu) + 1u;
+                const uint16_t val = src[sp++];
+                const uint32_t n = (dp + run <= kN) ? run : (kN - dp);
+                std::fill_n(dst + dp, n, val);
+                dp += n;
+            } else {
+                const uint32_t lit = static_cast<uint32_t>(tok) + 1u;
+                const uint32_t avail = static_cast<uint32_t>(srcLen - sp);
+                uint32_t n = lit < avail ? lit : avail;
+                if (dp + n > kN) n = kN - dp;
+                std::memcpy(dst + dp, src + sp, static_cast<size_t>(n) * sizeof(uint16_t));
+                sp += n;
+                dp += n;
+            }
+        }
+        if (dp < kN) {
+            std::memset(dst + dp, 0, static_cast<size_t>(kN - dp) * sizeof(uint16_t));
+        }
+    }
+
     // Ultra-fast lossless word-aligned RLE16 compression for cold 128x128 A1R5G5B5 VRAM pages.
-    // Replaces Z:\mushivrm.bin HDD swapping completely (0 disk I/O ever, ~25 us L2 decompress vs 10+ ms HDD!).
+    // Keeps cold pages in RAM (~25 us L2 decompress, 0 disk I/O), with 100% lossless Z:\ spill
+    // only if Cold RAM hits cap or physical RAM drops below 1.5 MB (NEVER drops sprites/tiles!).
     void StoreColdPageRle16(int logical, const uint16_t *src) {
         constexpr uint32_t kN = kPageSize * kPageSize; // 16384
-        // Remove any previous cold allocation for this logical page first.
+        // Remove any previous cold RAM allocation for this logical page first.
         if (coldState_[logical] == 1u) {
             coldTotalBytes_ -= coldPages_[logical].size() * sizeof(uint16_t);
             std::vector<uint16_t>().swap(coldPages_[logical]);
@@ -720,82 +834,50 @@ private:
             }
         }
         const size_t needBytes = rleScratch_.size() * sizeof(uint16_t);
-        // Enforce strict cold RAM cap and >= 3.0 MB physical RAM floor by dropping oldest unused cold pages.
+        // Enforce cold RAM cap & 1.5 MB physical RAM safety floor by spilling oldest cold pages to disk (lossless!).
         while (coldTotalBytes_ + needBytes > kMaxColdRamBytes) {
-            int oldestLog = -1;
-            uint32_t oldestTick = UINT32_MAX;
-            for (int p = 0; p < kTotalLogicalPages; ++p) {
-                if (coldState_[p] == 1u && coldClock_[p] < oldestTick) {
-                    oldestTick = coldClock_[p];
-                    oldestLog = p;
-                }
-            }
-            if (oldestLog < 0) break;
-            coldTotalBytes_ -= coldPages_[oldestLog].size() * sizeof(uint16_t);
-            std::vector<uint16_t>().swap(coldPages_[oldestLog]);
-            coldState_[oldestLog] = 0u;
+            if (!DemoteOldestColdPageToDisk()) break;
         }
         MM_STATISTICS mm{};
         mm.Length = sizeof(mm);
-        if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 768u) {
-            // Reclaim oldest cold pages until >= 3.5 MB physical RAM is free.
-            for (int tries = 0; tries < 16 && coldTotalBytes_ > 0; ++tries) {
-                int oldestLog = -1;
-                uint32_t oldestTick = UINT32_MAX;
-                for (int p = 0; p < kTotalLogicalPages; ++p) {
-                    if (coldState_[p] == 1u && coldClock_[p] < oldestTick) {
-                        oldestTick = coldClock_[p];
-                        oldestLog = p;
-                    }
-                }
-                if (oldestLog < 0) break;
-                coldTotalBytes_ -= coldPages_[oldestLog].size() * sizeof(uint16_t);
-                std::vector<uint16_t>().swap(coldPages_[oldestLog]);
-                coldState_[oldestLog] = 0u;
-                if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages >= 896u) break;
+        if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 384u) {
+            for (int tries = 0; tries < 8 && coldTotalBytes_ > 0; ++tries) {
+                if (!DemoteOldestColdPageToDisk()) break;
+                if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages >= 512u) break;
             }
         }
-        coldPages_[logical].assign(rleScratch_.begin(), rleScratch_.end());
-        coldState_[logical] = 1u;
-        coldClock_[logical] = ++coldTick_;
-        coldTotalBytes_ += needBytes;
+        if (coldTotalBytes_ + needBytes <= kMaxColdRamBytes &&
+            (MmQueryStatistics(&mm) != STATUS_SUCCESS || mm.AvailablePages >= 384u)) {
+            coldPages_[logical].assign(rleScratch_.begin(), rleScratch_.end());
+            coldState_[logical] = 1u;
+            coldClock_[logical] = ++coldTick_;
+            coldTotalBytes_ += needBytes;
+        } else if (SpillPageToDisk(logical, src)) {
+            coldState_[logical] = 2u;
+        } else {
+            // Last resort if both RAM low and disk unavailable: keep in RAM rather than dropping sprites!
+            coldPages_[logical].assign(rleScratch_.begin(), rleScratch_.end());
+            coldState_[logical] = 1u;
+            coldClock_[logical] = ++coldTick_;
+            coldTotalBytes_ += needBytes;
+        }
         ++swapCount_;
     }
 
     bool LoadColdPageRle16(int logical, uint16_t *dst) {
-        if (coldState_[logical] != 1u || coldPages_[logical].empty()) {
-            return false;
+        if (coldState_[logical] == 1u && !coldPages_[logical].empty()) {
+            DecodeRle16Buffer(coldPages_[logical].data(), coldPages_[logical].size(), dst);
+            coldClock_[logical] = ++coldTick_;
+            ++swapCount_;
+            return true;
         }
-        constexpr uint32_t kN = kPageSize * kPageSize;
-        const uint16_t *src = coldPages_[logical].data();
-        const size_t srcLen = coldPages_[logical].size();
-        size_t sp = 0;
-        uint32_t dp = 0;
-        while (sp < srcLen && dp < kN) {
-            const uint16_t tok = src[sp++];
-            if (tok & 0x8000u) {
-                if (sp >= srcLen) break;
-                const uint32_t run = static_cast<uint32_t>(tok & 0x7FFFu) + 1u;
-                const uint16_t val = src[sp++];
-                const uint32_t n = (dp + run <= kN) ? run : (kN - dp);
-                std::fill_n(dst + dp, n, val);
-                dp += n;
-            } else {
-                const uint32_t lit = static_cast<uint32_t>(tok) + 1u;
-                const uint32_t avail = static_cast<uint32_t>(srcLen - sp);
-                uint32_t n = lit < avail ? lit : avail;
-                if (dp + n > kN) n = kN - dp;
-                std::memcpy(dst + dp, src + sp, static_cast<size_t>(n) * sizeof(uint16_t));
-                sp += n;
-                dp += n;
+        if (coldState_[logical] == 2u) {
+            if (LoadPageFromDisk(logical, dst)) {
+                ++swapCount_;
+                return true;
             }
         }
-        if (dp < kN) {
-            std::memset(dst + dp, 0, static_cast<size_t>(kN - dp) * sizeof(uint16_t));
-        }
-        coldClock_[logical] = ++coldTick_;
-        ++swapCount_;
-        return true;
+        return false;
     }
 
     // Two-tier 100%-RAM VRAM pool: 22 MB hot uncompressed + 5.5 MB RLE16 cold compressed
@@ -898,7 +980,7 @@ private:
             if (pageRef_[phys] < 3u) ++pageRef_[phys];
             return pagePtrs_[logical];
         }
-        if (coldState_[logical] == 1u) {
+        if (coldState_[logical] != 0u) {
             return AllocateOrEvictPage(logical, false);
         }
         return nullptr;
@@ -1403,6 +1485,8 @@ private:
     std::vector<uint32_t> coldClock_;
     std::vector<std::vector<uint16_t>> coldPages_;
     std::vector<uint16_t> rleScratch_;
+    std::vector<uint16_t> spillScratch_;
+    HANDLE swapHandle_ = INVALID_HANDLE_VALUE;
     size_t coldTotalBytes_ = 0;
     uint32_t coldTick_ = 0;
     std::vector<uint8_t> pageRef_;
