@@ -5,8 +5,8 @@
 // - Zero 64 MB software VRAM: uses a sparse on-demand 128x128 A1R5G5B5 page pool (capped at 18 MB).
 // - Native NV2A A1R5G5B5 textures (NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5): zero 16->32-bit conversion!
 // - 4-row cycling texture offset (8 KB guard) guarantees NV2A/Xemu texture cache freshness every frame.
-// - Decoupled 2,048-slot Mix64 hash table + shelf atlas (2 MB) for O(1) sprite/rect dedup per frame.
-// - Bit-exact screen-space quad coordinates (kComposite = Identity, 0.001 texel UV inset).
+// - Decoupled 8,192-slot Mix64 hash table + dual-bank shelf atlas (4 MB) for O(1) sprite/rect dedup per frame.
+// - Bit-exact screen-space quad coordinates (hardware COMPOSITE_MATRIX YOKO/TATE, sub-texel UV inset).
 // - Hardware alpha-test (A1 > 0), hardware diffuse tint modulation, and hardware alpha blending.
 #include "machine/blitter.h"
 #include "xbox_asm.h"
@@ -289,7 +289,8 @@ public:
         static_cast<Nv2aCv1kRenderer *>(ctx)->ApplyDirectUpload(dstX, dstY, w, h, ram, ramMask, pixelAddr);
     }
 
-    // Hoisted 128x128 page-strip direct upload: resolves GetPageWrite() once per tile (32x fewer lookups!).
+    // Hoisted 128x128 page-strip direct upload: resolves GetPageWrite() once per tile (32x fewer lookups!)
+    // and uses a 2-pixel (32-bit) BE->LE swap inner loop whenever the row does not wrap RAM.
     void ApplyDirectUpload(int32_t dstX, int32_t dstY, int32_t w, int32_t h,
                            const uint8_t *ram, uint32_t ramMask, uint32_t pixelAddr) {
         if (w <= 0 || h <= 0 || !ram) {
@@ -297,6 +298,7 @@ public:
         }
         ++directUploadCount_;
         const uint32_t rowBytes = static_cast<uint32_t>(w) * 2u;
+        const uint32_t ramSize = ramMask + 1u;
         int32_t row = 0;
         while (row < h) {
             const int vy = (dstY + row) & (kVramH - 1);
@@ -310,14 +312,31 @@ public:
                 const int px = vx >> kPageShift;
                 const int lx = vx & kPageMask;
                 const int colSpan = std::min<int>(w - col, kPageSize - lx);
+                const uint32_t spanBytes = static_cast<uint32_t>(colSpan) * 2u;
                 uint16_t *dstBase = GetPageWrite(px, py) + static_cast<size_t>(ly0) * kPageSize + lx;
                 uint32_t rowAddr = pixelAddr + static_cast<uint32_t>(row) * rowBytes + static_cast<uint32_t>(col) * 2u;
                 for (int r = 0; r < rowSpan; ++r, dstBase += kPageSize, rowAddr += rowBytes) {
-                    uint32_t addr = rowAddr;
-                    for (int i = 0; i < colSpan; ++i) {
-                        const uint32_t a = addr & ramMask & ~1u;
-                        addr += 2u;
-                        dstBase[i] = static_cast<uint16_t>((static_cast<uint16_t>(ram[a]) << 8) | ram[a + 1u]);
+                    const uint32_t base = rowAddr & ramMask & ~1u;
+                    if (base + spanBytes <= ramSize) [[likely]] {
+                        const uint8_t *src = ram + base;
+                        int i = 0;
+                        for (; i + 1 < colSpan; i += 2) {
+                            uint32_t v;
+                            std::memcpy(&v, src + static_cast<size_t>(i) * 2u, 4);
+                            v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+                            std::memcpy(dstBase + i, &v, 4);
+                        }
+                        if (i < colSpan) {
+                            dstBase[i] = static_cast<uint16_t>((static_cast<uint16_t>(src[static_cast<size_t>(i) * 2u]) << 8) |
+                                                               src[static_cast<size_t>(i) * 2u + 1u]);
+                        }
+                    } else {
+                        uint32_t addr = rowAddr;
+                        for (int i = 0; i < colSpan; ++i) {
+                            const uint32_t a = addr & ramMask & ~1u;
+                            addr += 2u;
+                            dstBase[i] = static_cast<uint16_t>((static_cast<uint16_t>(ram[a]) << 8) | ram[a + 1u]);
+                        }
                     }
                 }
                 col += colSpan;
@@ -906,8 +925,8 @@ private:
         return false;
     }
 
-    // Two-tier 100%-RAM VRAM pool: 22 MB hot uncompressed + 5.5 MB RLE16 cold compressed
-    // with O(1) scan-resistant 2-bit Clock eviction (0 HDD swaps ever, immune to Stage 3 cyclic scan!).
+    // Three-tier lossless VRAM pool: 18 MB hot uncompressed + 3.5 MB RLE16 cold compressed + Z:\mushivrm.bin spill
+    // with O(1) scan-resistant 2-bit Clock eviction (immune to Stage 3 cyclic scan!).
     uint16_t *AllocateOrEvictPage(int logical, bool forWrite) {
         int slot = -1;
         uint16_t *dst = nullptr;
@@ -916,7 +935,7 @@ private:
             MM_STATISTICS mm{};
             mm.Length = sizeof(mm);
             if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 1152u) {
-                // Keep >= 4.5 MB physical RAM free for 5.5 MB RLE16 cold tier (0 disk spills!) + OS headroom!
+                // Keep >= 4.5 MB physical RAM free for RLE16 cold tier + OS headroom!
                 maxAllocPages_ = static_cast<int>(pageData_.size());
                 canGrow = false;
             }
@@ -1081,6 +1100,8 @@ private:
     }
 
     void ProcessDraw(const spelunk::NativeDraw &d, int scrX, int scrY, int dispX, int dispY, bool bilinear) {
+        (void)dispX;
+        (void)dispY;
         const int w = d.x1 - d.x0 + 1;
         const int h = d.y1 - d.y0 + 1;
         if (w <= 0 || h <= 0) {
@@ -1111,6 +1132,12 @@ private:
 
         if (w > kAtlasW || h > kAtlasH) {
             return;
+        }
+
+        // Check VB capacity BEFORE rectHash_ lookup/allocation so a mid-frame flush & bank flip
+        // never invalidates the slot we are about to emit.
+        if (vbCount_ + 4u > kMaxVertsPerFrame) {
+            FlushMidFrameAndResetShelf();
         }
 
         // Collision-free 64-bit rect key: 12b w (0..4095) | 12b h (0..4095) | 13b srcX0 (0..8191) | 12b srcY0 (0..4095).
@@ -1238,10 +1265,6 @@ private:
                 case 6: dFactor = NV097_SET_BLEND_FUNC_DFACTOR_V_ONE_MINUS_DST_COLOR; break;
                 default: dFactor = NV097_SET_BLEND_FUNC_DFACTOR_V_ONE; break;
             }
-        }
-
-        if (vbCount_ + 4u > kMaxVertsPerFrame) {
-            FlushMidFrameAndResetShelf();
         }
 
         // Emit compact 16-byte integer-position quad directly into write-combined NV2A hardware vertex buffer.

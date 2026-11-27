@@ -14,6 +14,7 @@
 namespace spelunk {
 
 namespace {
+#ifndef XBOX_NO_SW_VRAM
     // Colour arithmetic on 5-bit channels, clamped: x * y / 31 (y up to 63: a tint of 32 is "unchanged"),
     // (31 - x) * y / 31, and x + y
     uint8_t g_mul[0x20][0x40], g_rev[0x20][0x40], g_add[0x20][0x20];
@@ -31,6 +32,7 @@ namespace {
         }
         return true;
     }();
+#endif
 
     // Time, as measured on the board (buffi's research). The draws are counted in VRAM clocks: 76.8 MHz (12.8 MHz x 6,
     // 13.0208 ns; MAME rounds it to 13). The screen's line fetch comes every line (63.594 us: 407 dots of 6.4 MHz,
@@ -49,6 +51,8 @@ namespace {
         int srcX, srcY, dstX, dstY, startX, startY, dimX, dimY, stepX, stepY;
         uint8_t sAlpha, dAlpha, tint[3];
     };
+
+#ifndef XBOX_NO_SW_VRAM
     using BlitFn = void (*)(const BlitArgs &);
 
     // The source's part of a blend (mode 0-7): the source times the source alpha, itself, the destination, one, and
@@ -124,6 +128,7 @@ namespace {
     }
     // (by mode * 4 + tinted * 2 + transparent)
     const std::array<BlitFn, 65 * 4> kBlits = MakeBlits(std::make_index_sequence<65 * 4>{});
+#endif // !XBOX_NO_SW_VRAM
 
     // The 32 x 32 pixel rows of VRAM a rectangle touches (each costs the blitter a fixed time).
     // Bit-exact O(1) closed form of the 32-pixel stride loop (zero branches/loops per draw!).
@@ -139,6 +144,19 @@ namespace {
         const int down = qy * (sy ? 2 : 1) + (ry ? (1 + ((sy + ry > 32) ? 1 : 0)) : 0);
         return across * down;
     }
+
+    inline void CopyBe16ToLe16(const uint8_t *src, uint16_t *dst, uint32_t count) {
+        uint32_t i = 0;
+        for (; i + 1u < count; i += 2u) {
+            uint32_t v;
+            std::memcpy(&v, src + i * 2u, 4);
+            v = ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+            std::memcpy(dst + i, &v, 4);
+        }
+        if (i < count) {
+            dst[i] = static_cast<uint16_t>((static_cast<uint16_t>(src[i * 2u]) << 8) | src[i * 2u + 1u]);
+        }
+    }
 } // namespace
 
 Blitter::Blitter()
@@ -148,8 +166,9 @@ Blitter::Blitter()
     : vram(static_cast<size_t>(kVramWidth) * kVramHeight, 0)
 #endif
 {
+#ifndef XBOX_NO_SW_VRAM
     (void)g_tables;
-#ifdef XBOX_NO_SW_VRAM
+#else
     rasterize = false;
 #endif
 }
@@ -189,7 +208,7 @@ void Blitter::Upload(uint32_t &address) {
     // (the native list takes what lies inside VRAM; a picture that runs off its right edge is cut there)
     const uint32_t nativeW = std::min(dimX, static_cast<uint32_t>(kVramWidth) - dstX);
     const uint32_t nativeH = std::min(dimY, static_cast<uint32_t>(kVramHeight) - dstY);
-    const bool useDirectUpload = (!rasterize && native && onDirectUpload && native->draws.empty() &&
+    const bool useDirectUpload = (!rasterize && native && onDirectUpload && native->steps.empty() &&
                                   nativeW == dimX && nativeH == dimY);
     size_t nativeAt = 0;
     if (useDirectUpload) {
@@ -206,11 +225,17 @@ void Blitter::Upload(uint32_t &address) {
             native->steps.push_back({true, static_cast<uint32_t>(native->uploads.size() - 1), 1});
         }
         if (!rasterize && native && nativeW == dimX && nativeH == dimY) {
-            // Fast path for native Xbox NV2A mode (zero per-pixel branches).
+            // Fast path for native Xbox NV2A mode (zero per-pixel branches, 2-pixel BE->LE swap when contiguous).
             uint16_t *dst = native->pixels.data() + nativeAt;
             const uint32_t count = dimX * dimY;
-            for (uint32_t i = 0; i < count; ++i) {
-                dst[i] = Word(address);
+            const uint32_t base = address & ramMask & ~1u;
+            if (base + count * 2u <= ramMask + 1u) [[likely]] {
+                CopyBe16ToLe16(ram + base, dst, count);
+                address += count * 2u;
+            } else {
+                for (uint32_t i = 0; i < count; ++i) {
+                    dst[i] = Word(address);
+                }
             }
         } else {
             for (uint32_t y = 0; y < dimY; y++) {
@@ -246,16 +271,35 @@ void Blitter::Upload(uint32_t &address) {
 // tint green << 8 | blue
 void Blitter::DrawOp(uint32_t &address) {
     Draw d;
-    d.attr = Word(address);
-    d.alpha = Word(address);
-    d.srcX = Word(address);
-    d.srcY = Word(address);
-    d.dstX = static_cast<int16_t>(Word(address));
-    d.dstY = static_cast<int16_t>(Word(address));
-    d.width = Word(address);
-    d.height = Word(address);
-    d.tintR = Word(address);
-    d.tintGB = Word(address);
+    const uint32_t base = address & ramMask & ~1u;
+    if (base + 20u <= ramMask + 1u) [[likely]] {
+        const uint8_t *p = ram + base;
+        auto rd16 = [p](uint32_t off) -> uint16_t {
+            return static_cast<uint16_t>((static_cast<uint16_t>(p[off]) << 8) | p[off + 1u]);
+        };
+        d.attr = rd16(0);
+        d.alpha = rd16(2);
+        d.srcX = rd16(4);
+        d.srcY = rd16(6);
+        d.dstX = static_cast<int16_t>(rd16(8));
+        d.dstY = static_cast<int16_t>(rd16(10));
+        d.width = rd16(12);
+        d.height = rd16(14);
+        d.tintR = rd16(16);
+        d.tintGB = rd16(18);
+        address += 20u;
+    } else {
+        d.attr = Word(address);
+        d.alpha = Word(address);
+        d.srcX = Word(address);
+        d.srcY = Word(address);
+        d.dstX = static_cast<int16_t>(Word(address));
+        d.dstY = static_cast<int16_t>(Word(address));
+        d.width = Word(address);
+        d.height = Word(address);
+        d.tintR = Word(address);
+        d.tintGB = Word(address);
+    }
     if (record) {
         draws.push_back(d);
     }
@@ -307,12 +351,17 @@ void Blitter::DrawOp(uint32_t &address) {
             const int dw = x1 - x0 + 1, dh = y1 - y0 + 1;
             // (clocks: the source read four pixels a clock, the destination read and written, 6 a source row, 20 + 11
             // a destination row, 12 a draw)
-            const int64_t clocks = static_cast<int64_t>(w) * h / 4 + static_cast<int64_t>(dw) * dh / 2 + srcRows * 6 + dstRows * (20 + 11) + 12;
-            m_vramClocks += static_cast<uint64_t>(std::max<int64_t>(clocks, 0));
+            const uint32_t uw = static_cast<uint32_t>(w);
+            const uint32_t uh = static_cast<uint32_t>(h);
+            const uint32_t udw = static_cast<uint32_t>(dw);
+            const uint32_t udh = static_cast<uint32_t>(dh);
+            const uint32_t clocks = ((uw * uh) >> 2) + ((udw * udh) >> 1) +
+                                    static_cast<uint32_t>(srcRows) * 6u + static_cast<uint32_t>(dstRows) * 31u + 12u;
+            m_vramClocks += clocks;
             if (keepStats) {
-                const uint64_t px = static_cast<uint64_t>(w) * h / 4 + static_cast<uint64_t>(dw) * dh / 2;
+                const uint64_t px = ((uw * uh) >> 2) + ((udw * udh) >> 1);
                 stats.drawn++;
-                stats.pixels += static_cast<uint64_t>(w) * h;
+                stats.pixels += static_cast<uint64_t>(uw) * uh;
                 stats.pixelClocks += px;
                 stats.rowClocks += srcRows * 6 + dstRows * 31;
                 stats.fixedClocks += 12;
@@ -328,7 +377,7 @@ void Blitter::DrawOp(uint32_t &address) {
                     stats.overRightBottom++;
                     stats.overRightBottomClocks += clocks;
                 }
-                if (static_cast<int64_t>(w) * h >= 64 * 64) {
+                if (static_cast<uint64_t>(uw) * uh >= 64 * 64) {
                     stats.big++;
                     stats.bigClocks += clocks;
                 }
@@ -392,9 +441,11 @@ void Blitter::DrawOp(uint32_t &address) {
         }
         native->draws.push_back(n);
     }
+#ifndef XBOX_NO_SW_VRAM
     if (rasterize) {
         kBlits[mode * 4 + (tinted ? 2 : 0) + (trans ? 1 : 0)](a);
     }
+#endif
 }
 
 void Blitter::Run() {

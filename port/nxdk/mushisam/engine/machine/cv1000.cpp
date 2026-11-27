@@ -51,6 +51,8 @@ void Cv1000::Reset() {
     sound.Reset();
     m_blitterDone = 0;
     m_busyPollCount = 0;
+    m_lastBusyPollPc = 0;
+    m_lastBusyPollCycle = 0;
     m_frameEnd = 0;
     frame = 0;
     cpu.eventAt = ~0ull;
@@ -132,20 +134,29 @@ uint32 Cv1000::Read(uint32 address, unsigned size) {
             m_firstPoll = cpu.cycles;
         }
         if (offset == 0x10 && blitter.busy) {
-            if (cpu.cycles >= m_blitterDone) {
+            if (noSlowdown || cpu.cycles >= m_blitterDone) {
                 blitter.busy = false;
                 m_busyPollCount = 0;
-            } else if (++m_busyPollCount >= 2u && !cpu.interruptReady) {
-                // O(1) blitter busy-wait fast-forward: skips tight SH-3 poll spinloop while
-                // preserving exact CV1000 slowdown timing (stops at min(m_blitterDone, blockStop)).
-                const uint64_t target = (m_blitterDone < cpu.blockStop) ? m_blitterDone : cpu.blockStop;
-                if (target > cpu.cycles) {
-                    cpu.cycles = target;
+            } else {
+                if (cpu.PC == m_lastBusyPollPc && (cpu.cycles - m_lastBusyPollCycle) <= 64u) {
+                    ++m_busyPollCount;
+                } else {
+                    m_busyPollCount = 1u;
                 }
-                if (cpu.cycles >= m_blitterDone) {
-                    blitter.busy = false;
-                    m_busyPollCount = 0;
+                m_lastBusyPollPc = cpu.PC;
+                if (m_busyPollCount >= 2u && !cpu.interruptReady) {
+                    // O(1) blitter busy-wait fast-forward: skips tight SH-3 poll spinloop while
+                    // preserving exact CV1000 slowdown timing (stops at min(m_blitterDone, blockStop)).
+                    const uint64_t target = (m_blitterDone < cpu.blockStop) ? m_blitterDone : cpu.blockStop;
+                    if (target > cpu.cycles) {
+                        cpu.cycles = target;
+                    }
+                    if (cpu.cycles >= m_blitterDone) {
+                        blitter.busy = false;
+                        m_busyPollCount = 0;
+                    }
                 }
+                m_lastBusyPollCycle = cpu.cycles;
             }
         }
         const uint32 v = blitter.Read(offset);
@@ -180,6 +191,8 @@ void Cv1000::Write(uint32 address, uint32 value, unsigned size) {
         }
         if (blitter.started) {
             m_busyPollCount = 0;
+            m_lastBusyPollPc = 0;
+            m_lastBusyPollCycle = 0;
             // (its uploads took the bus from the CPU; it is busy for the time the list takes)
             const uint64_t prevDone = m_blitterDone;
             if (noSlowdown) {

@@ -125,6 +125,8 @@ private:
     uint8_t m_soundRegister = 0;
     uint64_t m_blitterDone = 0; // the CPU cycle the blitter is ready again at
     uint32_t m_busyPollCount = 0;
+    uint32_t m_lastBusyPollPc = 0;
+    uint64_t m_lastBusyPollCycle = 0;
     bool m_pollSeen = false;    // (SPELUNK_BLIT_LOG only: not state)
     uint64_t m_firstPoll = 0;
     uint64_t m_frameEnd = 0;
