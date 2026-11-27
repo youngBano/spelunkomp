@@ -564,7 +564,7 @@ int main(int argc, char **argv) {
                             totCyc ? 100.0 * cum / totCyc : 0.0,
                             (unsigned long long)cnt);
             }
-            if (hf && (i < 200 || (totCyc && cum * 100 <= totCyc * 98))) {
+            if (hf && (i < 600 || (totCyc && cum * 1000 <= totCyc * 992))) {
                 std::fprintf(hf, "%08X %llu %llu\n", pc, (unsigned long long)cyc, (unsigned long long)cnt);
             }
         }

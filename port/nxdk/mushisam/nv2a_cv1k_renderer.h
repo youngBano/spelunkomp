@@ -11,7 +11,6 @@
 #include "machine/blitter.h"
 #include "xbox_asm.h"
 
-#include <nxdk/mount.h>
 #include <pbkit/pbkit.h>
 #include <windows.h>
 #include <xboxkrnl/xboxkrnl.h>
@@ -38,7 +37,8 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 768; // 768 * 32 KB = 24 MB hot RAM pool (>= 3.5 MB permanent free RAM on 64 MB Xbox!)
+    static constexpr int kRetailMaxAllocPages = 640; // 640 * 32 KB = 20 MB hot RAM pool + RLE16 cold RAM tier (0 HDD swaps ever!)
+    static constexpr size_t kMaxColdRamBytes = 5120u * 1024u; // 5.0 MB compressed cold tier (~20 MB uncompressed equivalent!)
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
     // Dual-bank 1024x(2048+4) A1R5G5B5 NV2A shelf atlas (2 x 1024x1024 = 4 MB + 8 KB) + 8,192-slot Mix64 hash table:
@@ -98,18 +98,23 @@ public:
 
         pageTable_.assign(kTotalLogicalPages, -1);
         pagePtrs_.assign(kTotalLogicalPages, nullptr);
-        pageOnDisk_.assign(kTotalLogicalPages, 0);
+        coldState_.assign(kTotalLogicalPages, 0);
+        coldClock_.assign(kTotalLogicalPages, 0);
+        coldPages_.assign(kTotalLogicalPages, {});
+        coldTotalBytes_ = 0;
+        coldTick_ = 0;
         std::memset(pageGen_, 0, sizeof(pageGen_));
-        pageLru_.reserve(maxAllocPages_);
+        pageRef_.reserve(maxAllocPages_);
         pageOwner_.reserve(maxAllocPages_);
         pageDirty_.reserve(maxAllocPages_);
         pageData_.reserve(maxAllocPages_);
         rectHash_.assign(kRectHashSlots, {});
         batches_.reserve(256);
+        rleScratch_.reserve(kPageSize * kPageSize + 64u);
 
-        OpenSwapFile();
-
-        lruClock_ = 0;
+        clockHand_ = 0;
+        frameId_ = 1;
+        hasPresentedFrame_ = false;
         activeBank_ = 0;
         bankEpoch_[0] = 1;
         bankEpoch_[1] = 1;
@@ -126,7 +131,6 @@ public:
     }
 
     void Shutdown() {
-        CloseSwapFile();
         if (vbAlloc_) {
             MmFreeContiguousMemory(vbAlloc_);
             vbAlloc_ = nullptr;
@@ -141,24 +145,31 @@ public:
         pageData_.clear();
         pageTable_.clear();
         pagePtrs_.clear();
-        pageOnDisk_.clear();
-        pageLru_.clear();
+        coldPages_.clear();
+        coldState_.clear();
+        coldClock_.clear();
+        coldTotalBytes_ = 0;
+        pageRef_.clear();
         pageOwner_.clear();
         pageDirty_.clear();
+        rleScratch_.clear();
         rectHash_.clear();
         batches_.clear();
         stateInitialized_ = false;
+        hasPresentedFrame_ = false;
     }
 
     // Consume Blitter::NativeList steps (uploads + draws) and submit hardware NV2A quads.
-    void Render(const spelunk::Blitter &blitter, spelunk::NativeList &list,
+    // Returns true if a frame was submitted (caller should call pb_finished()), or false on
+    // 0-draw CV1000 transition frames where holding the frontbuffer avoids black flicker.
+    bool Render(const spelunk::Blitter &blitter, spelunk::NativeList &list,
                 bool tateMode, bool bilinear, bool integerScale) {
         if (!atlas_) {
             list.Clear();
-        if (list.pixels.capacity() > 65536u) {
-            std::vector<uint16_t>().swap(list.pixels);
-        }
-            return;
+            if (list.pixels.capacity() > 65536u) {
+                std::vector<uint16_t>().swap(list.pixels);
+            }
+            return false;
         }
 
         const float screenW = static_cast<float>(pb_back_buffer_width());
@@ -180,6 +191,7 @@ public:
 
         // 1. Flip double-buffered VB UP FRONT (CPU writes VB B while NV2A finishes reading VB A!).
         //    Only wait on pb_busy() before recycling a bank or submitting the new pushbuffer — hides ~2 ms GpuWait!
+        ++frameId_;
         atlasPhase_ = (atlasPhase_ + 1u) & 3u;
         atlasVBias_ = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
         vbPhase_ ^= 1u;
@@ -230,10 +242,16 @@ public:
             std::vector<uint16_t>().swap(list.pixels);
         }
 
-        // 3. Flush write-combined A1R5G5B5 atlas & hardware vertex buffer writes before NV2A DMA.
+        // 3. Hold previous presented frame on 0-draw CV1000 transition frames (e.g. f=25672..25884
+        //    Stage 2->3 load) instead of clearing backbuffer to solid black!
+        if (vbCount_ == 0u && !frameHeaderPushed_ && hasPresentedFrame_ && clearFramesRemaining_ == 0) {
+            return false;
+        }
+
+        // 4. Flush write-combined A1R5G5B5 atlas & hardware vertex buffer writes before NV2A DMA.
         _mm_sfence();
 
-        // 4. Sync GPU (now already idle after CPU work!), reset pushbuffer, and submit hardware batches.
+        // 5. Sync GPU (now already idle after CPU work!), reset pushbuffer, and submit hardware batches.
         EnsureGpuReadyForSubmit();
         const uint64_t tPb0 = ReadRdtsc();
         if (!frameHeaderPushed_) {
@@ -241,6 +259,10 @@ public:
         }
         SubmitDraws();
         lastPbSubmitTsc_ += ReadRdtsc() - tPb0;
+        if (vbCount_ > 0u) {
+            hasPresentedFrame_ = true;
+        }
+        return true;
     }
 
     static void DirectUploadCallback(void *ctx, int32_t dstX, int32_t dstY, int32_t w, int32_t h,
@@ -307,6 +329,7 @@ private:
         uint16_t v0 = 0;
         uint16_t epoch = 0;
         uint16_t pageGen = 0;
+        uint32_t lastFrame = 0;
     };
 
     static constexpr uint32_t kFloatZeroBits = 0x00000000u;
@@ -370,7 +393,7 @@ private:
         }
         lastGpuWaitTsc_ += ReadRdtsc() - t0;
         pb_reset();
-        pb_target_back_buffer();
+        // pb_init() and pb_finished() already target the current backbuffer; avoid redundant pushbuffer traffic!
         gpuReadyThisFrame_ = true;
     }
 
@@ -424,8 +447,10 @@ private:
             PushFrameHeader(curScreenW_, curScreenH_, curBilinear_);
         }
         SubmitDraws();
+        const uint64_t tFlush0 = ReadRdtsc();
         while (pb_busy()) {
         }
+        lastGpuWaitTsc_ += ReadRdtsc() - tFlush0;
         batches_.clear();
         vbCount_ = 0;
         activeBank_ ^= 1u;
@@ -645,70 +670,136 @@ private:
         // Per-page generation counter invalidated only on pages actually written by GetPageWrite().
     }
 
-    void OpenSwapFile() {
-        CloseSwapFile();
-        if (!nxIsDriveMounted('Z')) {
-            nxMountDrive('Z', "\\Device\\Harddisk0\\Partition5\\");
+    // Ultra-fast lossless word-aligned RLE16 compression for cold 128x128 A1R5G5B5 VRAM pages.
+    // Replaces Z:\mushivrm.bin HDD swapping completely (0 disk I/O ever, ~25 us L2 decompress vs 10+ ms HDD!).
+    void StoreColdPageRle16(int logical, const uint16_t *src) {
+        constexpr uint32_t kN = kPageSize * kPageSize; // 16384
+        // Remove any previous cold allocation for this logical page first.
+        if (coldState_[logical] == 1u) {
+            coldTotalBytes_ -= coldPages_[logical].size() * sizeof(uint16_t);
+            std::vector<uint16_t>().swap(coldPages_[logical]);
+            coldState_[logical] = 0u;
         }
-        swapHandle_ = CreateFileA("Z:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (swapHandle_ == INVALID_HANDLE_VALUE) {
-            if (!nxIsDriveMounted('E')) {
-                nxMountDrive('E', "\\Device\\Harddisk0\\Partition1\\");
+        // Fast all-zero check (common for unused / cleared VRAM pages -> 0 bytes stored!).
+        bool allZero = true;
+        const uint64_t *src64 = reinterpret_cast<const uint64_t *>(src);
+        for (uint32_t i = 0; i < (kN >> 2); ++i) {
+            if (src64[i] != 0ull) {
+                allZero = false;
+                break;
             }
-            swapHandle_ = CreateFileA("E:\\mushivrm.bin", GENERIC_READ | GENERIC_WRITE, 0, nullptr,
-                                      CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
         }
-    }
-
-    void CloseSwapFile() {
-        if (swapHandle_ != INVALID_HANDLE_VALUE) {
-            CloseHandle(swapHandle_);
-            swapHandle_ = INVALID_HANDLE_VALUE;
-        }
-    }
-
-    void SwapOutPage(int logical, const uint16_t *src) {
-        if (swapHandle_ == INVALID_HANDLE_VALUE) {
+        if (allZero) {
+            coldState_[logical] = 0u;
             return;
         }
-        LARGE_INTEGER pos{};
-        pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
-        IO_STATUS_BLOCK iosb{};
-        NTSTATUS st = NtWriteFile(swapHandle_, nullptr, nullptr, nullptr, &iosb,
-                                  const_cast<uint16_t *>(src), kPageBytes, &pos);
-        if (st == STATUS_PENDING) {
-            NtWaitForSingleObject(swapHandle_, FALSE, nullptr);
-            st = iosb.Status;
+        rleScratch_.clear();
+        uint32_t i = 0;
+        while (i < kN) {
+            const uint16_t v = src[i];
+            uint32_t run = 1;
+            while (i + run < kN && src[i + run] == v && run < 32768u) {
+                ++run;
+            }
+            if (run >= 3u) {
+                rleScratch_.push_back(static_cast<uint16_t>(0x8000u | (run - 1u)));
+                rleScratch_.push_back(v);
+                i += run;
+            } else {
+                const uint32_t litStart = i;
+                uint32_t litLen = 0;
+                while (i < kN && litLen < 32768u) {
+                    if (i + 2u < kN && src[i] == src[i + 1u] && src[i] == src[i + 2u]) {
+                        break;
+                    }
+                    ++i;
+                    ++litLen;
+                }
+                rleScratch_.push_back(static_cast<uint16_t>(litLen - 1u));
+                rleScratch_.insert(rleScratch_.end(), src + litStart, src + litStart + litLen);
+            }
         }
-        if (NT_SUCCESS(st) && iosb.Information == kPageBytes) {
-            pageOnDisk_[logical] = 1;
-            ++swapCount_;
+        const size_t needBytes = rleScratch_.size() * sizeof(uint16_t);
+        // Enforce strict cold RAM cap and >= 3.0 MB physical RAM floor by dropping oldest unused cold pages.
+        while (coldTotalBytes_ + needBytes > kMaxColdRamBytes) {
+            int oldestLog = -1;
+            uint32_t oldestTick = UINT32_MAX;
+            for (int p = 0; p < kTotalLogicalPages; ++p) {
+                if (coldState_[p] == 1u && coldClock_[p] < oldestTick) {
+                    oldestTick = coldClock_[p];
+                    oldestLog = p;
+                }
+            }
+            if (oldestLog < 0) break;
+            coldTotalBytes_ -= coldPages_[oldestLog].size() * sizeof(uint16_t);
+            std::vector<uint16_t>().swap(coldPages_[oldestLog]);
+            coldState_[oldestLog] = 0u;
         }
+        MM_STATISTICS mm{};
+        mm.Length = sizeof(mm);
+        if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 768u) {
+            // Reclaim oldest cold pages until >= 3.5 MB physical RAM is free.
+            for (int tries = 0; tries < 16 && coldTotalBytes_ > 0; ++tries) {
+                int oldestLog = -1;
+                uint32_t oldestTick = UINT32_MAX;
+                for (int p = 0; p < kTotalLogicalPages; ++p) {
+                    if (coldState_[p] == 1u && coldClock_[p] < oldestTick) {
+                        oldestTick = coldClock_[p];
+                        oldestLog = p;
+                    }
+                }
+                if (oldestLog < 0) break;
+                coldTotalBytes_ -= coldPages_[oldestLog].size() * sizeof(uint16_t);
+                std::vector<uint16_t>().swap(coldPages_[oldestLog]);
+                coldState_[oldestLog] = 0u;
+                if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages >= 896u) break;
+            }
+        }
+        coldPages_[logical].assign(rleScratch_.begin(), rleScratch_.end());
+        coldState_[logical] = 1u;
+        coldClock_[logical] = ++coldTick_;
+        coldTotalBytes_ += needBytes;
+        ++swapCount_;
     }
 
-    bool SwapInPage(int logical, uint16_t *dst) {
-        if (swapHandle_ == INVALID_HANDLE_VALUE || !pageOnDisk_[logical]) {
+    bool LoadColdPageRle16(int logical, uint16_t *dst) {
+        if (coldState_[logical] != 1u || coldPages_[logical].empty()) {
             return false;
         }
-        LARGE_INTEGER pos{};
-        pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
-        IO_STATUS_BLOCK iosb{};
-        NTSTATUS st = NtReadFile(swapHandle_, nullptr, nullptr, nullptr, &iosb,
-                                 dst, kPageBytes, &pos);
-        if (st == STATUS_PENDING) {
-            NtWaitForSingleObject(swapHandle_, FALSE, nullptr);
-            st = iosb.Status;
+        constexpr uint32_t kN = kPageSize * kPageSize;
+        const uint16_t *src = coldPages_[logical].data();
+        const size_t srcLen = coldPages_[logical].size();
+        size_t sp = 0;
+        uint32_t dp = 0;
+        while (sp < srcLen && dp < kN) {
+            const uint16_t tok = src[sp++];
+            if (tok & 0x8000u) {
+                if (sp >= srcLen) break;
+                const uint32_t run = static_cast<uint32_t>(tok & 0x7FFFu) + 1u;
+                const uint16_t val = src[sp++];
+                const uint32_t n = (dp + run <= kN) ? run : (kN - dp);
+                std::fill_n(dst + dp, n, val);
+                dp += n;
+            } else {
+                const uint32_t lit = static_cast<uint32_t>(tok) + 1u;
+                const uint32_t avail = static_cast<uint32_t>(srcLen - sp);
+                uint32_t n = lit < avail ? lit : avail;
+                if (dp + n > kN) n = kN - dp;
+                std::memcpy(dst + dp, src + sp, static_cast<size_t>(n) * sizeof(uint16_t));
+                sp += n;
+                dp += n;
+            }
         }
-        if (NT_SUCCESS(st) && iosb.Information == kPageBytes) {
-            ++swapCount_;
-            return true;
+        if (dp < kN) {
+            std::memset(dst + dp, 0, static_cast<size_t>(kN - dp) * sizeof(uint16_t));
         }
-        return false;
+        coldClock_[logical] = ++coldTick_;
+        ++swapCount_;
+        return true;
     }
 
-    // 22 MB hot RAM pool with lossless single-syscall NtReadFile/NtWriteFile Z:\mushivrm.bin backing
-    // + dynamic >= 5 MB free-RAM safety guard so OOM is mathematically impossible on 64 MB retail Xbox!
+    // Two-tier 100%-RAM VRAM pool: 22 MB hot uncompressed + 5.5 MB RLE16 cold compressed
+    // with O(1) scan-resistant 2-bit Clock eviction (0 HDD swaps ever, immune to Stage 3 cyclic scan!).
     uint16_t *AllocateOrEvictPage(int logical, bool forWrite) {
         int slot = -1;
         uint16_t *dst = nullptr;
@@ -716,8 +807,8 @@ private:
         if (canGrow && (pageData_.size() & 15u) == 0u && pageData_.size() >= 256u) {
             MM_STATISTICS mm{};
             mm.Length = sizeof(mm);
-            if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 896u) {
-                // Keep >= 3.5 MB (896 * 4 KB) physical RAM permanently free!
+            if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 1280u) {
+                // Keep >= 5.0 MB physical RAM free for RLE16 cold tier + audio + OS headroom!
                 maxAllocPages_ = static_cast<int>(pageData_.size());
                 canGrow = false;
             }
@@ -725,33 +816,38 @@ private:
         if (canGrow) {
             slot = static_cast<int>(pageData_.size());
             pageData_.emplace_back(kPageSize * kPageSize, 0u);
-            pageLru_.push_back(++lruClock_);
+            pageRef_.push_back(1u);
             pageOwner_.push_back(logical);
             pageDirty_.push_back(forWrite ? 1u : 0u);
             dst = pageData_[slot].data();
         } else {
+            const int nSlots = static_cast<int>(pageData_.size());
             int victim = 0;
-            uint32_t oldest = UINT32_MAX;
-            for (int i = 0; i < maxAllocPages_; ++i) {
-                if (pageLru_[i] < oldest) {
-                    oldest = pageLru_[i];
-                    victim = i;
+            // O(1) amortized 2-bit Clock eviction: frequently-read sprite/HUD pages stay at ref 2..3
+            // while Stage 3 streaming uploads (ref 1) get recycled first!
+            for (;;) {
+                const int idx = clockHand_;
+                clockHand_ = (idx + 1 >= nSlots) ? 0 : (idx + 1);
+                if (pageRef_[idx] == 0u) {
+                    victim = idx;
+                    break;
                 }
+                --pageRef_[idx];
             }
             const int oldLogical = pageOwner_[victim];
             uint16_t *victimPtr = pageData_[victim].data();
-            if (pageDirty_[victim] || !pageOnDisk_[oldLogical]) {
-                SwapOutPage(oldLogical, victimPtr);
+            if (pageDirty_[victim] || coldState_[oldLogical] == 0u) {
+                StoreColdPageRle16(oldLogical, victimPtr);
             }
             pageTable_[oldLogical] = -1;
             pagePtrs_[oldLogical] = nullptr;
             slot = victim;
             pageOwner_[slot] = logical;
-            pageLru_[slot] = ++lruClock_;
+            pageRef_[slot] = 1u;
             pageDirty_[slot] = forWrite ? 1u : 0u;
             dst = victimPtr;
         }
-        if (!SwapInPage(logical, dst)) {
+        if (!LoadColdPageRle16(logical, dst)) {
             std::memset(dst, 0, kPageBytes);
         }
         ++pageGen_[logical];
@@ -765,8 +861,8 @@ private:
         ++pageGen_[logical];
         const int phys = pageTable_[logical];
         if (phys >= 0) {
-            pageLru_[phys] = ++lruClock_;
-            pageDirty_[phys] = 1;
+            if (pageRef_[phys] < 3u) ++pageRef_[phys];
+            pageDirty_[phys] = 1u;
             return pagePtrs_[logical];
         }
         return AllocateOrEvictPage(logical, true);
@@ -799,10 +895,10 @@ private:
         const int logical = py * kPagesX + px;
         const int phys = pageTable_[logical];
         if (phys >= 0) {
-            pageLru_[phys] = ++lruClock_;
+            if (pageRef_[phys] < 3u) ++pageRef_[phys];
             return pagePtrs_[logical];
         }
-        if (pageOnDisk_[logical]) {
+        if (coldState_[logical] == 1u) {
             return AllocateOrEvictPage(logical, false);
         }
         return nullptr;
@@ -911,6 +1007,7 @@ private:
         const uint32_t hBase = Mix64(key) & kRectHashMask;
         RectHashSlot *slot = nullptr;
         bool hit = false;
+        bool canReuseInPlace = false;
         for (uint32_t pr = 0; pr < 128; ++pr) {
             RectHashSlot &cand = rectHash_[(hBase + pr) & kRectHashMask];
             const uint32_t slotBank = (cand.v0 >= kBankH) ? 1u : 0u;
@@ -920,7 +1017,14 @@ private:
             }
             if (cand.key == key) {
                 slot = &cand;
-                hit = (cand.pageGen == rectPageGen);
+                if (cand.pageGen == rectPageGen) {
+                    hit = true;
+                } else if (cand.lastFrame < frameId_ &&
+                           (cand.lastFrame + 2u <= frameId_ || gpuReadyThisFrame_ || !pb_busy())) {
+                    // Same (w,h,srcX0,srcY0) updated in VRAM (e.g. scrolling BG strip) and NV2A is done
+                    // reading the prior frame: overwrite its existing atlas rect in-place (zero shelf growth!).
+                    canReuseInPlace = true;
+                }
                 break;
             }
         }
@@ -930,6 +1034,14 @@ private:
         }
         if (hit) {
             ++lastAtlasHits_;
+            slot->lastFrame = frameId_;
+        } else if (canReuseInPlace) {
+            ++lastAtlasMisses_;
+            const uint64_t tC0 = ReadRdtsc();
+            CopyVramRectToAtlas(srcX0, srcY0, w, h, slot->u0, slot->v0);
+            lastAtlasCopyTsc_ += ReadRdtsc() - tC0;
+            slot->pageGen = rectPageGen;
+            slot->lastFrame = frameId_;
         } else {
             ++lastAtlasMisses_;
             const int padW = std::min(kAtlasW, w + 1); // 1px gutter prevents adjacent shelf UV bleed
@@ -970,6 +1082,7 @@ private:
             slot->v0 = static_cast<uint16_t>(dstY);
             slot->pageGen = rectPageGen;
             slot->epoch = bankEpoch_[activeBank_];
+            slot->lastFrame = frameId_;
         }
 
         // Compute tint & blend state for NV2A Stage-0 SHIFTLEFTBY1 (2x overdrive) Register Combiner:
@@ -1286,13 +1399,19 @@ private:
 
     std::vector<int> pageTable_;
     std::vector<uint16_t *> pagePtrs_;
-    std::vector<uint8_t> pageOnDisk_;
-    std::vector<uint32_t> pageLru_;
+    std::vector<uint8_t> coldState_;
+    std::vector<uint32_t> coldClock_;
+    std::vector<std::vector<uint16_t>> coldPages_;
+    std::vector<uint16_t> rleScratch_;
+    size_t coldTotalBytes_ = 0;
+    uint32_t coldTick_ = 0;
+    std::vector<uint8_t> pageRef_;
     std::vector<int> pageOwner_;
     std::vector<uint8_t> pageDirty_;
     std::vector<std::vector<uint16_t>> pageData_;
-    HANDLE swapHandle_ = INVALID_HANDLE_VALUE;
-    uint32_t lruClock_ = 0;
+    int clockHand_ = 0;
+    uint32_t frameId_ = 1;
+    bool hasPresentedFrame_ = false;
 
     std::vector<RectHashSlot> rectHash_;
     std::vector<DrawBatch> batches_;

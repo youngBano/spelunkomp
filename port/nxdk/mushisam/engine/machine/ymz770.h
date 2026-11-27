@@ -114,8 +114,11 @@ private:
     static constexpr uint32_t kHeaderCacheBytes = 65536u;
     static constexpr uint32_t kStreamWinBytes = 32768u;
     static constexpr uint32_t kSeqWinBytes = 4096u;
-    static constexpr uint32_t kMaxBgmCacheBytes = 1024u * 1024u; // 1.0 MB RAM cache for active looped BGM (keeps >= 4 MB free RAM!)
+    static constexpr uint32_t kMaxBgmCacheBytes = 1024u * 1024u; // 1.0 MB RAM cache for active looped BGM
+    static constexpr uint32_t kBgmInitChunkBytes = 65536u;       // Load only 64 KB synchronously (< 3 ms!), stream rest async!
     HANDLE m_romFile = INVALID_HANDLE_VALUE;
+    HANDLE m_bgmThread = nullptr;
+    uint32_t m_bgmRunning = 0;
     std::vector<uint8_t> m_romHeader;
     std::vector<uint8_t> m_streamBuf[kNumChannels];
     uint32_t m_streamBase[kNumChannels] = {};
@@ -123,11 +126,15 @@ private:
     std::vector<uint8_t> m_bgmBuf;
     uint32_t m_bgmBase = 0xFFFFFFFFu;
     uint32_t m_bgmLen = 0;
+    uint32_t m_bgmTargetLen = 0;
+    uint32_t m_bgmReqGen = 0;
     uint8_t m_seqBuf[kSeqWinBytes] = {};
     uint32_t m_seqBase = 0xFFFFFFFFu;
     uint32_t m_seqLen = 0;
     uint8_t ReadRomFileByte(uint32_t offset) const;
     bool EnsureChannelWindow(int ch, uint32_t byteOff, bool isLooped);
+    static DWORD WINAPI BgmPrefetchTrampoline(LPVOID param);
+    void BgmPrefetchLoop();
 #endif
 
     uint8_t Rom(uint32_t offset) const {

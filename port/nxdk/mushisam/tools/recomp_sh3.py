@@ -696,6 +696,7 @@ def main():
     ram_path = None
     ram_end_path = None
     hot_path = None
+    strip_found = False
     pos = []
     i = 0
     while i < len(args):
@@ -705,6 +706,8 @@ def main():
             ram_end_path = args[i + 1]; i += 2
         elif args[i] == "--hot" and i + 1 < len(args):
             hot_path = args[i + 1]; i += 2
+        elif args[i] == "--strip-found":
+            strip_found = True; i += 1
         else:
             pos.append(args[i]); i += 1
 
@@ -722,6 +725,8 @@ def main():
         for line in open(path):
             parts = line.split()
             if len(parts) >= 2:
+                if strip_found and len(parts) >= 3 and parts[2] == "found":
+                    continue
                 pc = int(parts[0], 16)
                 code = bytes.fromhex(parts[1])
                 raw_blocks[pc] = code

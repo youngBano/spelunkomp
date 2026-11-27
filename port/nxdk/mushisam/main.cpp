@@ -146,7 +146,6 @@ int main(void) {
     spelunk_xbox::g_xboxPerf.SampleRamStats();
     spelunk_xbox::P3Pmc::Configure(spelunk_xbox::P3Pmc::kEvtIfuIfetchMiss,
                                    spelunk_xbox::P3Pmc::kEvtL2LinesIn);
-    bool programFreed = false;
 
     spelunk_xbox::MushisamFakePlay fakePlay;
     fakePlay.Reset();
@@ -162,6 +161,8 @@ int main(void) {
     bool prevL3 = false;
     bool prevR3 = false;
     uint32_t loadedStagePack = 0xFFFFFFFFu;
+    bool everInPlay = false;
+    uint32_t outOfPlayFrames = 0;
     uint32_t lastVbl = pb_get_vbl_counter();
     uint64_t lastWallTick = spelunk_xbox::XboxTimer::NowTicks();
 
@@ -208,20 +209,28 @@ int main(void) {
         board.RunFrame();
         const uint64_t pmc0_b = spelunk_xbox::P3Pmc::Read(0) - pmc0_a;
         const uint64_t pmc1_b = spelunk_xbox::P3Pmc::Read(1) - pmc1_a;
-        if (!programFreed && board.frame >= 60u && (board.cpu.PC & 0xFF800000u) == 0x0C000000u) {
-            // Reclaim 2 MB U4 flash buffer after boot copy completes (saves 2 MB on 64 MB retail Xbox).
-            std::vector<uint8_t>().swap(board.program);
-            programFreed = true;
-        }
+        // Keep board.program (2 MB mushisam_u4) resident: Stage 3+ script/pattern code reads U4 directly!
         const bool inPlayNow = spelunk_xbox::MushisamFakePlay::InPlay(board);
         const uint32_t curStage = spelunk_xbox::MushisamFakePlay::Stage(board);
         // Never write EEPROM to HDD during active gameplay (zero gameplay disk I/O).
         if (!inPlayNow && (board.frame & 127u) == 0u) {
             eeprom.FlushIfDirty(board.rtc);
         }
-        const uint32_t desiredPack = inPlayNow ? (curStage + 1u) : 0u;
+        if (inPlayNow) {
+            everInPlay = true;
+            outOfPlayFrames = 0;
+        } else {
+            ++outOfPlayFrames;
+        }
+        // Keep stage pack attached across brief ShipState == 0 stage transitions/respawns/continues!
+        // Only switch back to pak_menu.bin after > 300 consecutive non-play frames at stage 0 (true attract/title).
+        uint32_t desiredPack = loadedStagePack;
+        if (!everInPlay || (curStage == 0u && !inPlayNow && outOfPlayFrames > 300u)) {
+            desiredPack = 0u;
+        } else {
+            desiredPack = curStage + 1u;
+        }
         if (desiredPack != loadedStagePack) {
-            // Update loadedStagePack unconditionally so a missing pack NEVER triggers a 60 Hz CreateFileA storm!
             loadedStagePack = desiredPack;
             char packPath[64];
             if (desiredPack == 0u) {
@@ -237,8 +246,9 @@ int main(void) {
 
         // Overlap NV2A rasterization of frame N-1 with BOTH SH-3 CPU AND CPU-side tilemap/atlas prep of frame N!
         const uint64_t tRen0 = spelunk_xbox::XboxTimer::NowTicks();
-        renderer.Render(board.blitter, nativeList, tateMode, bilinear, integerScale);
-        while (pb_finished()) {
+        if (renderer.Render(board.blitter, nativeList, tateMode, bilinear, integerScale)) {
+            while (pb_finished()) {
+            }
         }
         const uint64_t renTotalTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
         const uint32_t gpuWaitUs = static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastGpuWaitTsc()));

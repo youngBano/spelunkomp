@@ -49,9 +49,16 @@ bool Ymz770::AttachRomFile(const char *path) {
         m_streamBase[i] = 0xFFFFFFFFu;
         m_streamLen[i] = 0;
     }
-    m_bgmBuf.clear();
+    m_bgmBuf.assign(kMaxBgmCacheBytes, 0u); // Pre-allocate 1.0 MB once so async prefetch never reallocates!
     m_bgmBase = 0xFFFFFFFFu;
-    m_bgmLen = 0;
+    __atomic_store_n(&m_bgmLen, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&m_bgmTargetLen, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&m_bgmReqGen, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&m_bgmRunning, 1u, __ATOMIC_RELEASE);
+    m_bgmThread = CreateThread(nullptr, 32768, &BgmPrefetchTrampoline, this, 0, nullptr);
+    if (m_bgmThread) {
+        SetThreadPriority(m_bgmThread, THREAD_PRIORITY_BELOW_NORMAL);
+    }
     m_seqBase = 0xFFFFFFFFu;
     m_seqLen = 0;
     return true;
@@ -83,6 +90,12 @@ bool Ymz770::LoadSfxAdpcmPack(const char *path) {
 }
 
 void Ymz770::CloseRomFile() {
+    if (m_bgmThread) {
+        __atomic_store_n(&m_bgmRunning, 0u, __ATOMIC_RELEASE);
+        WaitForSingleObject(m_bgmThread, 500);
+        CloseHandle(m_bgmThread);
+        m_bgmThread = nullptr;
+    }
     if (m_romFile != INVALID_HANDLE_VALUE) {
         CloseHandle(m_romFile);
         m_romFile = INVALID_HANDLE_VALUE;
@@ -90,7 +103,8 @@ void Ymz770::CloseRomFile() {
     m_romHeader.clear();
     m_bgmBuf.clear();
     m_bgmBase = 0xFFFFFFFFu;
-    m_bgmLen = 0;
+    __atomic_store_n(&m_bgmLen, 0u, __ATOMIC_RELEASE);
+    __atomic_store_n(&m_bgmTargetLen, 0u, __ATOMIC_RELEASE);
     for (int i = 0; i < kNumChannels; ++i) {
         m_streamBuf[i].clear();
         m_streamBase[i] = 0xFFFFFFFFu;
@@ -127,20 +141,57 @@ uint8_t Ymz770::ReadRomFileByte(uint32_t offset) const {
                : 0xFF;
 }
 
+DWORD WINAPI Ymz770::BgmPrefetchTrampoline(LPVOID param) {
+    static_cast<Ymz770 *>(param)->BgmPrefetchLoop();
+    return 0;
+}
+
+void Ymz770::BgmPrefetchLoop() {
+    while (__atomic_load_n(&m_bgmRunning, __ATOMIC_ACQUIRE)) {
+        const uint32_t gen = __atomic_load_n(&m_bgmReqGen, __ATOMIC_ACQUIRE);
+        const uint32_t base = __atomic_load_n(&m_bgmBase, __ATOMIC_ACQUIRE);
+        const uint32_t len = __atomic_load_n(&m_bgmLen, __ATOMIC_ACQUIRE);
+        const uint32_t target = __atomic_load_n(&m_bgmTargetLen, __ATOMIC_ACQUIRE);
+        if (m_romFile != INVALID_HANDLE_VALUE && base != 0xFFFFFFFFu && len < target && target <= m_bgmBuf.size()) {
+            const uint32_t chunk = std::min<uint32_t>(kBgmInitChunkBytes, target - len);
+            const uint32_t got = NtReadAt(m_romFile, static_cast<uint64_t>(base) + len, m_bgmBuf.data() + len, chunk);
+            if (__atomic_load_n(&m_bgmReqGen, __ATOMIC_ACQUIRE) == gen) {
+                if (got > 0u) {
+                    __atomic_store_n(&m_bgmLen, len + got, __ATOMIC_RELEASE);
+                } else {
+                    __atomic_store_n(&m_bgmTargetLen, len, __ATOMIC_RELEASE);
+                }
+            }
+            Sleep(1);
+            continue;
+        }
+        Sleep(10);
+    }
+}
+
 bool Ymz770::EnsureChannelWindow(int ch, uint32_t byteOff, bool isLooped) {
     if (m_romFile == INVALID_HANDLE_VALUE || byteOff >= romSize) {
         return false;
     }
     if (isLooped) {
-        if (m_bgmBase != 0xFFFFFFFFu && byteOff >= m_bgmBase &&
-            (byteOff + 2048u <= m_bgmBase + m_bgmLen || m_bgmBase + m_bgmLen >= romSize)) {
+        const uint32_t curBase = __atomic_load_n(&m_bgmBase, __ATOMIC_ACQUIRE);
+        const uint32_t curLen = __atomic_load_n(&m_bgmLen, __ATOMIC_ACQUIRE);
+        if (curBase != 0xFFFFFFFFu && byteOff >= curBase &&
+            (byteOff + 2048u <= curBase + curLen || curBase + curLen >= romSize)) {
             return true;
         }
-        m_bgmBase = byteOff;
-        const uint32_t want = std::min<uint32_t>(kMaxBgmCacheBytes, romSize - byteOff);
-        m_bgmBuf.resize(want);
-        m_bgmLen = NtReadAt(m_romFile, byteOff, m_bgmBuf.data(), want);
-        return m_bgmLen > 0;
+        // Only read 64 KB synchronously (< 3 ms, ~20s of AMM music!) so the real-time audio mixer
+        // NEVER stalls 100-350 ms on a 1.0 MB DVD read! Background thread prefetches the rest to 1.0 MB.
+        const uint32_t target = std::min<uint32_t>(kMaxBgmCacheBytes, romSize - byteOff);
+        const uint32_t initWant = std::min<uint32_t>(kBgmInitChunkBytes, target);
+        __atomic_add_fetch(&m_bgmReqGen, 1u, __ATOMIC_ACQ_REL);
+        __atomic_store_n(&m_bgmLen, 0u, __ATOMIC_RELEASE);
+        __atomic_store_n(&m_bgmTargetLen, 0u, __ATOMIC_RELEASE);
+        const uint32_t got = NtReadAt(m_romFile, byteOff, m_bgmBuf.data(), initWant);
+        __atomic_store_n(&m_bgmBase, byteOff, __ATOMIC_RELEASE);
+        __atomic_store_n(&m_bgmLen, got, __ATOMIC_RELEASE);
+        __atomic_store_n(&m_bgmTargetLen, target, __ATOMIC_RELEASE);
+        return got > 0u;
     }
     if (m_streamBase[ch] != 0xFFFFFFFFu && byteOff >= m_streamBase[ch] &&
         (byteOff + 2048u <= m_streamBase[ch] + m_streamLen[ch] || m_streamBase[ch] + m_streamLen[ch] >= romSize)) {
@@ -317,8 +368,8 @@ int16_t Ymz770::Sample() {
                         const bool isLooped = (c.loop != 0);
                         if (EnsureChannelWindow(i, byteOff, isLooped)) {
                             const uint8_t *winPtr = isLooped ? m_bgmBuf.data() : m_streamBuf[i].data();
-                            const uint32_t winBase = isLooped ? m_bgmBase : m_streamBase[i];
-                            const uint32_t winLen = isLooped ? m_bgmLen : m_streamLen[i];
+                            const uint32_t winBase = isLooped ? __atomic_load_n(&m_bgmBase, __ATOMIC_ACQUIRE) : m_streamBase[i];
+                            const uint32_t winLen = isLooped ? __atomic_load_n(&m_bgmLen, __ATOMIC_ACQUIRE) : m_streamLen[i];
                             m_decoders[i]->SetData(winPtr);
                             int localBit = c.position - static_cast<int>(winBase * 8u);
                             const int localEnd = static_cast<int>(winLen * 8u);

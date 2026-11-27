@@ -25,8 +25,8 @@ namespace spelunk_xbox {
 
 class XboxAudio {
 public:
-    static constexpr uint32_t kNumBuffers = 8;        // 8 x 512 stereo frames @ 48 kHz = 85.3 ms total ring
-    static constexpr uint32_t kTargetInFlight = 4;    // Keep 4 buffers queued (~42.7 ms crisp arcade latency, < 45 ms target!)
+    static constexpr uint32_t kNumBuffers = 12;       // 12 x 512 stereo frames @ 48 kHz = 128.0 ms total ring
+    static constexpr uint32_t kTargetInFlight = 6;    // Keep 6 buffers queued (~64.0 ms cushion: absorbs transition spikes, 0 underruns!)
     static constexpr uint32_t kBufFrames48k = 512;    // 10.67 ms per descriptor
     static constexpr uint32_t kBufBytes = kBufFrames48k * 2 * sizeof(int16_t); // 2048 bytes
     static constexpr uint32_t kCmdQueueSize = 2048;   // Lock-free SPSC YMZ770 register write queue
