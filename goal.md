@@ -1,127 +1,95 @@
-# Goal: Zero-Lag 60 FPS Gameplay & Uncompromising Audio for *Mushihimesama* (`mushisam`) on Original Xbox
+# Goal: Zero-Lag Full-Game Completion (Stages 1–5 + Bosses), Stage 3 Black-Screen Fix & Deep `nxdk` Kernel/GPU Optimization
 
-## 1. Comprehensive Codebase & Telemetry Audit (Baseline at Commit `2886729`)
+## 1. Honest Audit Against Previous `goal.md` (`914968f`)
 
-### 1.1 Why Previous Telemetry Reported "Low/No Lag" Despite Visible Slowdown (Critical Timer & Pacing Audit)
-
-Inspection of [`port/nxdk/mushisam/main.cpp`](port/nxdk/mushisam/main.cpp), [`port/nxdk/mushisam/xbox_timer.h`](port/nxdk/mushisam/xbox_timer.h), and [`port/nxdk/mushisam/xbox_profiler.h`](port/nxdk/mushisam/xbox_profiler.h) identified **four compounding measurement and frame-pacing bugs** that masked real frame drops and slow-motion:
-
-1. **Incomplete Frame-Time Accounting (`xbox_profiler.h:194`, `main.cpp:202-271`):**
-   - `totalUs = cpuUs + renderUs + gpuWaitUs` only timed isolated inner blocks. It **excluded** `input.Poll()` (`usbh_pooling_hubs()` synchronous USB OHCI hub register polling), `pb_wait_for_vbl()`, and loop iterations where `ConsumeArcadeFrame()` returned `false`.
-2. **Hidden VBlank Quantization Cliff (60 FPS $\to$ 30 FPS Halving):**
-   - When `vblWakeOffset (1–2 ms) + inputPoll (0.5–1 ms) + cpuUs (8.5 ms) + renderUs (6.0 ms)` totaled `16.8 ms` wall-clock, `g_xboxPerf` logged `cpuUs + renderUs = 14.5 ms` (`< 16,662 µs` = **"no lag"**), yet the frame missed the `16.683 ms` hardware VBlank by `0.12 ms` and **`pb_wait_for_vbl()` blocked until `33.367 ms` (instant drop to 30 FPS)** without incrementing `lagFrames`.
-3. **Dual-Clock Beat-Frequency Judder & Silent Slow-Motion Clamping (`xbox_timer.h:60-73`, `main.cpp:182-271`):**
-   - Coupling a `60.0184 Hz` (`16.661562 ms`) software accumulator (`ConsumeArcadeFrame()`) in series with an unconditional `59.94 Hz` (`16.6833 ms`) hardware `pb_wait_for_vbl()` caused two severe artifacts:
-     - Whenever a VBlank interval woke slightly under `16.6615 ms`, `ConsumeArcadeFrame()` returned `false` (`stepped = false`) and `main.cpp:271` **immediately called `pb_wait_for_vbl()` a second time**—stalling an entire extra `16.68 ms` (`33.3 ms` judder).
-     - Whenever any frame missed VBlank (`33.3 ms`), `accumTicks_` saturated at `maxAccumTicks_ = 2 * ticksPerArcadeFrame_`. Because the loop only stepped at most **1** emulated frame per `pb_wait_for_vbl()`, it could **never drain the backlog**; every subsequent spike clamped `accumTicks_ = maxAccumTicks_`, silently discarding real wall-clock time (**visible slow-motion**).
-   - *Empirical proof from live Xemu dumps:* Over `60.0` real wall-clock seconds (`3,600` expected frames), `g_xboxPerf.frames` only advanced `2,599–2,888` frames (**43–48 real-time FPS**) while `AVG Total` falsely reported `8.8–9.2 ms`.
-4. **Missing Ground-Truth Hardware VBlank & System Wall-Clock Anchors:**
-   - Neither `pb_get_vbl_counter()` (NV2A hardware VBlank interrupt counter) nor `KeQuerySystemTime()` (100 ns real-time system clock) nor end-to-end Present-to-Present wall-clock deltas were tracked. Under emulator load, virtualized guest `RDTSC` and ACPI PMTimer (`KeQueryPerformanceCounter`) can also dilate together unless verified against `KeQuerySystemTime()` and `pb_get_vbl_counter()`.
+| Previous Goal Pillar / Deliverable | Status | Objective Codebase Evidence |
+|---|---|---|
+| **Pillar 1.1–1.2:** Real-time `KeQuerySystemTime` + `KeQueryPerformanceCounter` + `pb_get_vbl_counter()` v4 profiler | **Matched** | Implemented in `port/nxdk/mushisam/xbox_profiler.h` and `tools/decode_perf.py`; logs true wall-clock `WallUs`, `VblDelta`, `DroppedVblPct`, and `EffectiveFps`. |
+| **Pillar 1.3:** 1:1 adaptive VBlank pacing (`vblNow == lastVbl`) | **Matched** | Implemented in `port/nxdk/mushisam/main.cpp:233-238`; eliminates late-frame `16.6 ms -> 33.3 ms` double-sleep halving. |
+| **Pillar 1.4:** Throttled USB OHCI hub polling (`usbh_pooling_hubs`) & `!InPlay` EEPROM flush | **Matched** | `xbox_input.h:60-63` polls OHCI root hub once per 60 frames once XID pad is attached; `main.cpp:207-209` gates EEPROM writes to `!inPlayNow`. |
+| **Pillar 2.2:** Streamed `sound_rom.bin` + 1 MB looped BGM cache + 8-ch `Ymz770` | **Partial** | Saved `+7.5 MB` RAM (`ymz770.h:87-129`), **but** offline pre-baked `sfx_adpcm.bin` was **not** built—`ImaAdpcmCache` (`adpcm_cache.h:15`) still dynamically allocates up to `2.0 MB` of `std::vector` heap across stages. |
+| **Pillar 2.1 & 2.3:** Menu + Stages 1–5 `MPAK` binaries (`pak_menu`, `pak_s1..s5`) & zero gameplay disk I/O | **NOT Matched** | Only `pak_s1.bin` (`8.1 MB`) and `pak_s2.bin` (`10.5 MB`) exist. `pak_menu.bin` and `pak_s3..s5.bin` were **never generated**, causing Stage 3+ to hammer `mushisam_u2` and trigger a 60 Hz failing `CreateFileA` storm. |
+| **Pillar 3:** Full 5-stage AOT SH-3 harvest, `-O3` top-500 hot bank, inline `JSR`, and native C++ hot-loop rewrites (`0x0C160E1C`, bullet/collision loops) | **Partial / NOT Matched** | 32-bit `sint32 rem` countdown landed (`3,500`-frame parity = `0` mismatches), **but** `blocks.txt` stops at `frame 18,000` (mid-Stage 2), leaving **86.7M interpreted block fallbacks** across Stage 2 Boss & Stages 3–5; `0x0C160E1C` and bullet loops were not rewritten in C++; cold TUs stayed `-Oz` (`4.68%` cumulative dropped VBlanks vs `<= 1.0%` target). |
+| **Pillar 4:** 4 MB dual-bank sprite atlas + GPU overlap + MMX blit + NV2A Render-to-Texture off-screen tilemap | **Partial** | 4 MB dual-bank (`2 × 1024 × 1024`) atlas, deferred `pb_busy()` (`GpuWait` `2,059 µs -> 565 µs`), and 4-px MMX blit landed, **but** off-screen `BlitVramToVram` (`x=7456..8191`, `21.4` draws/frame) still runs in software on the CPU (`~1.5 ms/frame`). |
+| **Pillar 5:** `< 45 ms` low-latency audio (`3 × 512` frames) with `0` underruns | **NOT Matched** | Reverted to `4 × 1024` (`85.3 ms`, `Sleep(6)`) in `xbox_audio.h:28-30` because `512`-frame polling with `Sleep(2)` caused `18` underruns and preempted the single PIII core. |
 
 ---
 
-### 1.2 Subsystem-by-Subsystem Bottleneck Audit
+## 2. Empirical Root-Cause Diagnosis: Why Screen Goes Black on Stage 3
 
-| Subsystem | Current Files | Measured State & Remaining Slowdown / Stutter Root Causes |
-| :--- | :--- | :--- |
-| **1. SH-3 AOT Recompiler & CPU** (`6.4 ms` avg, **`35.4 ms` max**) | [`tools/recomp_sh3.py`](port/nxdk/mushisam/tools/recomp_sh3.py), [`engine/runtime/recomp_rt.h`](port/nxdk/mushisam/engine/runtime/recomp_rt.h), [`Makefile`](port/nxdk/mushisam/Makefile), [`engine/machine/sh3.cpp`](port/nxdk/mushisam/engine/machine/sh3.cpp) | **a) `-Oz` on Boss & Stage 2–5 Code:** Only `blocks_hot.obj` (`113` functions from Stage 1 opening) compiles at `-O3`. All other `3,762` functions—including Stage 1 Midboss/Boss and Stage 2+ bullet scripts—compile in `blocks_000..031.obj` at **`-Oz`**, causing `20–35 ms` CPU spikes when boss patterns activate.<br>**b) 64-bit `uint64 &cyc` Stack Spills on 32-bit Pentium III:** Passing `uint64 &cyc` by reference to every `recomp::R*/W*` spills `cyc` to stack memory and emits 64-bit `add/adc` + `cmp/sbb` across an ISA with only 7 usable GPRs. One CV1000 frame is only `1,706,496` cycles (`< 2^21`)—a 32-bit `int32_t cyclesLeft` countdown fits in 1 GPR.<br>**c) Dual-Branch `SH3::IsRam()`:** Every load/store executes two comparisons + mask instead of a single unsigned `(a - 0x0C000000u) < 0x800000u`.<br>**d) Residual Interpreted & Un-Nativized Loops:** `1,805` blocks at `0x0C09E040` still hit `InterpretBlock()` on Xbox; `JSR @Rn` jump tables exit to `RunBlocks()`; hot routines `0x0C160E1C` (`433M` cycles), `0x0C09DE8C`, `0x0C055470`, `0x0C055800`, and `0x0C05411E` are not yet native C++. |
-| **2. NV2A Renderer & Sprite Atlas** (`4.05 ms` avg, **`29.6 ms` max**) | [`nv2a_cv1k_renderer.h`](port/nxdk/mushisam/nv2a_cv1k_renderer.h), [`xbox_asm.S`](port/nxdk/mushisam/xbox_asm.S) | **a) Full-Atlas Wipe Cliff (`29.6 ms` spike):** When `shelfY_ > 768`, `InvalidateRectHash()` wipes **all** cached sprites simultaneously, forcing 400+ sprites/tiles to re-copy from VRAM into write-combined memory in one frame.<br>**b) CPU Off-Screen Tilemap Double-Copy (`~2.5 ms/frame`):** `BlitVramToVram()` composites scrolling background tiles (`x = 7456..8191`, `~20` draws/frame) on the CPU into sparse VRAM pages, and `CopyVramRectToAtlas()` copies those exact pixels *again* on the CPU into the atlas—work the NV2A GPU can execute in `< 0.1 ms` via hardware Render-to-Texture.<br>**c) Tight 64 MB RAM Headroom (`~1.9 MB` free):** `832` VRAM pages (`26 MB`) still leaves minor swap pressure because `board.soundRom` pins `8.0 MB` of RAM. |
-| **3. Audio Engine** (`0 µs` main thread, `128 ms` latency) | [`xbox_audio.h`](port/nxdk/mushisam/xbox_audio.h), [`engine/machine/ymz770.cpp`](port/nxdk/mushisam/engine/machine/ymz770.cpp), [`engine/native_cv1k/adpcm_cache.h`](port/nxdk/mushisam/engine/native_cv1k/adpcm_cache.h) | Dedicated `THREAD_PRIORITY_HIGHEST` async thread achieved `0` underruns, **but**:<br>**a) `8.0 MB` `board.soundRom` (`u23+u24`) is pinned permanently in RAM** even though BGM streams sequentially at ~16 KB/s.<br>**b) High Audio Latency (`128 ms`):** `6 × 1024` stereo frames @ 48 kHz delays shot/explosion SFX by ~7.7 frames.<br>**c) Dead Channels `8..15`:** `Ymz770` allocates 16 `AmmDecoder` + `m_block` buffers (`0..15`) when CV1000 hardware only addresses 8 channels (`0..7`). |
-| **4. Assets, NAND, & Disk I/O** | [`engine/machine/nand.h`](port/nxdk/mushisam/engine/machine/nand.h), [`engine/native_cv1k/xbox_eeprom.h`](port/nxdk/mushisam/engine/native_cv1k/xbox_eeprom.h), [`tools/build_stage_packs.py`](port/nxdk/mushisam/tools/build_stage_packs.py) | **a) Lazy Stage-Pack Reads:** `AttachStagePack()` still performs `ReadFile` calls *after* `InPlay` becomes `1` instead of preloading before gameplay begins.<br>**b) Incomplete Stage Coverage:** Only `pak_s1.bin` (`8.1 MB`) and `pak_s2.bin` (`10.5 MB`) exist; Menu and Stages 3–5 are not yet split.<br>**c) Mid-Gameplay Disk Writes:** `eeprom.FlushIfDirty()` runs every 128 frames even while `InPlay == 1`, and `Z:\mushivrm.bin` swap file still exists. |
-| **5. USB XID Input** | [`xbox_input.h`](port/nxdk/mushisam/xbox_input.h) | `usbh_pooling_hubs()` walks USB OHCI hub registers on **every single frame** even when a gamepad is already connected and delivering interrupt transfers via `OnReadComplete`. |
+A `72,000`-frame host instrumentation pass across **Boot/Menu + Stages 1–5** exposed the exact working-set profile of every stage:
 
----
+| Bucket | NAND Pages Read | VRAM Read | VRAM Written (`Upload`) | Active VRAM Union | Interpreted SH-3 Blocks |
+|---|---:|---:|---:|---:|---:|
+| **Boot / Menu** | `19,421` (`39.12 MB`) | `167` (`5.2 MB`) | `1,250` (`39.1 MB`) | `1,252` (`39.1 MB`) | `0` |
+| **Stage 1** (`stage=0`) | `4,014` (`8.08 MB`) | `849` (`26.5 MB`) | `266` (`8.3 MB`) | `857` (`26.8 MB`) | `0` |
+| **Stage 2** (`stage=1`) | `5,222` (`10.52 MB`) | `751` (`23.5 MB`) | `342` (`10.7 MB`) | `768` (`24.0 MB`) | `3.43M` (Boss) |
+| **Stage 3** (`stage=2`) | **`10,141` (`20.43 MB`)** | **`1,064` (`33.2 MB`)** | **`658` (`20.6 MB`)** | **`1,203` (`37.6 MB`)** | **`42.80M` (`~2,140/f`)** |
+| **Stage 4** (`stage=3`) | `7,517` (`15.14 MB`) | `896` (`28.0 MB`) | `490` (`15.3 MB`) | `932` (`29.1 MB`) | `38.99M` (`~1,700/f`) |
+| **Stage 5** (`stage=4`) | `8,701` (`17.53 MB`) | `471` (`14.7 MB`) | `564` (`17.6 MB`) | `919` (`28.7 MB`) | *(continues)* |
 
-## 2. Mission & Engineering Trade-Offs
+Stage 3 (the giant walking Leviathan) turns black due to **three compounding failures** firing simultaneously during the black fade-out transition between Stage 2 Boss clear and Stage 3 start (`f ≈ 25,800..26,800`):
 
-Deliver **locked, zero-lag 60 FPS gameplay (`0` dropped VBlanks in active play) with full, low-latency, zero-underrun BGM + SFX audio** on a stock **64 MB retail Original Xbox**.
-
-### Approved Engineering Sacrifices vs. Non-Negotiables
-* **Embraced Sacrifices (for Zero Gameplay Lag):**
-  1. **1:1 Hardware VBlank Lock (`59.94 Hz` NTSC / `60.00 Hz` PAL vs. `60.0184 Hz` arcade = `-0.13%` speed):** Eliminates dual-clock beat judder and `accumTicks_` slow-motion clamping completely (identical practice to official Cave console ports).
-  2. **Short Pre-Stage / Pre-Menu Loading Bursts (`!InPlay`):** Split Menu and Stages 1–5 assets into dedicated binary packs loaded in bulk during stage/menu transitions so **strictly zero disk reads or writes occur during active gameplay (`InPlay == 1`)**.
-  3. **Streamed BGM + Pre-Baked SFX Bank (Freeing `~7.5 MB` of `soundRom` RAM):** Stream looped BGM phrases on the async audio thread from a compact file/ring buffer instead of pinning `8.0 MB` `u23+u24` in RAM, reallocating that RAM to hold **100% of active VRAM pages in memory (`0` VRAM swap file)**.
-* **Non-Negotiables (Zero Compromise):**
-  - **Full BGM + SFX Audio at All Times:** Zero muted channels, zero crackles/underruns (`underruns == 0`), tight arcade SFX latency (`<= 45 ms`), bit-accurate YMZ770C mixing.
-  - **Zero Visual Glitches:** Preserve exact sprite/tilemap ordering, transparency, 2x hit-flash tint overdrive, and off-screen tilemap compositing.
-  - **64 MB Retail Xbox Compatibility:** Keep `>= 4.0 MB` free physical RAM headroom (`MmQueryStatistics`) at all times on a stock 64 MB Xbox.
-
----
-
-## 3. Pillar 1: Real-Time Wall-Clock Telemetry & VBlank-Locked Frame Pacing
-
-1. **Ground-Truth Real-Time Profiler (`xbox_profiler.h` v4 & `tools/decode_perf.py`):**
-   - Measure **end-to-end Present-to-Present wall-clock microseconds** (`wallFrameUs`) across the **entire** main loop (including `input.Poll()`, `CPU`, `NV2A Render`, `GpuWait`, and `pb_wait_for_vbl()`) using hardware `KeQueryPerformanceCounter()` (`3.579545 MHz` ACPI PMTimer).
-   - Cross-check elapsed wall-clock seconds via **`KeQuerySystemTime()`** (`100 ns` system clock) and compute **True Real-Time FPS** (`frames / wallElapsedSec`) inside `XboxPerfStats` so emulator/timer drift can never hide slowdowns.
-   - Read NV2A hardware **`pb_get_vbl_counter()`** every frame: record `vblanksElapsed` and `droppedVblanks` (`sum of max(0, vblDelta - 1)` during `inPlay && !nandBusy`). Any missed 60 Hz refresh is now caught with 100% hardware certainty.
-   - Base the gameplay-isolated histogram (`playHist[10]`, `p50`/`p95`/`p99`) and `playLagFrames` on **real `wallFrameUs` and `vblDelta > 1`**, not partial inner timers.
-2. **1:1 VBlank-Locked Tear-Free Frame Loop (`main.cpp`, `xbox_timer.h`):**
-   - Replace the conflicting `ConsumeArcadeFrame()` + unconditional `pb_wait_for_vbl()` pair with a clean **1-frame-per-VBlank pipeline**:
-     - Overlap SH-3 CPU frame `N` with NV2A GPU rasterization of frame `N-1`.
-     - Wait on `pb_wait_for_vbl()` **only** when finishing early (`vblNow == lastPresentVbl`), flip immediately without sleeping an extra frame if `vblNow > lastPresentVbl` (adaptive tear-free recovery: prevents a `16.9 ms` frame from stalling to `33.3 ms`!).
-   - Throttle `usbh_pooling_hubs()` in [`xbox_input.h`](port/nxdk/mushisam/xbox_input.h) to once every 60 frames while `padDev_ != nullptr` (button packets continue arriving every millisecond via OHCI interrupt `OnReadComplete`).
+1. **Fatal Heap OOM in `Blitter::Upload()` -> `NativeList::pixels` (`blitter.cpp:198`) While Screen Is Faded to Black:**
+   - Stage 1 telemetry already showed only **`3.9 MB` free RAM** on a 64 MB retail Xbox *before* `ImaAdpcmCache` dynamically allocates up to **`2.0 MB`** across Stages 1–2 (`~1.9 MB` free RAM left).
+   - Stage 3 uploads **`20.6 MB` (`658` pages)** of new Leviathan graphics. During Stage 3's black load transition, `Blitter::Upload()` buffers all uploaded pixels for the frame inside `std::vector<uint16_t> NativeList::pixels` (`native->pixels.resize(...)`). Doubling `std::vector` capacity (`2 MB -> 4 MB -> 8 MB` while holding both old and new buffers) exceeds the `< 2 MB` remaining heap; `malloc` returns `NULL`, and under `-fno-exceptions`, `dst[i] = Word(address)` (`blitter.cpp:207`) dereferences `nullptr` and hard-freezes while the screen is black.
+   - Even if `pixels.resize` were avoided, Stage 3's active VRAM union is **`1,203` pages (`37.6 MB`)**, exceeding `kRetailMaxAllocPages = 928` (`29.0 MB`) by **`275` pages (`8.6 MB`)**—which either zeroed Stage 3 graphics to black (before `914968f`) or triggers heavy synchronous `Z:\mushivrm.bin` HDD swap thrashing (after `914968f`).
+2. **60 Hz Infinite Failing DVD `CreateFileA("D:\\mushisam\\pak_s3.bin")` Storm (`main.cpp:210-216`):**
+   - On Stage 3 (`curStage == 2`), `curStage != loadedStagePack` (`2 != 1`) calls `board.nand.AttachStagePack("D:\\mushisam\\pak_s3.bin")`.
+   - `AttachStagePack()` (`nand.h:45`) detaches `pak_s2.bin`, calls `CreateFileA` on nonexistent `pak_s3.bin`, and returns `false` **without updating `loadedStagePack`**.
+   - As a result, `main.cpp` hammers the DVD filesystem with a failing `NtCreateFile` directory lookup **every single frame (60 Hz forever)** right while Stage 3 also streams `10,141` uncached NAND pages across 4,000 gameplay frames (`f=26,000..30,000`).
+3. **Uncompiled SH-3 Interpreter Explosion (`42.8 Million` Interpreted Blocks in Stage 3):**
+   - Because `gen/blocks.txt` ended at `frame 18,000`, Stage 2 Boss and all of Stage 3 fall back to `SH3::InterpretBlock()` (`2,140–4,890` interpreted blocks/frame), multiplying SH-3 CPU cost by 3–5× during Stage 3 load and gameplay.
 
 ---
 
-## 4. Pillar 2: Reclaiming ~8.5 MB RAM, Zero-Swap VRAM, & Preloaded Stage/Menu Packs
+## 3. Execution Pillars for Next Pass
 
-1. **Offline SFX Bank + Streamed BGM ROM (`tools/build_audio_pack.py`, `ymz770.h/.cpp`, `xbox_audio.h`):**
-   - Build a compact pre-decoded **4-bit IMA ADPCM SFX Pack (`D:\mushisam\sfx_adpcm.bin`, `~1.0–1.5 MB`)** containing all non-looped YMZ770C SFX phrases at boot, eliminating runtime capture/transcode overhead and first-play AMM decode spikes.
-   - Replace the `8.0 MB` in-RAM `board.soundRom` (`u23` + `u24`) with a unified `D:\mushisam\sound_rom.bin` streamed by the async audio thread through a small **per-channel `32 KB` read-ahead cache** (`8` channels × `32 KB` = `256 KB` total RAM, freeing **`~7.5 MB`** of main RAM!).
-   - Trim unused `Ymz770` channels `8..15` (`m_decoders`, `m_keptDecoders`, `m_block`), saving another **`~0.5 MB`**.
-2. **100% RAM-Resident Sparse VRAM Pool — Delete `Z:\mushivrm.bin` Completely (`nv2a_cv1k_renderer.h`):**
-   - Expand `kRetailMaxAllocPages` to **`1,024` pages (`32.0 MB` hot RAM pool)** while still retaining **`>= 4.5 MB` free RAM** on 64 MB retail Xbox.
-   - Remove `OpenSwapFile()`, `SwapOutPage()`, and `SwapInPage()` (`Z:\mushivrm.bin` / `E:\mushivrm.bin`) entirely, and add a **Dead-Page Stage Purge** on stage transition so stale previous-stage pages are recycled in O(1) RAM with **zero HDD swap I/O ever**.
-3. **Complete Per-Menu & Per-Stage Asset Packs (`pak_menu.bin`, `pak_s1.bin` .. `pak_s5.bin`):**
-   - Add deterministic stage-select / 5-stage sweep support in [`mushisam_fake_play.h`](port/nxdk/mushisam/mushisam_fake_play.h) and [`tests/mushisam_parity_test.cpp`](port/nxdk/mushisam/tests/mushisam_parity_test.cpp) to profile and extract **all 5 stages + Bosses + Boot/Menu** via `tools/build_stage_packs.py`.
-   - Pre-warm the stage's NAND pack + VRAM uploads in one sequential burst **before** `InPlay` begins (during stage-intro load), and defer `eeprom.FlushIfDirty()` strictly to `!InPlay` (Title / Game Over) so **disk I/O during `InPlay == 1` is strictly zero**.
+### Pillar 1 — Fix Stage 3 Crash, Eliminate `NativeList::pixels`, & Complete Menu + Stages 1–5 Packs
+1. **Zero-Copy Direct `Blitter::Upload` Streaming (Save `+4–8 MB` Transient Heap, Fix Stage 3 OOM):**
+   - Add a direct upload sink callback/interface on `Blitter` (`onUploadRow` / `Nv2aCv1kRenderer::WriteUploadRect`) so `0x2000` blitter uploads write 16-bit pixels **directly from `board.ram` into sparse 128×128 VRAM pages** (ordered accurately via `NativeList::steps` or staged page writes without buffering megabytes in `NativeList::pixels`). Shrink `NativeList::pixels` capacity to `0` bytes (`std::vector<uint16_t>().swap(nativeList.pixels)`).
+2. **Fix `loadedStagePack` Retry Bug & Build Complete `MPAK` Suite (`pak_menu.bin`, `pak_s1..s5.bin`):**
+   - Fix `main.cpp:210-216` so `loadedStagePack = curStage` is recorded on transition attempt (never retrying a missing file at 60 Hz) and attach `pak_menu.bin` when `!inPlayNow`.
+   - Extend `tools/build_stage_packs.py` using the `72,000+`-frame full-game trace (plus boss clear & attract/menu sweep) to generate `pak_menu.bin`, `pak_s1.bin`, `pak_s2.bin`, `pak_s3.bin`, `pak_s4.bin`, and `pak_s5.bin` (including Stage 3's mid-stage Leviathan waves `f=26,000..30,000` so **zero** scattered `mushisam_u2` seeks occur mid-stage).
+3. **Offline Pre-Baked `sfx_adpcm.bin` (Eliminate `2.0 MB` Dynamic `ImaAdpcmCache` Heap):**
+   - Extend `tools/build_audio_pack.py` to decode all short non-looped YMZ770 SFX phrases (`<= 32,768` samples) offline into a compact `D:\mushisam\sfx_adpcm.bin` (`~0.8–1.2 MB` flat allocation loaded once at boot), deleting runtime `m_captureBuf` / `std::vector` heap growth and first-play MPEG-2 decode spikes.
 
----
+### Pillar 2 — Direct `nxdk` Library Customizations (`nxdk/lib/...`)
+Modify the local `nxdk` submodule sources (`C:\Users\lenovo\Documents\ree\nxdk`) and rebuild the `nxdk` static libraries used by this project:
 
-## 5. Pillar 3: SH-3 CPU 2x Speedup (Eliminating All Boss & Bullet-Hell Spikes)
+1. **Reclaim `+4.31 MB` of Wasted Contiguous Physical RAM in `nxdk` (`hal/video.c` + `pbkit/pbkit.c`):**
+   - **Free Dead Boot Framebuffer (`+1.23 MB`):** Add `XVideoFreeFB()` in `nxdk/lib/hal/video.c` (or release `framebufferMemory` once `pb_show_front_screen()` switches `PCRTC_START` to `pb_FBAddr[0]`), reclaiming the dead `640×480×4B` buffer noted at `pbkit.c:2879`.
+   - **Optional No-Z Mode in `pbkit` (`+1.23 MB` + Zero Z-Tile Overhead):** Add `pb_set_depth_stencil_enable(bool enable)` in `nxdk/lib/pbkit/pbkit.h` & `pbkit.c` (`pbkit.c:3048`). When disabled (2D sprite engine with `DEPTH_TEST_ENABLE = 0`), skip `MmAllocateContiguousMemoryEx(DSSize)` (`1.23 MB`) and skip `pb_assign_tile(1, ...)` Z-compression tag traffic.
+   - **16-bit `R5G6B5` Scanout Mode (`+1.85 MB` + 50% Less NV2A Framebuffer ROP Bandwidth):** CV1000 native output is 15-bit RGB555 (`A1R5G5B5`); switching display + `pbkit` triple-buffers from 32-bit `A8R8G8B8` (`3 × 1.23 MB = 3.69 MB`) to 16-bit `R5G6B5` (`3 × 614 KB = 1.84 MB`) via `XVideoSetMode(640, 480, 16, REFRESH_DEFAULT)` + `pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false)` saves another **`+1.85 MB`** of contiguous RAM and halves backbuffer clear/fill memory bandwidth (verify tint/blend visual parity; keep 32-bit toggleable via compile flag if desired).
+   - **Expand Hot Sparse VRAM Pool to `1,184–1,216` Pages (`37.0–38.0 MB`):** Feed the reclaimed `+6.3 MB` (`+4.3 MB` `nxdk` + `+2.0 MB` `ImaAdpcmCache`/upload heap) directly into `kRetailMaxAllocPages`, raising hot VRAM residency from `928` (`29.0 MB`) to **`~1,184+` pages (`>= 37.0 MB`)** so even Stage 3's giant `1,203`-page Leviathan fits almost 100% in RAM with near-zero `Z:\mushivrm.bin` swaps!
+2. **Zero-Interrupt `pbkit` Render-Target Switch & Pushbuffer Fast Path (`nxdk/lib/pbkit/pbkit.c`):**
+   - **Eliminate 16 GPU-to-CPU Hardware Interrupts/Frame (`set_draw_buffer`):** `pbkit.c:1638-1721` currently emits `WAIT_MAKESPACE` (full 3D pipeline idle stall) + **8 `FIRE_INTERRUPT (PB_SETOUTER)` IRQ3/DPC traps** *twice per frame* (`pb_finished()` and `pb_target_back_buffer()`) just to rewrite `NV_PRAMIN` DMA context addresses. Since `pb_init()` already configures `DMA_COLOR` (`Channel 9`, `pbkit.c:2665`) across `0..MAXRAM`, replace `set_draw_buffer()`'s `PB_SETOUTER` storm with direct pushbuffer methods: `NV097_SET_SURFACE_PITCH` + `NV097_SET_SURFACE_COLOR_OFFSET = pb_FBAddr[idx] & 0x03FFFFFF` (**2 DWORDs, `0.01 µs`, zero IRQ3 traps, zero pipeline stalls**).
+   - **Disable Default `MULTISAMPLE` & `ZCULL` in `pb_init()` (`pbkit.c:3219-3233`):** Turn off `NV20_TCL_PRIMITIVE_3D_MULTISAMPLE` and `CULL_ENABLE` for pure 2D quad rasterization, and avoid unnecessary `pb_jump_to_head()` busy-wait spins (`pbkit.c:1525`) until `pb_Put` nears `pb_Tail - 64 KB`.
+3. **Single-Syscall NT File I/O & ThinLTO + Pentium III `nxdk` Archive Build (`nxdk/Makefile`):**
+   - Replace two-syscall `SetFilePointerEx` + `ReadFile`/`WriteFile` pairs (`nxdk/lib/winapi/fileio.c:259`) in `nand.h`, `ymz770.cpp`, and `nv2a_cv1k_renderer.h` with direct `NtReadFile` / `NtWriteFile` passing `&ByteOffset` in **one** kernel call (halving syscall overhead and making file reads atomic/thread-safe).
+   - Build `nxdk` C libraries (`libpbkit.lib`, `libhal.lib`, `libusb.lib`, `libwinapi.lib`, `libc.lib`) with `-O2 -march=pentium3 -msse -mmmx -mfpmath=sse -fomit-frame-pointer -flto=thin` so `pb_begin`, `pb_end`, `pb_busy`, and `XAudioProvideSamples` inline across library boundaries into `main.exe`.
 
-1. **32-Bit `int32_t cyclesLeft` Register Countdown (`tools/recomp_sh3.py`, `engine/runtime/recomp_rt.h`):**
-   - Replace stack-spilled `uint64 &cyc` across all generated functions with a register-allocated `int32_t rem` (`c.blockStop - c.cycles`) passed/updated in 32-bit GPRs (`rem -= N; if (rem > 0 && !c.interruptReady) goto L_...`), syncing `c.cycles = c.blockStop - rem` only on MMIO slow paths and function exits.
-   - Replace dual-branch `SH3::IsRam(a)` in `recomp_rt.h` with single-comparison `const uint32 off = a - 0x0C000000u; if (off < SH3::kRamSize) [[likely]]`.
-2. **5-Stage + Boss Profile-Guided `-O3` Partitioning & Zero Interpreted Blocks:**
-   - Harvest all executed blocks and hot PCs across **Boot/Menu + Stages 1–5 + Midbosses/Bosses** (explicitly capturing `0x0C09E040` and any attract/menu blocks so `interpretedBlocks == 0` on Xbox from power-on through Stage 5).
-   - Compile the top **500** gameplay & boss functions (`>= 99.5%` of active gameplay cycles) into `blocks_hot_*.cpp` with `-O3`, and compile remaining functions with `-O2` (enabled by our `+8.5 MB` RAM savings—no more slow `-Oz` on boss scripts!).
-   - Inline fast `m_pageFnPtrs` dispatch directly at `JSR @Rn` / `JMP @Rn` call sites to avoid bouncing back to `SH3::RunBlocks()`.
-3. **Native C++20 Rewrites of Top Hot Routines (`engine/game_native/mushisam_native.h`):**
-   - Disassemble, rewrite in native C++20/MMX/SSE1, and parity-verify the hottest remaining SH-3 loops (`0x0C160E1C` graphics/data unpacker, `0x0C09DE8C`, `0x0C055470`, `0x0C055800`, `0x0C05411E`), cutting worst-case boss SH-3 frame time below **`6.5 ms`**.
+### Pillar 3 — Full 5-Stage + Boss SH-3 AOT Recompilation & Native C++ Hot-Loop Rewrites
+1. **Harvest 100% of Stages 1–5 + Bosses + Attract/Menu (`0` Interpreted Blocks):**
+   - Run an `85,000+`-frame `MushisamFakePlay` sweep (plus Stage-Select jumps via `kBeginStage = 0x0C05D4E0` for all 5 stages, bosses, and game-over/menu paths) to record every reachable SH-3 block into `gen/blocks.txt` (`interpBlk == 0` across all 5 stages!).
+   - Clamp static branch following (`FollowBlock` / `recomp_sh3.py`) strictly to valid executable code ranges and safe `RamOracle` intersection across Boot + Stages 1–5 so data words are never mis-decoded as `ILLEGAL` or over-folded.
+2. **Native C++20 / MMX / SSE1 Rewrites of Top SH-3 Bottlenecks (`engine/native_cv1k/mushisam_native.h`):**
+   - Profile the full `85,000`-frame 5-stage run with `-DMUSHISAM_PROFILE_HOT` and intercept the top SH-3 CPU hotspots (`0x0C160E1C` blitter command emitter + top bullet-update, hitbox-collision, and sprite-sort loops) with verified native x86/SSE1 C++ implementations.
+   - Inline direct/hot `JSR` targets inside `recomp_sh3.py` and expand `blocks_hot.cpp` (`-O3`) to cover **>= 95%** of total dynamic SH-3 cycles while keeping `main.exe` well within our expanded RAM budget.
 
----
-
-## 6. Pillar 4: Sub-1.5 ms NV2A GPU Hardware Tilemap & Dual-Bank Sprite Atlas
-
-1. **NV2A Hardware Render-to-Texture Off-Screen Tilemap (`nv2a_cv1k_renderer.h`):**
-   - Allocate a dedicated `1024 × 512` (`1 MB` `A1R5G5B5` / `X8R8G8B8` swizzled or linear) NV2A surface for CV1000's off-screen background tilemap cache (`x = 7456..8191`).
-   - Redirect off-screen tilemap draws (`ux >= 7456`) to render **directly on the NV2A GPU** into that surface (`NV097_SET_SURFACE_COLOR_OFFSET`), and bind that surface directly when drawing background layers to the screen—eliminating `1.2–2.2 ms` of CPU `BlitVramToVram()` and `~1.0 ms` of background `AtlasCopy` every frame!
-2. **Dual-Bank (`2 × 1024 × 512`) Generational Shelf Atlas (Zero Wipe Stutter):**
-   - Partition the `1024 × 1024` (`2 MB`) sprite atlas into two `1024 × 512` banks (`bankEpoch_[0]`, `bankEpoch_[1]`).
-   - When the active bank fills, switch allocation to the opposite bank and invalidate **only** that bank's epoch while keeping all active sprites in the recently filled bank valid—eliminating the `29.6 ms` full-atlas wipe spike completely (`MaxRender < 2.5 ms`).
-
----
-
-## 7. Pillar 5: Low-Latency, Zero-Compromise Async Audio (`<= 45 ms` Latency)
-
-1. **Tight `512`-Frame AC'97 Hardware Ring (`xbox_audio.h`):**
-   - Reconfigure DMA descriptors from `8 × 1024` (`kTargetInFlight = 6`, `128 ms` latency) to **`8 × 512` stereo frames @ 48 kHz (`10.67 ms`/buffer) with `kTargetInFlight = 4` (`42.7 ms` latency)** and `Sleep(2)` polling on the `THREAD_PRIORITY_HIGHEST` audio thread.
-2. **Zero-Spike Synthesis:**
-   - Serve short SFX directly from the pre-baked RAM `sfx_adpcm.bin` bank (`< 15 µs` per block) and BGM from the per-channel `32 KB` buffered ROM reader, guaranteeing `0` underruns even across stage transitions while cutting SFX latency by **3×**.
+### Pillar 4 — NV2A GPU Render-to-Texture Off-Screen Tilemap & `< 32 ms` Event-Driven Audio
+1. **Hardware NV2A Render-to-Texture for `x=7456..8191` Off-Screen Tilemap Cache (`~1.5 ms/frame` Saved):**
+   - Using our new zero-interrupt `NV097_SET_SURFACE_COLOR_OFFSET` fast path, allocate a dedicated contiguous `A1R5G5B5` / `R5G6B5` NV2A surface for the CV1000 off-screen scrolling tilemap ring (`x=7456..8191`, `y=0..511`), routing off-screen tilemap composition quads to NV2A PGRAPH instead of CPU `BlitVramToVram()`. Keep software `BlitVramToVram` only as an automatic fallback for any rare self-overlapping or unmapped off-screen region.
+2. **Event-Driven `< 32 ms` AC'97 Audio (`3 × 512` Frames, `0` Underruns, Minimal CPU Preemption):**
+   - With `sfx_adpcm.bin` eliminating runtime SFX MPEG-2 spikes and `NtReadFile(&ByteOffset)` streamlining BGM streaming, upgrade `xbox_audio.h` from blind `Sleep(6)` polling (`85.3 ms`) to AC'97 buffer-completion IRQ / waitable kernel timer wakeup with **`3 × 512` stereo frames (`32.0 ms` latency)** and `0` underruns.
 
 ---
 
-## 8. Strict Verification Gates & Definition of Done
-
-1. **Host Differential Parity & 5-Stage Sweep (`tests/mushisam_parity_test.exe`):**
-   - `3,500`-frame differential parity against `SH3::Mode::Blocks`: **`0` mismatches**.
-   - Multi-stage (`Stages 1–5` + Bosses) benchmark: **`interpretedBlocks == 0`**, `YMZ770` audio `peakPlay > 5000`.
-2. **Live Xemu Real-Time Hardware Verification (`gdb_dump.py` + `decode_perf.py` v4 across `>= 1,500` gameplay frames):**
-   - **Real Wall-Clock FPS (`KeQuerySystemTime` & `wallFrameUs`):** **`59.8–60.1 FPS`** sustained during active gameplay (`inPlay == 1 && !nandBusy`).
-   - **Hardware VBlank Drops (`pb_get_vbl_counter`):** **`0` dropped VBlanks** (`<= 1%` tolerance under host OS jitter) during active gameplay; `p50 < 10,000 µs`, `p95 < 13,500 µs`, `p99 < 16,000 µs` (`wallFrameUs` including `input` + `CPU` + `Render`).
-   - **Zero Gameplay Disk I/O:** `nandReads` delta **`== 0`**, VRAM swap count **`== 0`** (swap file removed), EEPROM writes **`== 0`** during active gameplay.
-   - **Zero-Compromise Live Audio:** `audioPeakAmp > 5000`, `AC97 CIV` advancing continuously, `DCH == 0`, **`audioUnderruns == 0`** from boot through Stage 1–5 sweep.
-   - **64 MB Retail RAM Headroom:** `minFreeRam >= 4.0 MB` on stock 64 MB Xbox configuration; `interpretedBlocks == 0` (`lastInterpPc == 0`).
-3. **Deliverables:**
-   - Rebuild final player-ready retail `bin/default.xbe` and `mushisam-cv1000-xbox.iso` (with `FAKE_PLAY` off by default, toggleable via `R3`), shut down all Xemu processes cleanly, and save a clean local git commit.
+## 4. Strict Verification & Acceptance Criteria
+1. **Bit-Exact / Cycle-Accurate Host Differential Parity:** `mushisam_parity_test.exe --parity` passes with **`0` mismatches** across Boot, Menu, and Stages 1–5 (including native C++ hotspot hooks).
+2. **Stage 3 Black-Screen Resolution (Live Xemu Verification):** Live automated playthrough transitions cleanly from Stage 2 Boss -> Stage 3 -> Stage 3 Leviathan -> Stage 3 Boss -> Stage 4 -> Stage 5 with **visible gameplay (verified via Xemu screenshots on Stage 3!)**, **`0` black-screen hangs/crashes**, and **`0` missing/corrupted sprites or tiles**.
+3. **Zero Uncompiled SH-3 Code & Zero Gameplay Disk Stutter:**
+   - `interpBlk == 0` (or `< 5` one-shot transition blocks total) across all 5 stages on Xbox.
+   - `0` failed `CreateFileA` calls and `0` mid-stage `mushisam_u2` cache misses once a stage's `pak_s*.bin` finishes initial load; `>= 6.0 MB` free Xbox physical RAM headroom maintained throughout Stages 1–5.
+4. **Real-Time 60 Hz Wall-Clock & Audio Targets (`decode_perf.py` v4):**
+   - `EffectiveFps >= 59.4 FPS` (`DroppedVblPct <= 1.0%`) measured by real-time `KeQuerySystemTime` + `pb_get_vbl_counter()` across Stages 1, 2, and 3 heavy bullet/Leviathan scenes, with `AudioUnderruns == 0` at `<= 32–43 ms` latency.

@@ -50,7 +50,6 @@ struct NativeList {
         steps.reserve(256);
         draws.reserve(4096);
         uploads.reserve(64);
-        pixels.reserve(131072);
     }
 };
 
@@ -117,6 +116,12 @@ public:
     // the software blitter draws nothing (VRAM is then the GPU's, and `vram` is brought up to date only when asked)
     NativeList *native = nullptr;
     bool rasterize = true;
+    // Optional zero-copy direct upload sink (streams 0x2000 uploads straight from SH-3 RAM into sparse VRAM pages
+    // when no prior draws exist in the current frame, preventing multi-MB NativeList::pixels OOM spikes on Stage 3!).
+    using DirectUploadFn = void (*)(void *ctx, int32_t dstX, int32_t dstY, int32_t w, int32_t h,
+                                    const uint8_t *ram, uint32_t ramMask, uint32_t pixelAddr);
+    DirectUploadFn onDirectUpload = nullptr;
+    void *onDirectUploadCtx = nullptr;
 
     std::vector<uint16_t> vram; // kVramWidth x kVramHeight: bit 15 opaque, then red, green, blue (5 bits each)
     uint32_t scrollX = 0, scrollY = 0, clipX = 0, clipY = 0, listAddress = 0;

@@ -31,9 +31,10 @@ def main():
         u2_data = u2.read()
 
     for b_idx, pages in sorted(buckets.items()):
-        if b_idx == 0 or not pages:
-            continue  # Skip BootMenu (39 MB); split active Stage 1..5 packs
-        out_path = os.path.join(out_dir, f"pak_s{b_idx}.bin")
+        if not pages:
+            continue
+        fname = "pak_menu.bin" if b_idx == 0 else f"pak_s{b_idx}.bin"
+        out_path = os.path.join(out_dir, fname)
         with open(out_path, "wb") as out:
             out.write(struct.pack("<2I", MAGIC, len(pages)))
             out.write(struct.pack(f"<{len(pages)}I", *pages))

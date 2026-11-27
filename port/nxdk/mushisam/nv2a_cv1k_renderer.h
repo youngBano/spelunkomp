@@ -38,7 +38,7 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 928; // 928 * 32 KB = 29 MB hot RAM pool (100% Stage 1 & 2 resident, >= 3.5 MB free!)
+    static constexpr int kRetailMaxAllocPages = 768; // 768 * 32 KB = 24 MB hot RAM pool (>= 3.5 MB permanent free RAM on 64 MB Xbox!)
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
     // Dual-bank 1024x(2048+4) A1R5G5B5 NV2A shelf atlas (2 x 1024x1024 = 4 MB + 8 KB) + 8,192-slot Mix64 hash table:
@@ -155,6 +155,9 @@ public:
                 bool tateMode, bool bilinear, bool integerScale) {
         if (!atlas_) {
             list.Clear();
+        if (list.pixels.capacity() > 65536u) {
+            std::vector<uint16_t>().swap(list.pixels);
+        }
             return;
         }
 
@@ -197,7 +200,8 @@ public:
         }
         batches_.clear();
         lastDrawCount_ = list.draws.size();
-        lastUploadCount_ = static_cast<uint32_t>(list.uploads.size());
+        lastUploadCount_ = static_cast<uint32_t>(list.uploads.size()) + directUploadCount_;
+        directUploadCount_ = 0;
         lastStateChanges_ = 0;
         lastBlitVramTsc_ = 0;
         lastAtlasCopyTsc_ = 0;
@@ -222,6 +226,9 @@ public:
             }
         }
         list.Clear();
+        if (list.pixels.capacity() > 65536u) {
+            std::vector<uint16_t>().swap(list.pixels);
+        }
 
         // 3. Flush write-combined A1R5G5B5 atlas & hardware vertex buffer writes before NV2A DMA.
         _mm_sfence();
@@ -234,6 +241,39 @@ public:
         }
         SubmitDraws();
         lastPbSubmitTsc_ += ReadRdtsc() - tPb0;
+    }
+
+    static void DirectUploadCallback(void *ctx, int32_t dstX, int32_t dstY, int32_t w, int32_t h,
+                                     const uint8_t *ram, uint32_t ramMask, uint32_t pixelAddr) {
+        static_cast<Nv2aCv1kRenderer *>(ctx)->ApplyDirectUpload(dstX, dstY, w, h, ram, ramMask, pixelAddr);
+    }
+
+    void ApplyDirectUpload(int32_t dstX, int32_t dstY, int32_t w, int32_t h,
+                           const uint8_t *ram, uint32_t ramMask, uint32_t pixelAddr) {
+        if (w <= 0 || h <= 0 || !ram) {
+            return;
+        }
+        ++directUploadCount_;
+        uint32_t addr = pixelAddr;
+        for (int32_t row = 0; row < h; ++row) {
+            const int vy = (dstY + row) & (kVramH - 1);
+            const int py = vy >> kPageShift;
+            const int ly = vy & kPageMask;
+            int32_t col = 0;
+            while (col < w) {
+                const int vx = (dstX + col) & (kVramW - 1);
+                const int px = vx >> kPageShift;
+                const int lx = vx & kPageMask;
+                const int chunk = std::min<int>(w - col, kPageSize - lx);
+                uint16_t *dst = GetPageWrite(px, py) + static_cast<size_t>(ly) * kPageSize + lx;
+                for (int i = 0; i < chunk; ++i) {
+                    const uint32_t a = addr & ramMask & ~1u;
+                    addr += 2u;
+                    dst[i] = static_cast<uint16_t>((static_cast<uint16_t>(ram[a]) << 8) | ram[a + 1u]);
+                }
+                col += chunk;
+            }
+        }
     }
 
     size_t LastQuadCount() const { return vbCount_ >> 2; }
@@ -634,12 +674,16 @@ private:
         }
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
-        if (SetFilePointerEx(swapHandle_, pos, nullptr, FILE_BEGIN)) {
-            DWORD written = 0;
-            if (WriteFile(swapHandle_, src, kPageBytes, &written, nullptr) && written == kPageBytes) {
-                pageOnDisk_[logical] = 1;
-                ++swapCount_;
-            }
+        IO_STATUS_BLOCK iosb{};
+        NTSTATUS st = NtWriteFile(swapHandle_, nullptr, nullptr, nullptr, &iosb,
+                                  const_cast<uint16_t *>(src), kPageBytes, &pos);
+        if (st == STATUS_PENDING) {
+            NtWaitForSingleObject(swapHandle_, FALSE, nullptr);
+            st = iosb.Status;
+        }
+        if (NT_SUCCESS(st) && iosb.Information == kPageBytes) {
+            pageOnDisk_[logical] = 1;
+            ++swapCount_;
         }
     }
 
@@ -649,21 +693,36 @@ private:
         }
         LARGE_INTEGER pos{};
         pos.QuadPart = static_cast<LONGLONG>(logical) * static_cast<LONGLONG>(kPageBytes);
-        if (SetFilePointerEx(swapHandle_, pos, nullptr, FILE_BEGIN)) {
-            DWORD got = 0;
-            if (ReadFile(swapHandle_, dst, kPageBytes, &got, nullptr) && got == kPageBytes) {
-                ++swapCount_;
-                return true;
-            }
+        IO_STATUS_BLOCK iosb{};
+        NTSTATUS st = NtReadFile(swapHandle_, nullptr, nullptr, nullptr, &iosb,
+                                 dst, kPageBytes, &pos);
+        if (st == STATUS_PENDING) {
+            NtWaitForSingleObject(swapHandle_, FALSE, nullptr);
+            st = iosb.Status;
+        }
+        if (NT_SUCCESS(st) && iosb.Information == kPageBytes) {
+            ++swapCount_;
+            return true;
         }
         return false;
     }
 
-    // 29 MB hot RAM pool with lossless Z:\mushivrm.bin backing so evicted shared sprites are never lost!
+    // 22 MB hot RAM pool with lossless single-syscall NtReadFile/NtWriteFile Z:\mushivrm.bin backing
+    // + dynamic >= 5 MB free-RAM safety guard so OOM is mathematically impossible on 64 MB retail Xbox!
     uint16_t *AllocateOrEvictPage(int logical, bool forWrite) {
         int slot = -1;
         uint16_t *dst = nullptr;
-        if (static_cast<int>(pageData_.size()) < maxAllocPages_) {
+        bool canGrow = static_cast<int>(pageData_.size()) < maxAllocPages_;
+        if (canGrow && (pageData_.size() & 15u) == 0u && pageData_.size() >= 256u) {
+            MM_STATISTICS mm{};
+            mm.Length = sizeof(mm);
+            if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 896u) {
+                // Keep >= 3.5 MB (896 * 4 KB) physical RAM permanently free!
+                maxAllocPages_ = static_cast<int>(pageData_.size());
+                canGrow = false;
+            }
+        }
+        if (canGrow) {
             slot = static_cast<int>(pageData_.size());
             pageData_.emplace_back(kPageSize * kPageSize, 0u);
             pageLru_.push_back(++lruClock_);
@@ -1246,6 +1305,7 @@ private:
     uint32_t swapCount_ = 0;
     uint32_t lastStateChanges_ = 0;
     uint32_t lastUploadCount_ = 0;
+    uint32_t directUploadCount_ = 0;
     size_t lastDrawCount_ = 0;
     uint64_t lastBlitVramTsc_ = 0;
     uint64_t lastAtlasCopyTsc_ = 0;

@@ -499,7 +499,7 @@ OPFN(TRAPA) {
     c.TakeException(0x160, c.PC + 2);
     c.branched = true;
 }
-OPFN(ILLEGAL); // (sh3.cpp)
+void ILLEGAL(SH3 &c, uint16 op); // (sh3.cpp)
 
 #undef OPFN
 #undef N_

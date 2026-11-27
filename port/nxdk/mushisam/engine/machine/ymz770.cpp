@@ -57,6 +57,31 @@ bool Ymz770::AttachRomFile(const char *path) {
     return true;
 }
 
+bool Ymz770::LoadSfxAdpcmPack(const char *path) {
+#ifdef XBOX_FAST_CPU
+    HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 4 * 1024 * 1024) {
+        CloseHandle(h);
+        return false;
+    }
+    std::vector<uint8_t> raw(static_cast<size_t>(sz.QuadPart));
+    DWORD got = 0;
+    const BOOL ok = ReadFile(h, raw.data(), static_cast<DWORD>(raw.size()), &got, nullptr);
+    CloseHandle(h);
+    if (!ok || got != static_cast<DWORD>(raw.size())) {
+        return false;
+    }
+    return m_adpcmCache.LoadPackData(std::move(raw));
+#else
+    (void)path;
+    return false;
+#endif
+}
+
 void Ymz770::CloseRomFile() {
     if (m_romFile != INVALID_HANDLE_VALUE) {
         CloseHandle(m_romFile);
@@ -75,6 +100,18 @@ void Ymz770::CloseRomFile() {
     m_seqLen = 0;
 }
 
+static uint32_t NtReadAt(HANDLE h, uint64_t offset, void *dst, uint32_t want) {
+    LARGE_INTEGER pos{};
+    pos.QuadPart = static_cast<LONGLONG>(offset);
+    IO_STATUS_BLOCK iosb{};
+    NTSTATUS st = NtReadFile(h, nullptr, nullptr, nullptr, &iosb, dst, want, &pos);
+    if (st == STATUS_PENDING) {
+        NtWaitForSingleObject(h, FALSE, nullptr);
+        st = iosb.Status;
+    }
+    return NT_SUCCESS(st) ? static_cast<uint32_t>(iosb.Information) : 0u;
+}
+
 uint8_t Ymz770::ReadRomFileByte(uint32_t offset) const {
     if (m_romFile == INVALID_HANDLE_VALUE || offset >= romSize) {
         return 0xFF;
@@ -82,12 +119,8 @@ uint8_t Ymz770::ReadRomFileByte(uint32_t offset) const {
     auto *self = const_cast<Ymz770 *>(this);
     if (offset < self->m_seqBase || offset >= self->m_seqBase + self->m_seqLen) {
         self->m_seqBase = offset;
-        LARGE_INTEGER pos{};
-        pos.QuadPart = static_cast<LONGLONG>(offset);
-        SetFilePointerEx(self->m_romFile, pos, nullptr, FILE_BEGIN);
-        DWORD got = 0;
-        const DWORD want = static_cast<DWORD>(std::min<uint32_t>(kSeqWinBytes, romSize - offset));
-        self->m_seqLen = ReadFile(self->m_romFile, self->m_seqBuf, want, &got, nullptr) ? static_cast<uint32_t>(got) : 0u;
+        const uint32_t want = std::min<uint32_t>(kSeqWinBytes, romSize - offset);
+        self->m_seqLen = NtReadAt(self->m_romFile, offset, self->m_seqBuf, want);
     }
     return (offset >= self->m_seqBase && offset < self->m_seqBase + self->m_seqLen)
                ? self->m_seqBuf[offset - self->m_seqBase]
@@ -99,7 +132,6 @@ bool Ymz770::EnsureChannelWindow(int ch, uint32_t byteOff, bool isLooped) {
         return false;
     }
     if (isLooped) {
-        // Load entire looped BGM chunk (up to 1.5 MB) once into RAM so active gameplay has ZERO DVD audio reads!
         if (m_bgmBase != 0xFFFFFFFFu && byteOff >= m_bgmBase &&
             (byteOff + 2048u <= m_bgmBase + m_bgmLen || m_bgmBase + m_bgmLen >= romSize)) {
             return true;
@@ -107,13 +139,7 @@ bool Ymz770::EnsureChannelWindow(int ch, uint32_t byteOff, bool isLooped) {
         m_bgmBase = byteOff;
         const uint32_t want = std::min<uint32_t>(kMaxBgmCacheBytes, romSize - byteOff);
         m_bgmBuf.resize(want);
-        LARGE_INTEGER pos{};
-        pos.QuadPart = static_cast<LONGLONG>(byteOff);
-        SetFilePointerEx(m_romFile, pos, nullptr, FILE_BEGIN);
-        DWORD got = 0;
-        m_bgmLen = ReadFile(m_romFile, m_bgmBuf.data(), static_cast<DWORD>(want), &got, nullptr)
-                       ? static_cast<uint32_t>(got)
-                       : 0u;
+        m_bgmLen = NtReadAt(m_romFile, byteOff, m_bgmBuf.data(), want);
         return m_bgmLen > 0;
     }
     if (m_streamBase[ch] != 0xFFFFFFFFu && byteOff >= m_streamBase[ch] &&
@@ -121,12 +147,8 @@ bool Ymz770::EnsureChannelWindow(int ch, uint32_t byteOff, bool isLooped) {
         return true;
     }
     m_streamBase[ch] = byteOff;
-    LARGE_INTEGER pos{};
-    pos.QuadPart = static_cast<LONGLONG>(byteOff);
-    SetFilePointerEx(m_romFile, pos, nullptr, FILE_BEGIN);
-    DWORD got = 0;
-    const DWORD want = static_cast<DWORD>(std::min<uint32_t>(kStreamWinBytes, romSize - byteOff));
-    m_streamLen[ch] = ReadFile(m_romFile, m_streamBuf[ch].data(), want, &got, nullptr) ? static_cast<uint32_t>(got) : 0u;
+    const uint32_t want = std::min<uint32_t>(kStreamWinBytes, romSize - byteOff);
+    m_streamLen[ch] = NtReadAt(m_romFile, byteOff, m_streamBuf[ch].data(), want);
     return m_streamLen[ch] > 0;
 }
 #endif

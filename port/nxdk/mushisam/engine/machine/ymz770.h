@@ -19,6 +19,7 @@
 #include <vector>
 #ifdef NXDK
 #include <windows.h>
+#include <xboxkrnl/xboxkrnl.h>
 #endif
 
 namespace spelunk {
@@ -35,6 +36,7 @@ public:
     uint32_t romSize = 0;
 #ifdef NXDK
     bool AttachRomFile(const char *path);
+    bool LoadSfxAdpcmPack(const char *path);
     void CloseRomFile();
 #endif
     void Reset();

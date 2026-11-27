@@ -17,6 +17,7 @@
 #include <vector>
 #ifdef NXDK
 #include <windows.h>
+#include <xboxkrnl/xboxkrnl.h>
 #endif
 
 namespace spelunk {
@@ -421,18 +422,23 @@ private:
         slot.lru = ++m_lruClock;
         ++cacheMisses;
 #ifdef NXDK
-        // Fast contiguous per-stage pack lookup (zero random seeks across 132 MB mushisam_u2!).
+        // Fast contiguous per-stage pack lookup (zero random seeks across 132 MB mushisam_u2!)
+        // Uses single-syscall NtReadFile(&pos) instead of 2-syscall SetFilePointerEx + ReadFile.
         if (m_packHandle != INVALID_HANDLE_VALUE && pageIdx < m_packLut.size() && m_packLut[pageIdx] != 0xFFFFu) {
             const size_t pOff = m_packDataOff + static_cast<size_t>(m_packLut[pageIdx]) * kPageTotal;
             if (pOff < m_packRaOff || pOff + kPageTotal > m_packRaOff + m_packRaLen) {
                 m_packRaOff = pOff;
                 LARGE_INTEGER pos{};
                 pos.QuadPart = static_cast<LONGLONG>(m_packRaOff);
-                SetFilePointerEx(m_packHandle, pos, nullptr, FILE_BEGIN);
-                DWORD got = 0;
-                m_packRaLen = ReadFile(m_packHandle, m_raBuf, static_cast<DWORD>(sizeof(m_raBuf)), &got, nullptr)
-                                  ? static_cast<size_t>(got)
-                                  : 0u;
+                IO_STATUS_BLOCK iosb{};
+                NTSTATUS st = NtReadFile(m_packHandle, nullptr, nullptr, nullptr, &iosb,
+                                         m_raBuf, static_cast<ULONG>(sizeof(m_raBuf)), &pos);
+                if (st == STATUS_PENDING) {
+                    NtWaitForSingleObject(m_packHandle, FALSE, nullptr);
+                    st = iosb.Status;
+                }
+                m_packRaLen = NT_SUCCESS(st) ? static_cast<size_t>(iosb.Information) : 0u;
+                m_raLen = 0; // m_raBuf now holds pack data; invalidate m_handle read-ahead!
             }
             const size_t avail = (pOff < m_packRaOff + m_packRaLen) ? (m_packRaOff + m_packRaLen - pOff) : 0;
             const size_t copyLen = avail < kPageTotal ? avail : kPageTotal;
@@ -449,17 +455,21 @@ private:
 #endif
         const size_t off = static_cast<size_t>(pageIdx) * kPageTotal;
         if (off < m_fileSize) {
-            // 128 KB sequential read-ahead eliminates per-page Xbox DVD fseek/fread stalls.
+            // 256 KB sequential read-ahead eliminates per-page Xbox DVD fseek/fread stalls.
             if (off < m_raOff || off + kPageTotal > m_raOff + m_raLen) {
                 m_raOff = off;
 #ifdef NXDK
                 LARGE_INTEGER pos{};
                 pos.QuadPart = static_cast<LONGLONG>(m_raOff);
-                SetFilePointerEx(m_handle, pos, nullptr, FILE_BEGIN);
-                DWORD got = 0;
-                m_raLen = ReadFile(m_handle, m_raBuf, static_cast<DWORD>(sizeof(m_raBuf)), &got, nullptr)
-                              ? static_cast<size_t>(got)
-                              : 0u;
+                IO_STATUS_BLOCK iosb{};
+                NTSTATUS st = NtReadFile(m_handle, nullptr, nullptr, nullptr, &iosb,
+                                         m_raBuf, static_cast<ULONG>(sizeof(m_raBuf)), &pos);
+                if (st == STATUS_PENDING) {
+                    NtWaitForSingleObject(m_handle, FALSE, nullptr);
+                    st = iosb.Status;
+                }
+                m_raLen = NT_SUCCESS(st) ? static_cast<size_t>(iosb.Information) : 0u;
+                m_packRaLen = 0; // m_raBuf now holds m_handle data; invalidate pack read-ahead!
 #else
                 std::fseek(m_file, static_cast<long>(m_raOff), SEEK_SET);
                 m_raLen = std::fread(m_raBuf, 1, sizeof(m_raBuf), m_file);

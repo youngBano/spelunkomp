@@ -259,6 +259,13 @@ void SH3::RunBlocks(uint64 stop) {
                 continue;
             }
 #endif
+#ifdef XBOX_START_STAGE
+            if (PC == 0x0C05BCB0u && PR == 0x0C0D8436u) {
+                R[4] = static_cast<uint32>(XBOX_START_STAGE);
+            } else if (PC == 0x0C05D4E0u && R[5] == 0u) {
+                R[5] = static_cast<uint32>(XBOX_START_STAGE);
+            }
+#endif
             if ((PC & 0xFF800000u) == 0x0C000000u) [[likely]] {
                 const uint32 phys = PC & (kRamSize - 1);
                 if (BlockFn *fnSlots = m_pageFnPtrs[phys >> 12]) [[likely]] {

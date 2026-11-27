@@ -25,10 +25,10 @@ namespace spelunk_xbox {
 
 class XboxAudio {
 public:
-    static constexpr uint32_t kNumBuffers = 8;        // 8 x 1024 stereo frames @ 48 kHz = 170.7 ms total ring
-    static constexpr uint32_t kTargetInFlight = 4;    // Keep 4 buffers queued (~85.3 ms cushion, 0 underruns across boot/loads)
-    static constexpr uint32_t kBufFrames48k = 1024;   // 21.33 ms per descriptor (low single-core preemption overhead)
-    static constexpr uint32_t kBufBytes = kBufFrames48k * 2 * sizeof(int16_t); // 4096 bytes
+    static constexpr uint32_t kNumBuffers = 8;        // 8 x 512 stereo frames @ 48 kHz = 85.3 ms total ring
+    static constexpr uint32_t kTargetInFlight = 4;    // Keep 4 buffers queued (~42.7 ms crisp arcade latency, < 45 ms target!)
+    static constexpr uint32_t kBufFrames48k = 512;    // 10.67 ms per descriptor
+    static constexpr uint32_t kBufBytes = kBufFrames48k * 2 * sizeof(int16_t); // 2048 bytes
     static constexpr uint32_t kCmdQueueSize = 2048;   // Lock-free SPSC YMZ770 register write queue
     static constexpr uint32_t kCmdQueueMask = kCmdQueueSize - 1;
     static constexpr uint32_t kMonoBufSize = 2048;    // Up to 48kHz -> 1024+4 samples per DMA descriptor
@@ -254,8 +254,8 @@ private:
                 }
             }
 
-            // Sleep 6 ms (~3.5x faster than 21.33 ms per descriptor): minimal single-core context switches, 0 underruns!
-            Sleep(6);
+            // Sleep 4 ms (~2.7x faster than 10.67 ms descriptor, ~8x per 32 ms cushion): crisp latency, low PIII preemption!
+            Sleep(4);
         }
     }
 

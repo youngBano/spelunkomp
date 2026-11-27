@@ -65,6 +65,7 @@ bool LoadMushisamRoms(spelunk::Cv1000 &board) {
         debugPrint("Mushihimesama: failed streaming D:\\mushisam\\sound_rom.bin\n");
         return false;
     }
+    board.sound.LoadSfxAdpcmPack("D:\\mushisam\\sfx_adpcm.bin");
     if (!board.nand.AttachFile("D:\\mushisam\\mushisam_u2")) {
         debugPrint("Mushihimesama: failed streaming D:\\mushisam\\mushisam_u2\n");
         return false;
@@ -75,7 +76,9 @@ bool LoadMushisamRoms(spelunk::Cv1000 &board) {
 } // namespace
 
 int main(void) {
-    XVideoSetMode(640, 480, 32, REFRESH_DEFAULT);
+    // 16-bit R5G6B5 display matches CV1000's native 15-bit RGB555 output while saving +1.85 MB RAM
+    // and halving NV2A ROP bandwidth vs 32-bit A8R8G8B8!
+    XVideoSetMode(640, 480, 16, REFRESH_DEFAULT);
 
     // Heap-allocate large CV1000/renderer objects so the 64 KB Xbox main thread stack never overflows.
     auto boardPtr = std::make_unique<spelunk::Cv1000>();
@@ -98,6 +101,10 @@ int main(void) {
     spelunk_xbox::XboxEeprom eeprom;
     eeprom.Load(board.rtc);
 
+    pb_set_color_format(NV097_SET_SURFACE_FORMAT_COLOR_LE_R5G6B5, false);
+#ifdef XBOX_CUSTOM_NXDK
+    pb_set_depth_stencil_enable(false); // 2D CV1000 renderer uses no Z/stencil: saves +1.23 MB contiguous RAM!
+#endif
     if (pb_init() != 0) {
         debugPrint("Mushihimesama: pb_init failed\n");
         while (true) {
@@ -105,6 +112,9 @@ int main(void) {
         }
     }
     pb_show_front_screen();
+#ifdef XBOX_CUSTOM_NXDK
+    XVideoFreeFB(); // Reclaim dead boot framebuffer after PCRTC_START switches to pb_FBAddr[0] (+0.61-1.23 MB)!
+#endif
 
     auto inputPtr = std::make_unique<spelunk_xbox::XboxInput>();
     auto &input = *inputPtr;
@@ -126,6 +136,8 @@ int main(void) {
             Sleep(1000);
         }
     }
+    board.blitter.onDirectUpload = &spelunk_xbox::Nv2aCv1kRenderer::DirectUploadCallback;
+    board.blitter.onDirectUploadCtx = &renderer;
 
     spelunk_xbox::XboxTimer timer;
     timer.Init();
@@ -207,12 +219,17 @@ int main(void) {
         if (!inPlayNow && (board.frame & 127u) == 0u) {
             eeprom.FlushIfDirty(board.rtc);
         }
-        if (inPlayNow && curStage != loadedStagePack) {
+        const uint32_t desiredPack = inPlayNow ? (curStage + 1u) : 0u;
+        if (desiredPack != loadedStagePack) {
+            // Update loadedStagePack unconditionally so a missing pack NEVER triggers a 60 Hz CreateFileA storm!
+            loadedStagePack = desiredPack;
             char packPath[64];
-            std::snprintf(packPath, sizeof(packPath), "D:\\mushisam\\pak_s%u.bin", curStage + 1u);
-            if (board.nand.AttachStagePack(packPath)) {
-                loadedStagePack = curStage;
+            if (desiredPack == 0u) {
+                std::snprintf(packPath, sizeof(packPath), "D:\\mushisam\\pak_menu.bin");
+            } else {
+                std::snprintf(packPath, sizeof(packPath), "D:\\mushisam\\pak_s%u.bin", desiredPack);
             }
+            board.nand.AttachStagePack(packPath);
         }
         const uint64_t cpuTicks = spelunk_xbox::XboxTimer::NowTicks() - tCpu0;
         (void)pmc0_b;

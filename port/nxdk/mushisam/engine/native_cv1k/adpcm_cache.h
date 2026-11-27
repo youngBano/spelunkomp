@@ -19,8 +19,24 @@ public:
         uint8_t state = 0; // 0 = unknown, 1 = cached ADPCM, 2 = too long (stream via AMM)
         uint32_t sampleRate = 16000u;
         uint32_t totalSamples = 0;
+        const uint8_t *flatPtr = nullptr;
+        uint32_t flatBytes = 0;
         std::vector<uint8_t> adpcm;
     };
+
+    struct DiskHeader {
+        uint32_t magic;      // 0x4D435041 ('APCM')
+        uint32_t count;      // <= 256
+        uint32_t totalBytes; // flat ADPCM payload bytes
+    };
+    struct DiskEntry {
+        uint32_t phrase;
+        uint32_t sampleRate;
+        uint32_t totalSamples;
+        uint32_t dataOff;
+        uint32_t dataBytes;
+    };
+    static constexpr uint32_t kPackMagic = 0x4D435041u; // 'APCM'
 
     struct DecoderState {
         int32_t pred = 0;
@@ -34,13 +50,57 @@ public:
     };
 
     void Reset() {
+        if (m_prebaked) {
+            return; // Keep pre-baked flat sfx_adpcm.bin resident across Ymz770::Reset()!
+        }
         for (auto &e : m_entries) {
             e.state = 0;
             e.sampleRate = 16000u;
             e.totalSamples = 0;
+            e.flatPtr = nullptr;
+            e.flatBytes = 0;
             e.adpcm.clear();
         }
         m_usedBytes = 0;
+    }
+
+    bool IsPrebaked() const { return m_prebaked; }
+
+    bool LoadPackData(std::vector<uint8_t> &&raw) {
+        if (raw.size() < sizeof(DiskHeader)) {
+            return false;
+        }
+        DiskHeader hdr{};
+        std::memcpy(&hdr, raw.data(), sizeof(hdr));
+        if (hdr.magic != kPackMagic || hdr.count == 0 || hdr.count > 256u) {
+            return false;
+        }
+        const size_t dataBase = sizeof(DiskHeader) + static_cast<size_t>(hdr.count) * sizeof(DiskEntry);
+        if (dataBase + hdr.totalBytes > raw.size()) {
+            return false;
+        }
+        m_prebaked = false;
+        Reset();
+        m_flatPack = std::move(raw);
+        for (auto &e : m_entries) {
+            e.state = 2; // Any phrase not in pre-baked pack is streamed (BGM / long voice)
+        }
+        const auto *entries = reinterpret_cast<const DiskEntry *>(m_flatPack.data() + sizeof(DiskHeader));
+        const uint8_t *payload = m_flatPack.data() + dataBase;
+        for (uint32_t i = 0; i < hdr.count; ++i) {
+            const DiskEntry &de = entries[i];
+            if (de.phrase < 256u && de.dataOff + de.dataBytes <= hdr.totalBytes) {
+                PhraseEntry &e = m_entries[de.phrase];
+                e.state = 1;
+                e.sampleRate = de.sampleRate;
+                e.totalSamples = de.totalSamples;
+                e.flatPtr = payload + de.dataOff;
+                e.flatBytes = de.dataBytes;
+            }
+        }
+        m_usedBytes = m_flatPack.size();
+        m_prebaked = true;
+        return true;
     }
 
     const PhraseEntry *Get(uint8_t phrase) const {
@@ -94,7 +154,7 @@ public:
         int32_t pred = st.pred;
         int32_t stepIdx = st.stepIdx;
         uint32_t pos = st.samplePos;
-        const uint8_t *src = e.adpcm.data();
+        const uint8_t *src = e.flatPtr ? e.flatPtr : e.adpcm.data();
         for (uint32_t i = 0; i < n; ++i, ++pos) {
             const uint8_t byte = src[pos >> 1];
             const uint8_t nib = (pos & 1u) ? (byte >> 4) : (byte & 0x0Fu);
@@ -154,7 +214,9 @@ private:
     }
 
     PhraseEntry m_entries[256];
+    std::vector<uint8_t> m_flatPack;
     size_t m_usedBytes = 0;
+    bool m_prebaked = false;
 };
 
 } // namespace spelunk

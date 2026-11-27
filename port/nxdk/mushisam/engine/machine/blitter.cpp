@@ -192,30 +192,40 @@ void Blitter::Upload(uint32_t &address) {
     // (the native list takes what lies inside VRAM; a picture that runs off its right edge is cut there)
     const uint32_t nativeW = std::min(dimX, static_cast<uint32_t>(kVramWidth) - dstX);
     const uint32_t nativeH = std::min(dimY, static_cast<uint32_t>(kVramHeight) - dstY);
+    const bool useDirectUpload = (!rasterize && native && onDirectUpload && native->draws.empty() &&
+                                  nativeW == dimX && nativeH == dimY);
     size_t nativeAt = 0;
-    if (native) {
-        nativeAt = native->pixels.size();
-        native->pixels.resize(nativeAt + static_cast<size_t>(nativeW) * nativeH);
-        native->uploads.push_back({static_cast<int32_t>(dstX), static_cast<int32_t>(dstY), static_cast<int32_t>(nativeW), static_cast<int32_t>(nativeH), nativeAt});
-        native->steps.push_back({true, static_cast<uint32_t>(native->uploads.size() - 1), 1});
-    }
-    if (!rasterize && native && nativeW == dimX && nativeH == dimY) {
-        // Fast path for native Xbox NV2A mode (zero per-pixel branches).
-        uint16_t *dst = native->pixels.data() + nativeAt;
-        const uint32_t count = dimX * dimY;
-        for (uint32_t i = 0; i < count; ++i) {
-            dst[i] = Word(address);
-        }
+    if (useDirectUpload) {
+        // Zero-copy fast path: stream straight from SH-3 RAM into sparse VRAM pages (0 B NativeList::pixels!).
+        onDirectUpload(onDirectUploadCtx, static_cast<int32_t>(dstX), static_cast<int32_t>(dstY),
+                       static_cast<int32_t>(nativeW), static_cast<int32_t>(nativeH),
+                       ram, ramMask, address);
+        address += dimX * dimY * 2u;
     } else {
-        for (uint32_t y = 0; y < dimY; y++) {
-            size_t at = static_cast<size_t>(dstY + y) * kVramWidth + dstX;
-            for (uint32_t x = 0; x < dimX; x++, at++) {
-                const uint16_t pen = Word(address);
-                if (rasterize && at < vram.size()) {
-                    vram[at] = pen;
-                }
-                if (native && x < nativeW && y < nativeH) {
-                    native->pixels[nativeAt + static_cast<size_t>(y) * nativeW + x] = pen;
+        if (native) {
+            nativeAt = native->pixels.size();
+            native->pixels.resize(nativeAt + static_cast<size_t>(nativeW) * nativeH);
+            native->uploads.push_back({static_cast<int32_t>(dstX), static_cast<int32_t>(dstY), static_cast<int32_t>(nativeW), static_cast<int32_t>(nativeH), nativeAt});
+            native->steps.push_back({true, static_cast<uint32_t>(native->uploads.size() - 1), 1});
+        }
+        if (!rasterize && native && nativeW == dimX && nativeH == dimY) {
+            // Fast path for native Xbox NV2A mode (zero per-pixel branches).
+            uint16_t *dst = native->pixels.data() + nativeAt;
+            const uint32_t count = dimX * dimY;
+            for (uint32_t i = 0; i < count; ++i) {
+                dst[i] = Word(address);
+            }
+        } else {
+            for (uint32_t y = 0; y < dimY; y++) {
+                size_t at = static_cast<size_t>(dstY + y) * kVramWidth + dstX;
+                for (uint32_t x = 0; x < dimX; x++, at++) {
+                    const uint16_t pen = Word(address);
+                    if (rasterize && at < vram.size()) {
+                        vram[at] = pen;
+                    }
+                    if (native && x < nativeW && y < nativeH) {
+                        native->pixels[nativeAt + static_cast<size_t>(y) * nativeW + x] = pen;
+                    }
                 }
             }
         }

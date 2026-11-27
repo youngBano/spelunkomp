@@ -457,7 +457,7 @@ def emit_insn_direct(name, op, a, oracle, used_regs, use_t_ref):
     return None
 
 
-def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set):
+def emit_function(root_pc, members, blocks_by_pc, table, oracle, owner):
     """Emit a whole-function C++20 routine F_<root_pc>(SH3 &c)."""
     member_set = set(members)
     used_regs = set()
@@ -486,14 +486,8 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
                     f"{pad}__FLUSH_RETURN__",
                 ]
             return [f"{pad}goto L_{target_pc:08X};"]
-        # Cross-function tail-call chaining when target is a known compiled function root!
-        if target_pc in func_roots_set and target_pc != root_pc:
-            return [
-                f"{pad}c.PC = 0x{target_pc:08X}u;",
-                f"{pad}__FLUSH__",
-                f"{pad}if (rem > 0 && !c.interruptReady) {{ F_{target_pc:08X}(c); return; }}",
-                f"{pad}return;",
-            ]
+        # Return to RunNative() iterative dispatcher for cross-function branches so
+        # mutual cross-function loops NEVER recurse on the 64 KB Original Xbox stack!
         return [f"{pad}c.PC = 0x{target_pc:08X}u;", f"{pad}__FLUSH_RETURN__"]
 
     for pc in members:
@@ -583,12 +577,14 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, func_roots_set)
             blines.append(f"    c.PR = 0x{tfall:08X}u;")
             blines.extend(emit_one(sname, tslot, u32(ta + 2), 4))
             blines.append(f"    rem -= {scyc + tcyc};")
-            # Direct C++ call if target is a known compiled function root!
-            if ttgt is not None and ttgt in func_roots_set:
+            # Direct C++ call ONLY for non-self BSR/JSR calls when target is a known function root
+            # (bounded SH-3 call depth keeps stack usage < 4 KB on the 64 KB Original Xbox stack!).
+            if ttgt is not None and ttgt in owner and owner[ttgt] != root_pc and ttgt == owner[ttgt]:
+                callee_root = owner[ttgt]
                 blines.append(f"    c.PC = 0x{ttgt:08X}u;")
                 blines.append("    __FLUSH__")
                 blines.append(f"    if (rem > 0 && !c.interruptReady) {{")
-                blines.append(f"        F_{ttgt:08X}(c);")
+                blines.append(f"        F_{callee_root:08X}(c);")
                 blines.append("        if (c.PC == 0x%08Xu && c.cycles < c.blockStop && !c.interruptReady) {" % tfall)
                 if tfall in member_set:
                     blines.append("            __RELOAD__")
@@ -790,7 +786,7 @@ def main():
     for tu_idx, (fname, fgroup) in enumerate(tu_groups):
         lines = list(header)
         for r, members in fgroup:
-            lines.extend(emit_function(r, members, blocks_by_pc, table, oracle, func_roots_set))
+            lines.extend(emit_function(r, members, blocks_by_pc, table, oracle, owner))
             lines.append("")
         lines.append(f"const NativeBlock *Blocks{tu_idx}(size_t &count);")
         lines.append(f"static const NativeBlock kBlocks{tu_idx}[] = {{")

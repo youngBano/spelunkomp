@@ -13,6 +13,7 @@
 //       port/nxdk/mushisam/gen/blocks_*.cpp \
 //       port/nxdk/mushisam/gen/registry.cpp \
 //       -o port/nxdk/mushisam/tests/mushisam_parity_test.exe
+#include "machine/amm_decoder.h"
 #include "machine/cv1000.h"
 #include "mushisam_fake_play.h"
 
@@ -116,6 +117,7 @@ int main(int argc, char **argv) {
     std::string dumpRamPath;
     std::string dumpBlocksPath;
     std::string dumpAssetsPath;
+    std::string dumpSfxPath;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -133,6 +135,8 @@ int main(int argc, char **argv) {
             dumpBlocksPath = argv[++i];
         } else if (a == "--dump-assets" && i + 1 < argc) {
             dumpAssetsPath = argv[++i];
+        } else if (a == "--dump-sfx" && i + 1 < argc) {
+            dumpSfxPath = argv[++i];
         }
     }
 
@@ -229,6 +233,70 @@ int main(int argc, char **argv) {
     auto &board = *boardPtr;
     if (!LoadRoms(board, romDir)) {
         return 2;
+    }
+    if (!dumpSfxPath.empty()) {
+        // Offline pre-bake all short YMZ770 SFX phrases (<= 32,768 samples) into flat 4-bit IMA-ADPCM sfx_adpcm.bin.
+        const uint8_t *rom = board.soundRom.data();
+        const uint32_t romSize = static_cast<uint32_t>(board.soundRom.size());
+        std::vector<spelunk::ImaAdpcmCache::DiskEntry> entries;
+        std::vector<uint8_t> payload;
+        spelunk::ImaAdpcmCache enc;
+        std::vector<int16_t> pcm;
+        std::vector<int16_t> block(0x1000, 0);
+        for (uint32_t p = 0; p < 256u; ++p) {
+            const uint32_t off = (static_cast<uint32_t>(rom[4u * p + 1u]) << 16) |
+                                 (static_cast<uint32_t>(rom[4u * p + 2u]) << 8) |
+                                 static_cast<uint32_t>(rom[4u * p + 3u]);
+            if (off == 0u || off >= romSize) continue;
+            spelunk::AmmDecoder dec(rom);
+            int bitPos = static_cast<int>(off * 8u);
+            const int endBit = static_cast<int>(romSize * 8u);
+            int tableIdx = 0;
+            uint32_t rate = 16000u;
+            pcm.clear();
+            bool tooLong = false;
+            for (int iter = 0; iter < 64; ++iter) {
+                const int made = dec.DecodeFrame(bitPos, endBit, block.data(), tableIdx);
+                if (dec.Rate() > 0) rate = static_cast<uint32_t>(dec.Rate());
+                if (made <= 0) break;
+                if (pcm.size() + static_cast<size_t>(made) > spelunk::ImaAdpcmCache::kMaxSfxSamples) {
+                    tooLong = true;
+                    break;
+                }
+                pcm.insert(pcm.end(), block.data(), block.data() + made);
+                if (made < 1152) break;
+            }
+            if (!tooLong && !pcm.empty()) {
+                enc.Reset();
+                if (enc.StorePcm(static_cast<uint8_t>(p), rate, pcm.data(), static_cast<uint32_t>(pcm.size()))) {
+                    const auto *pe = enc.Get(static_cast<uint8_t>(p));
+                    if (pe && !pe->adpcm.empty()) {
+                        spelunk::ImaAdpcmCache::DiskEntry de{};
+                        de.phrase = p;
+                        de.sampleRate = pe->sampleRate;
+                        de.totalSamples = pe->totalSamples;
+                        de.dataOff = static_cast<uint32_t>(payload.size());
+                        de.dataBytes = static_cast<uint32_t>(pe->adpcm.size());
+                        entries.push_back(de);
+                        payload.insert(payload.end(), pe->adpcm.begin(), pe->adpcm.end());
+                    }
+                }
+            }
+        }
+        spelunk::ImaAdpcmCache::DiskHeader hdr{};
+        hdr.magic = spelunk::ImaAdpcmCache::kPackMagic;
+        hdr.count = static_cast<uint32_t>(entries.size());
+        hdr.totalBytes = static_cast<uint32_t>(payload.size());
+        FILE *sf = std::fopen(dumpSfxPath.c_str(), "wb");
+        if (sf) {
+            std::fwrite(&hdr, sizeof(hdr), 1, sf);
+            std::fwrite(entries.data(), sizeof(spelunk::ImaAdpcmCache::DiskEntry), entries.size(), sf);
+            std::fwrite(payload.data(), 1, payload.size(), sf);
+            std::fclose(sf);
+            std::printf("Wrote %s: %u SFX phrases (%.2f KB flat ADPCM)\n",
+                        dumpSfxPath.c_str(), hdr.count,
+                        (sizeof(hdr) + entries.size() * sizeof(spelunk::ImaAdpcmCache::DiskEntry) + payload.size()) / 1024.0);
+        }
     }
     spelunk::NativeList nl;
     nl.Reserve();
