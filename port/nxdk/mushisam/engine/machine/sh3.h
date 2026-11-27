@@ -511,6 +511,8 @@ public:
     void WriteSlowPublic(uint32 a, uint32 v, unsigned size) { WriteSlow(a, v, size); }
 
     using BlockFn = void (*)(SH3 &);
+    uint32 indirectDepth = 0;
+    bool DispatchIndirect(uint32 target);
 
 private:
     std::unordered_map<uint32, std::pair<NativeCall, void *>> m_nativeCalls;

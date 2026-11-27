@@ -158,6 +158,7 @@ int main(void) {
     bool integerScale = false;
     bool prevRb = false;
     bool prevLb = false;
+    bool prevLt = false;
     bool prevL3 = false;
     bool prevR3 = false;
     uint32_t loadedStagePack = 0xFFFFFFFFu;
@@ -175,6 +176,8 @@ int main(void) {
         prevRb = pad.black;
         if (pad.white && !prevLb) bilinear = !bilinear;
         prevLb = pad.white;
+        if (pad.lTrigger && !prevLt) board.noSlowdown = !board.noSlowdown;
+        prevLt = pad.lTrigger;
         if (pad.l3 && !prevL3) integerScale = !integerScale;
         prevL3 = pad.l3;
         if (pad.r3 && !prevR3) {
@@ -246,17 +249,22 @@ int main(void) {
 
         // Overlap NV2A rasterization of frame N-1 with BOTH SH-3 CPU AND CPU-side tilemap/atlas prep of frame N!
         const uint64_t tRen0 = spelunk_xbox::XboxTimer::NowTicks();
-        if (renderer.Render(board.blitter, nativeList, tateMode, bilinear, integerScale)) {
+        uint64_t pbFinishTicks = 0;
+        if (renderer.Render(board.blitter, nativeList, tateMode, bilinear, integerScale, board.noSlowdown)) {
+            const uint64_t tFin0 = spelunk_xbox::XboxTimer::NowTicks();
             while (pb_finished()) {
             }
+            pbFinishTicks = spelunk_xbox::XboxTimer::NowTicks() - tFin0;
         }
         const uint64_t renTotalTicks = spelunk_xbox::XboxTimer::NowTicks() - tRen0;
-        const uint32_t gpuWaitUs = static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastGpuWaitTsc()));
+        const uint32_t gpuWaitUs = static_cast<uint32_t>(timer.RdtscToMicros(renderer.LastGpuWaitTsc()) +
+                                                         timer.TicksToMicros(pbFinishTicks));
         const uint32_t renTotalUs = static_cast<uint32_t>(timer.TicksToMicros(renTotalTicks));
         const uint32_t renOnlyUs = (renTotalUs > gpuWaitUs) ? (renTotalUs - gpuWaitUs) : 0u;
         const uint64_t workTicks = spelunk_xbox::XboxTimer::NowTicks() - tLoop0;
 
-        // Adaptive 1:1 VBlank sync: wait ONLY if we finished before the next VBlank; never double-sleep to 33.3 ms!
+        // Adaptive 1:1 VBlank sync: wait ONLY if no VBlank fired yet (NtPulseEvent is edge-triggered,
+        // so calling pb_wait_for_vbl() unconditionally after a late frame sleeps an extra 16.67 ms!).
         uint32_t vblNow = pb_get_vbl_counter();
         if (vblNow == lastVbl) {
             vblNow = pb_wait_for_vbl();

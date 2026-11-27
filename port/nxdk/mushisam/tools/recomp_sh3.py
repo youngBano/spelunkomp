@@ -457,7 +457,7 @@ def emit_insn_direct(name, op, a, oracle, used_regs, use_t_ref):
     return None
 
 
-def emit_function(root_pc, members, blocks_by_pc, table, oracle, owner):
+def emit_function(root_pc, members, blocks_by_pc, table, oracle, owner, is_hot=False):
     """Emit a whole-function C++20 routine F_<root_pc>(SH3 &c)."""
     member_set = set(members)
     used_regs = set()
@@ -517,6 +517,21 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, owner):
             blines.extend([
                 "    __FLUSH__",
                 "    if (game_native::FastMemsetByteLoop(c)) return;",
+            ])
+        elif pc == 0x0C0555DC:
+            blines.extend([
+                "    __FLUSH__",
+                "    if (game_native::FastSpritePivot(c)) return;",
+            ])
+        elif pc == 0x0C0556C8:
+            blines.extend([
+                "    __FLUSH__",
+                "    if (game_native::FastSpriteBlendFlags(c)) return;",
+            ])
+        elif pc == 0x0C0557D8:
+            blines.extend([
+                "    __FLUSH__",
+                "    if (game_native::FastEmitBlitCmd(c)) return;",
             ])
 
         pending_cyc = 0
@@ -594,6 +609,18 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, owner):
                 blines.append("        }")
                 blines.append("    }")
                 blines.append("    return;")
+            elif is_hot and tname == "JSR" and tfall in member_set:
+                # Fast bounded indirect C++ call in hot functions only (zero cold-TU bloat;
+                # keeps Pentium III RSB hot on 0x0C05410E, 0x0C0A9522, 0x0C059F60!).
+                blines.append("    c.PC = _tgt;")
+                blines.append("    __FLUSH__")
+                blines.append("    if (rem > 0 && !c.interruptReady && c.DispatchIndirect(_tgt)) {")
+                blines.append("        if (c.PC == 0x%08Xu && c.cycles < c.blockStop && !c.interruptReady) {" % tfall)
+                blines.append("            __RELOAD__")
+                blines.append(f"            goto L_{tfall:08X};")
+                blines.append("        }")
+                blines.append("    }")
+                blines.append("    return;")
             else:
                 tgt_expr = f"0x{ttgt:08X}u" if tname == "BSR" else "_tgt"
                 blines.append(f"    c.PC = {tgt_expr};")
@@ -622,7 +649,15 @@ def emit_function(root_pc, members, blocks_by_pc, table, oracle, owner):
             blines.extend(emit_one(sname, tslot, u32(ta + 2), 4))
             blines.append(f"    rem -= {scyc + tcyc};")
             blines.append("    c.PC = _tgt;")
-            blines.append("    __FLUSH_RETURN__")
+            if tname == "JMP" and pc in (0x0C0557D8, 0x0C0555E6):
+                # Tail-dispatch computed jump tables directly so callers' direct-call return checks succeed!
+                blines.append("    __FLUSH__")
+                blines.append("    if (rem > 0 && !c.interruptReady) {")
+                blines.append("        c.DispatchIndirect(_tgt);")
+                blines.append("    }")
+                blines.append("    return;")
+            else:
+                blines.append("    __FLUSH_RETURN__")
         elif tname in BARRIERS:
             if pending_cyc:
                 blines.append(f"    rem -= {pending_cyc};")
@@ -741,6 +776,8 @@ def main():
             p = line.split()
             if p:
                 hot_pcs.add(int(p[0], 16))
+                if len(hot_pcs) >= 220:
+                    break
 
     # Order functions: hot functions first (into blocks_hot.cpp), then cold chunks
     hot_funcs = []
@@ -790,8 +827,9 @@ def main():
 
     for tu_idx, (fname, fgroup) in enumerate(tu_groups):
         lines = list(header)
+        tu_is_hot = (fname == "blocks_hot.cpp")
         for r, members in fgroup:
-            lines.extend(emit_function(r, members, blocks_by_pc, table, oracle, owner))
+            lines.extend(emit_function(r, members, blocks_by_pc, table, oracle, owner, is_hot=tu_is_hot))
             lines.append("")
         lines.append(f"const NativeBlock *Blocks{tu_idx}(size_t &count);")
         lines.append(f"static const NativeBlock kBlocks{tu_idx}[] = {{")

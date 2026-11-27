@@ -22,6 +22,8 @@ struct PadState {
     bool back = false;
     bool white = false; // LB
     bool black = false; // RB
+    bool lTrigger = false; // LT
+    bool rTrigger = false; // RT
     bool l3 = false;
     bool r3 = false;
 };
@@ -55,9 +57,9 @@ public:
     }
 
     void Poll(PadState &out) {
-        // Only poll USB OHCI hub registers every 60 frames once a controller is attached;
-        // live button packets arrive automatically via OHCI interrupt callback OnReadComplete().
-        if (!padDev_ || (++hubPollDiv_ >= 60u)) {
+        // Once attached, OHCI interrupt callback OnReadComplete() delivers packets at 125 Hz;
+        // poll USB hub registers only every 300 frames (5s) to avoid 1 Hz OHCI bus jitter.
+        if (!padDev_ || (++hubPollDiv_ >= 300u)) {
             hubPollDiv_ = 0;
             usbh_pooling_hubs();
         }
@@ -94,6 +96,8 @@ public:
         out.y = pkt.y > kAnalogThreshold;
         out.white = pkt.white > kAnalogThreshold;
         out.black = pkt.black > kAnalogThreshold;
+        out.lTrigger = pkt.l > kAnalogThreshold;
+        out.rTrigger = pkt.r > kAnalogThreshold;
     }
 
 private:

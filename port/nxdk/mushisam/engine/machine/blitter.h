@@ -116,6 +116,7 @@ public:
     // the software blitter draws nothing (VRAM is then the GPU's, and `vram` is brought up to date only when asked)
     NativeList *native = nullptr;
     bool rasterize = true;
+    bool simulateSlowdown = true; // (CV1000 draw-clock & line-fetch slowdown; cleared by LT No-Slowdown toggle)
     // Optional zero-copy direct upload sink (streams 0x2000 uploads straight from SH-3 RAM into sparse VRAM pages
     // when no prior draws exist in the current frame, preventing multi-MB NativeList::pixels OOM spikes on Stage 3!).
     using DirectUploadFn = void (*)(void *ctx, int32_t dstX, int32_t dstY, int32_t w, int32_t h,

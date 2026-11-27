@@ -31,6 +31,7 @@
 namespace spelunk {
 std::unordered_map<uint32, uint64> g_hotPcCounts;
 std::unordered_map<uint32, uint64> g_hotPcCycles;
+std::unordered_map<uint32, uint64> g_hotPcTsc;
 }
 #endif
 
@@ -176,6 +177,8 @@ int main(int argc, char **argv) {
                 if (spelunk_xbox::MushisamFakePlay::InPlay(ref)) {
                     nat.ram[spelunk_xbox::MushisamFakePlay::kShipsOff] = ref.ram[spelunk_xbox::MushisamFakePlay::kShipsOff];
                     nat.ram[spelunk_xbox::MushisamFakePlay::kBombsOff] = ref.ram[spelunk_xbox::MushisamFakePlay::kBombsOff];
+                    std::memcpy(&nat.ram[spelunk_xbox::MushisamFakePlay::kPowerOff],
+                                &ref.ram[spelunk_xbox::MushisamFakePlay::kPowerOff], 4);
                     std::memcpy(&nat.ram[spelunk_xbox::MushisamFakePlay::kSafeFramesOff],
                                 &ref.ram[spelunk_xbox::MushisamFakePlay::kSafeFramesOff], 4);
                 }
@@ -316,6 +319,9 @@ int main(int argc, char **argv) {
 
     const auto t0 = std::chrono::steady_clock::now();
     uint64_t totalDraws = 0;
+    uint64_t totalBullets = 0;
+    uint32_t maxBullets = 0;
+    uint32_t maxDraws = 0;
     uint64_t totalUploads = 0;
     uint64_t totalUploadPx = 0;
     uint64_t midFrameUploadsAfterDraws = 0;
@@ -375,6 +381,10 @@ int main(int argc, char **argv) {
         board.sound.out.clear();
 
         totalDraws += nl.draws.size();
+        if (nl.draws.size() > maxDraws) maxDraws = static_cast<uint32_t>(nl.draws.size());
+        const uint32_t curBullets = spelunk_xbox::MushisamFakePlay::BulletCount(board);
+        totalBullets += curBullets;
+        if (curBullets > maxBullets) maxBullets = curBullets;
         totalUploads += nl.uploads.size();
         totalUploadPx += nl.pixels.size();
         {
@@ -480,11 +490,14 @@ int main(int argc, char **argv) {
                 totalTsc > 0 ? 100.0 * sumSh3Tsc / totalTsc : 0.0,
                 totalTsc > 0 ? 100.0 * sumAudTsc / totalTsc : 0.0,
                 totalTsc > 0 ? 100.0 * sumBlitTsc / totalTsc : 0.0);
-    std::printf("  Avg dispatches/frame: %.1f (interp=%llu, lastInterpPc=0x%08X) | Avg draws/frame: %.1f | Uploads: %llu (%llu px)\n",
+    std::printf("  Avg dispatches/frame: %.1f (interp=%llu, lastInterpPc=0x%08X) | Avg draws/frame: %.1f (max=%u) | Bullets avg=%.1f max=%u | Uploads: %llu (%llu px)\n",
                 static_cast<double>(board.cpu.nativeBlocks) / frames,
                 (unsigned long long)board.cpu.interpretedBlocks,
                 board.cpu.lastInterpretedPc,
                 static_cast<double>(totalDraws) / frames,
+                maxDraws,
+                static_cast<double>(totalBullets) / frames,
+                maxBullets,
                 (unsigned long long)totalUploads,
                 (unsigned long long)totalUploadPx);
     std::printf("  Audio YMZ770: rate=%u Hz | totalSamples=%llu | nonZero=%llu | peakAll=%u | peakPlay=%u\n",
@@ -569,6 +582,31 @@ int main(int argc, char **argv) {
             }
         }
         if (hf) std::fclose(hf);
+
+        std::vector<std::pair<uint64_t, uint32_t>> byTsc;
+        byTsc.reserve(spelunk::g_hotPcTsc.size());
+        uint64_t totTsc = 0;
+        for (const auto &[pc, t] : spelunk::g_hotPcTsc) {
+            byTsc.push_back({t, pc});
+            totTsc += t;
+        }
+        std::sort(byTsc.begin(), byTsc.end(), [](const auto &a, const auto &b) { return a.first > b.first; });
+        std::printf("=== TOP 30 REAL x86 WALL-CLOCK (RDTSC) HOT PCs (total tsc=%llu) ===\n", (unsigned long long)totTsc);
+        uint64_t cumTsc = 0;
+        for (size_t i = 0; i < byTsc.size() && i < 30; ++i) {
+            const uint32_t pc = byTsc[i].second;
+            const uint64_t t = byTsc[i].first;
+            const uint64_t cnt = spelunk::g_hotPcCounts[pc];
+            const uint64_t cyc = spelunk::g_hotPcCycles[pc];
+            cumTsc += t;
+            std::printf("  %2zu. %08X : %12llu tsc (%5.2f%%, cum %5.2f%%) | %10llu calls | %6.1f tsc/call | %6.1f sh3cyc/call\n",
+                        i + 1, pc, (unsigned long long)t,
+                        totTsc ? 100.0 * t / totTsc : 0.0,
+                        totTsc ? 100.0 * cumTsc / totTsc : 0.0,
+                        (unsigned long long)cnt,
+                        cnt ? static_cast<double>(t) / cnt : 0.0,
+                        cnt ? static_cast<double>(cyc) / cnt : 0.0);
+        }
     }
 #endif
     return 0;

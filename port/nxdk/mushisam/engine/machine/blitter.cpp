@@ -125,22 +125,19 @@ namespace {
     // (by mode * 4 + tinted * 2 + transparent)
     const std::array<BlitFn, 65 * 4> kBlits = MakeBlits(std::make_index_sequence<65 * 4>{});
 
-    // The 32 x 32 pixel rows of VRAM a rectangle touches (each costs the blitter a fixed time)
-    int VramRows(int startX, int startY, int dimX, int dimY) {
-        int across = 0, rows = 0;
-        for (int left = dimX; left > 0; left -= 32) {
-            across++;
-            if ((startX & 31) + std::min(32, left) > 32) {
-                across++;
-            }
-        }
-        for (int left = dimY; left > 0; left -= 32) {
-            rows += across;
-            if ((startY & 31) + std::min(32, left) > 32) {
-                rows += across;
-            }
-        }
-        return rows;
+    // The 32 x 32 pixel rows of VRAM a rectangle touches (each costs the blitter a fixed time).
+    // Bit-exact O(1) closed form of the 32-pixel stride loop (zero branches/loops per draw!).
+    inline int VramRows(int startX, int startY, int dimX, int dimY) {
+        if (dimX <= 0 || dimY <= 0) return 0;
+        const int sx = startX & 31;
+        const int qx = dimX >> 5;
+        const int rx = dimX & 31;
+        const int across = qx * (sx ? 2 : 1) + (rx ? (1 + ((sx + rx > 32) ? 1 : 0)) : 0);
+        const int sy = startY & 31;
+        const int qy = dimY >> 5;
+        const int ry = dimY & 31;
+        const int down = qy * (sy ? 2 : 1) + (ry ? (1 + ((sy + ry > 32) ? 1 : 0)) : 0);
+        return across * down;
     }
 } // namespace
 
@@ -287,13 +284,9 @@ void Blitter::DrawOp(uint32_t &address) {
     a.dimY = (d.height & 0x0FFF) + 1;
 
     // --- the time it takes (before the draw's own clipping changes the sizes) ---
-#if !defined(XBOX_NO_SW_VRAM) && !defined(XBOX_FAST_CPU)
     // The destination is read as unsigned 16-bit here, as MAME's cv1k_v.cpp does: a draw that starts left of the clip
-    // or above it costs a list entry's read alone, although the draw below paints its pixels inside. Timing such draws
-    // by what they paint (2026-11-22, #56) made Mushihimesama's stage 3 late about three times as often as two boards
-    // filmed at 60 pictures a second (docs/BOARD-VIDEO.md, "Mushihimesama's stage 3"); read this way it is a little
-    // under both boards, which played a busier route.
-    {
+    // or above it costs a list entry's read alone, although the draw below paints its pixels inside.
+    if (simulateSlowdown) {
         int x0 = static_cast<uint16_t>(d.dstX), y0 = static_cast<uint16_t>(d.dstY);
         int x1 = static_cast<uint16_t>(x0 + a.dimX - 1), y1 = static_cast<uint16_t>(y0 + a.dimY - 1);
         const bool overlaps = !(x0 > m_clip.right || x1 < m_clip.left || y0 > m_clip.bottom || y1 < m_clip.top);
@@ -346,7 +339,6 @@ void Blitter::DrawOp(uint32_t &address) {
             }
         }
     }
-#endif
 
     // --- the draw ---
     if (flipX) {
@@ -454,13 +446,13 @@ void Blitter::Write(uint32_t offset, uint32_t value) {
             lastStolenCpuCycles = 0;
             stats = ListStats{};
             Run();
-#if !defined(XBOX_NO_SW_VRAM) && !defined(XBOX_FAST_CPU)
-            m_delayNs += m_vramClocks * 1000000000ull / kVramClockHz;
-            // (every line period the blitter stops to fetch a line of the picture for the screen, also in the time
-            // those stops add)
-            stats.lineFetchNs = m_delayNs / (kLinePeriodNs - kLineFetchNs) * kLineFetchNs;
-            m_delayNs += stats.lineFetchNs;
-#endif
+            if (simulateSlowdown) {
+                m_delayNs += m_vramClocks * 1000000000ull / kVramClockHz;
+                // (every line period the blitter stops to fetch a line of the picture for the screen, also in the time
+                // those stops add)
+                stats.lineFetchNs = m_delayNs / (kLinePeriodNs - kLineFetchNs) * kLineFetchNs;
+                m_delayNs += stats.lineFetchNs;
+            }
             lastBusyNs = m_delayNs;
             busy = true;
             started = true;

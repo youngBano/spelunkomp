@@ -237,9 +237,26 @@ namespace {
 
 #ifdef MUSHISAM_PROFILE_HOT
 #include <unordered_map>
+#include <x86intrin.h>
 extern std::unordered_map<uint32, uint64> g_hotPcCounts;
 extern std::unordered_map<uint32, uint64> g_hotPcCycles;
+extern std::unordered_map<uint32, uint64> g_hotPcTsc;
 #endif
+
+bool SH3::DispatchIndirect(uint32 target) {
+    if (indirectDepth < 4u && (target & 0xFF800000u) == 0x0C000000u) [[likely]] {
+        const uint32 phys = target & (kRamSize - 1);
+        if (BlockFn *fnSlots = m_pageFnPtrs[phys >> 12]) [[likely]] {
+            if (BlockFn fn = fnSlots[(phys & 0xFFF) >> 1]) [[likely]] {
+                ++indirectDepth;
+                fn(*this);
+                --indirectDepth;
+                return true;
+            }
+        }
+    }
+    return false;
+}
 
 void SH3::RunBlocks(uint64 stop) {
     blockStop = stop;
@@ -273,11 +290,14 @@ void SH3::RunBlocks(uint64 stop) {
 #ifdef MUSHISAM_PROFILE_HOT
                         const uint32 entryPc = PC;
                         const uint64 c0 = cycles;
+                        const uint64 t0 = __rdtsc();
 #endif
                         fn(*this);
 #ifdef MUSHISAM_PROFILE_HOT
+                        const uint64 dt = __rdtsc() - t0;
                         g_hotPcCounts[entryPc]++;
                         g_hotPcCycles[entryPc] += (cycles - c0);
+                        g_hotPcTsc[entryPc] += dt;
 #endif
                         ++localNative;
                         continue;

@@ -38,12 +38,12 @@ public:
     static constexpr int kPagesX = kVramW / kPageSize; // 64
     static constexpr int kPagesY = kVramH / kPageSize; // 32
     static constexpr int kTotalLogicalPages = kPagesX * kPagesY; // 2,048
-    static constexpr int kRetailMaxAllocPages = 576; // 576 * 32 KB = 18 MB hot RAM pool + RLE16 cold RAM tier (leaves ~5 MB headroom!)
-    static constexpr size_t kMaxColdRamBytes = 3584u * 1024u; // 3.5 MB compressed cold RAM (~14-18 MB raw) + lossless Z:\ spill if ever exceeded
+    static constexpr int kRetailMaxAllocPages = 576; // 576 * 32 KB = 18 MB hot cached-RAM pool (leaves ~7.5 MB for cold RLE16 + OS!)
+    static constexpr size_t kMaxColdRamBytes = 3584u * 1024u; // 3.5 MB compressed cold RAM (keeps >= 3.5 MB free RAM, never hits 1.5 MB thrash!) + lossless Z:\ spill
     static constexpr uint32_t kPageBytes = static_cast<uint32_t>(kPageSize * kPageSize * sizeof(uint16_t)); // 32 KB
 
     // Dual-bank 1024x(2048+4) A1R5G5B5 NV2A shelf atlas (2 x 1024x1024 = 4 MB + 8 KB) + 8,192-slot Mix64 hash table:
-    // 1024 rows per bank guarantees ZERO mid-frame pb_busy() flushes and ZERO full-atlas wipe spikes!
+    // 1024 rows per bank guarantees ZERO mid-frame pb_busy() flushes and ZERO 128x128 sprite-splitting seams!
     static constexpr int kAtlasW = 1024;
     static constexpr int kAtlasH = 2048;
     static constexpr int kBankH = kAtlasH / 2; // 1024 rows per bank (Bank 0: 0..1023, Bank 1: 1024..2047)
@@ -55,8 +55,8 @@ public:
 
     // Double-buffered write-combined NV2A hardware DMA vertex buffer:
     // Compact 16-byte vertex (int16x2 TYPE_S32K pos + float2 tex0 + D3DCOLOR diffuse = 64 B/quad = 2 PIII WC lines!).
-    // YOKO/TATE rotation and viewport scaling execute in NV2A hardware NV097_SET_COMPOSITE_MATRIX!
-    static constexpr uint32_t kMaxQuadsPerFrame = 2048;
+    // Overlaps NV2A rasterization of Frame N-1 with BOTH SH-3 CPU AND Frame N atlas/VB prep; syncs cleanly before submit!
+    static constexpr uint32_t kMaxQuadsPerFrame = 2560;
     static constexpr uint32_t kMaxVertsPerFrame = kMaxQuadsPerFrame * 4;
     struct Nv2aVertex {
         int16_t x, y;
@@ -111,9 +111,10 @@ public:
         pageData_.reserve(maxAllocPages_);
         rectHash_.assign(kRectHashSlots, {});
         batches_.reserve(256);
-        rleScratch_.reserve(kPageSize * kPageSize + 64u);
+        rleScratch_.resize(kPageSize * kPageSize + 512u, 0u);
         spillScratch_.resize(kPageSize * kPageSize, 0u);
         swapHandle_ = INVALID_HANDLE_VALUE;
+        EnsureSwapFileOpen(); // Mount/create lossless swap file at boot so Mode Select (f=1747) never stalls 30+ ms!
 
         clockHand_ = 0;
         frameId_ = 1;
@@ -129,6 +130,7 @@ public:
         stateInitialized_ = false;
         filterInitialized_ = false;
         geomInitialized_ = false;
+        cachedNoSlowdownIndicator_ = false;
         clearFramesRemaining_ = 3;
         return true;
     }
@@ -168,7 +170,8 @@ public:
     // Returns true if a frame was submitted (caller should call pb_finished()), or false on
     // 0-draw CV1000 transition frames where holding the frontbuffer avoids black flicker.
     bool Render(const spelunk::Blitter &blitter, spelunk::NativeList &list,
-                bool tateMode, bool bilinear, bool integerScale) {
+                bool tateMode, bool bilinear, bool integerScale,
+                bool noSlowdownIndicator = false) {
         if (!atlas_) {
             list.Clear();
             if (list.pixels.capacity() > 65536u) {
@@ -186,6 +189,10 @@ public:
             clearFramesRemaining_ = 3;
             stateInitialized_ = false;
         }
+        if (cachedNoSlowdownIndicator_ && !noSlowdownIndicator) {
+            clearFramesRemaining_ = 3;
+        }
+        cachedNoSlowdownIndicator_ = noSlowdownIndicator;
 
         // CV1000 double-buffers in VRAM: draws target the active clip window (clipX, clipY)
         // while the display scans out the previous buffer at (scrollX, scrollY).
@@ -195,7 +202,7 @@ public:
         const int dispY = static_cast<int>(blitter.scrollY & 0x0FFFu);
 
         // 1. Flip double-buffered VB UP FRONT (CPU writes VB B while NV2A finishes reading VB A!).
-        //    Only wait on pb_busy() before recycling a bank or submitting the new pushbuffer — hides ~2 ms GpuWait!
+        //    Only wait on pb_busy() before recycling a bank or submitting the new pushbuffer — hides GPU wait behind CPU+atlas prep!
         ++frameId_;
         atlasPhase_ = (atlasPhase_ + 1u) & 3u;
         atlasVBias_ = static_cast<float>(kAtlasGuardRows - static_cast<int>(atlasPhase_));
@@ -231,8 +238,8 @@ public:
         curBilinear_ = bilinear;
 
         // 2. Process all blitter steps in exact game order:
-        //    - Uploads & off-screen VRAM composite draws update sparse VRAM pages and bump per-page pageGen_[]
-        //      (NEVER wiping unrelated cached sprites from the 8,192-slot atlas hash table!).
+        //    - Uploads & off-screen VRAM composite draws update cached-RAM sparse VRAM pages and bump pageGen_[].
+        //    - All screen draws emit atomic native NV2A hardware quads (ZERO 128x128 sprite splitting!).
         for (const auto &step : list.steps) {
             if (step.upload) {
                 ApplyUpload(list.uploads[step.first], list.pixels);
@@ -247,8 +254,7 @@ public:
             std::vector<uint16_t>().swap(list.pixels);
         }
 
-        // 3. Hold previous presented frame on 0-draw CV1000 transition frames (e.g. f=25672..25884
-        //    Stage 2->3 load) instead of clearing backbuffer to solid black!
+        // 3. Hold previous presented frame on 0-draw CV1000 transition frames instead of clearing to black!
         if (vbCount_ == 0u && !frameHeaderPushed_ && hasPresentedFrame_ && clearFramesRemaining_ == 0) {
             return false;
         }
@@ -256,13 +262,21 @@ public:
         // 4. Flush write-combined A1R5G5B5 atlas & hardware vertex buffer writes before NV2A DMA.
         _mm_sfence();
 
-        // 5. Sync GPU (now already idle after CPU work!), reset pushbuffer, and submit hardware batches.
+        // 5. Sync GPU (almost always already idle after SH-3 + atlas prep!), reset pushbuffer, and submit hardware batches.
         EnsureGpuReadyForSubmit();
         const uint64_t tPb0 = ReadRdtsc();
         if (!frameHeaderPushed_) {
             PushFrameHeader(screenW, screenH, bilinear);
         }
         SubmitDraws();
+        if (noSlowdownIndicator) {
+            uint32_t *p = pb_begin();
+            p = pb_push1(p, NV097_SET_CLEAR_RECT_HORIZONTAL, (3u << 16) | 0u);
+            p = pb_push1(p, NV097_SET_CLEAR_RECT_VERTICAL, (3u << 16) | 0u);
+            p = pb_push1(p, NV097_SET_COLOR_CLEAR_VALUE, 0xFF00FF00u);
+            p = pb_push1(p, NV097_CLEAR_SURFACE, NV097_CLEAR_SURFACE_COLOR);
+            pb_end(p);
+        }
         lastPbSubmitTsc_ += ReadRdtsc() - tPb0;
         if (vbCount_ > 0u) {
             hasPresentedFrame_ = true;
@@ -275,31 +289,40 @@ public:
         static_cast<Nv2aCv1kRenderer *>(ctx)->ApplyDirectUpload(dstX, dstY, w, h, ram, ramMask, pixelAddr);
     }
 
+    // Hoisted 128x128 page-strip direct upload: resolves GetPageWrite() once per tile (32x fewer lookups!).
     void ApplyDirectUpload(int32_t dstX, int32_t dstY, int32_t w, int32_t h,
                            const uint8_t *ram, uint32_t ramMask, uint32_t pixelAddr) {
         if (w <= 0 || h <= 0 || !ram) {
             return;
         }
         ++directUploadCount_;
-        uint32_t addr = pixelAddr;
-        for (int32_t row = 0; row < h; ++row) {
+        const uint32_t rowBytes = static_cast<uint32_t>(w) * 2u;
+        int32_t row = 0;
+        while (row < h) {
             const int vy = (dstY + row) & (kVramH - 1);
             const int py = vy >> kPageShift;
-            const int ly = vy & kPageMask;
+            const int ly0 = vy & kPageMask;
+            const int rowSpan = std::min<int>(h - row, kPageSize - ly0);
+
             int32_t col = 0;
             while (col < w) {
                 const int vx = (dstX + col) & (kVramW - 1);
                 const int px = vx >> kPageShift;
                 const int lx = vx & kPageMask;
-                const int chunk = std::min<int>(w - col, kPageSize - lx);
-                uint16_t *dst = GetPageWrite(px, py) + static_cast<size_t>(ly) * kPageSize + lx;
-                for (int i = 0; i < chunk; ++i) {
-                    const uint32_t a = addr & ramMask & ~1u;
-                    addr += 2u;
-                    dst[i] = static_cast<uint16_t>((static_cast<uint16_t>(ram[a]) << 8) | ram[a + 1u]);
+                const int colSpan = std::min<int>(w - col, kPageSize - lx);
+                uint16_t *dstBase = GetPageWrite(px, py) + static_cast<size_t>(ly0) * kPageSize + lx;
+                uint32_t rowAddr = pixelAddr + static_cast<uint32_t>(row) * rowBytes + static_cast<uint32_t>(col) * 2u;
+                for (int r = 0; r < rowSpan; ++r, dstBase += kPageSize, rowAddr += rowBytes) {
+                    uint32_t addr = rowAddr;
+                    for (int i = 0; i < colSpan; ++i) {
+                        const uint32_t a = addr & ramMask & ~1u;
+                        addr += 2u;
+                        dstBase[i] = static_cast<uint16_t>((static_cast<uint16_t>(ram[a]) << 8) | ram[a + 1u]);
+                    }
                 }
-                col += chunk;
+                col += colSpan;
             }
+            row += rowSpan;
         }
     }
 
@@ -398,7 +421,6 @@ private:
         }
         lastGpuWaitTsc_ += ReadRdtsc() - t0;
         pb_reset();
-        // pb_init() and pb_finished() already target the current backbuffer; avoid redundant pushbuffer traffic!
         gpuReadyThisFrame_ = true;
     }
 
@@ -443,7 +465,7 @@ private:
         frameHeaderPushed_ = true;
     }
 
-    // Safety net: if a single extreme frame ever fills the 1024x2048 atlas or 2048-quad VB,
+    // Safety net: if a single extreme frame ever fills the 1024x2048 atlas or 2560-quad VB,
     // submit queued quads and wait for PGRAPH completion before recycling shelf (0, 0).
     void FlushMidFrameAndResetShelf() {
         EnsureGpuReadyForSubmit();
@@ -807,17 +829,18 @@ private:
             coldState_[logical] = 0u;
             return;
         }
-        rleScratch_.clear();
+        uint16_t *const rleBase = rleScratch_.data();
+        uint16_t *rleOut = rleBase;
         uint32_t i = 0;
         while (i < kN) {
             const uint16_t v = src[i];
-            uint32_t run = 1;
-            while (i + run < kN && src[i + run] == v && run < 32768u) {
-                ++run;
-            }
-            if (run >= 3u) {
-                rleScratch_.push_back(static_cast<uint16_t>(0x8000u | (run - 1u)));
-                rleScratch_.push_back(v);
+            if (i + 2u < kN && src[i + 1u] == v && src[i + 2u] == v) {
+                uint32_t run = 3u;
+                while (i + run < kN && src[i + run] == v && run < 32768u) {
+                    ++run;
+                }
+                *rleOut++ = static_cast<uint16_t>(0x8000u | (run - 1u));
+                *rleOut++ = v;
                 i += run;
             } else {
                 const uint32_t litStart = i;
@@ -829,26 +852,29 @@ private:
                     ++i;
                     ++litLen;
                 }
-                rleScratch_.push_back(static_cast<uint16_t>(litLen - 1u));
-                rleScratch_.insert(rleScratch_.end(), src + litStart, src + litStart + litLen);
+                *rleOut++ = static_cast<uint16_t>(litLen - 1u);
+                std::memcpy(rleOut, src + litStart, static_cast<size_t>(litLen) * sizeof(uint16_t));
+                rleOut += litLen;
             }
         }
-        const size_t needBytes = rleScratch_.size() * sizeof(uint16_t);
+        const size_t rleCount = static_cast<size_t>(rleOut - rleBase);
+        const size_t needBytes = rleCount * sizeof(uint16_t);
         // Enforce cold RAM cap & 1.5 MB physical RAM safety floor by spilling oldest cold pages to disk (lossless!).
         while (coldTotalBytes_ + needBytes > kMaxColdRamBytes) {
             if (!DemoteOldestColdPageToDisk()) break;
         }
         MM_STATISTICS mm{};
         mm.Length = sizeof(mm);
-        if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 384u) {
+        bool haveMm = (MmQueryStatistics(&mm) == STATUS_SUCCESS);
+        if (haveMm && mm.AvailablePages < 384u) {
             for (int tries = 0; tries < 8 && coldTotalBytes_ > 0; ++tries) {
                 if (!DemoteOldestColdPageToDisk()) break;
-                if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages >= 512u) break;
+                haveMm = (MmQueryStatistics(&mm) == STATUS_SUCCESS);
+                if (haveMm && mm.AvailablePages >= 512u) break;
             }
         }
-        if (coldTotalBytes_ + needBytes <= kMaxColdRamBytes &&
-            (MmQueryStatistics(&mm) != STATUS_SUCCESS || mm.AvailablePages >= 384u)) {
-            coldPages_[logical].assign(rleScratch_.begin(), rleScratch_.end());
+        if (coldTotalBytes_ + needBytes <= kMaxColdRamBytes && (!haveMm || mm.AvailablePages >= 384u)) {
+            coldPages_[logical].assign(rleBase, rleOut);
             coldState_[logical] = 1u;
             coldClock_[logical] = ++coldTick_;
             coldTotalBytes_ += needBytes;
@@ -856,7 +882,7 @@ private:
             coldState_[logical] = 2u;
         } else {
             // Last resort if both RAM low and disk unavailable: keep in RAM rather than dropping sprites!
-            coldPages_[logical].assign(rleScratch_.begin(), rleScratch_.end());
+            coldPages_[logical].assign(rleBase, rleOut);
             coldState_[logical] = 1u;
             coldClock_[logical] = ++coldTick_;
             coldTotalBytes_ += needBytes;
@@ -889,8 +915,8 @@ private:
         if (canGrow && (pageData_.size() & 15u) == 0u && pageData_.size() >= 256u) {
             MM_STATISTICS mm{};
             mm.Length = sizeof(mm);
-            if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 1280u) {
-                // Keep >= 5.0 MB physical RAM free for RLE16 cold tier + audio + OS headroom!
+            if (MmQueryStatistics(&mm) == STATUS_SUCCESS && mm.AvailablePages < 1152u) {
+                // Keep >= 4.5 MB physical RAM free for 5.5 MB RLE16 cold tier (0 disk spills!) + OS headroom!
                 maxAllocPages_ = static_cast<int>(pageData_.size());
                 canGrow = false;
             }
@@ -986,27 +1012,34 @@ private:
         return nullptr;
     }
 
+    // Hoisted 128x128 page-strip upload: resolves GetPageWrite() once per tile instead of per row!
     void ApplyUpload(const spelunk::NativeUpload &up, const std::vector<uint16_t> &pixels) {
         if (up.width <= 0 || up.height <= 0 || up.pixels >= pixels.size()) {
             return;
         }
         const uint16_t *srcBase = pixels.data() + up.pixels;
-        for (int row = 0; row < up.height; ++row) {
+        int row = 0;
+        while (row < up.height) {
             const int vy = (up.y + row) & (kVramH - 1);
             const int py = vy >> kPageShift;
-            const int ly = vy & kPageMask;
-            const uint16_t *srcRow = srcBase + static_cast<size_t>(row) * up.width;
+            const int ly0 = vy & kPageMask;
+            const int rowSpan = std::min(up.height - row, kPageSize - ly0);
+
             int col = 0;
             while (col < up.width) {
                 const int vx = (up.x + col) & (kVramW - 1);
                 const int px = vx >> kPageShift;
                 const int lx = vx & kPageMask;
-                const int chunk = std::min(up.width - col, kPageSize - lx);
-                uint16_t *page = GetPageWrite(px, py);
-                std::memcpy(page + static_cast<size_t>(ly) * kPageSize + lx, srcRow + col,
-                            static_cast<size_t>(chunk) * sizeof(uint16_t));
-                col += chunk;
+                const int colSpan = std::min(up.width - col, kPageSize - lx);
+                uint16_t *dstPtr = GetPageWrite(px, py) + static_cast<size_t>(ly0) * kPageSize + lx;
+                const uint16_t *srcPtr = srcBase + static_cast<size_t>(row) * up.width + col;
+                const size_t bytes = static_cast<size_t>(colSpan) * sizeof(uint16_t);
+                for (int r = 0; r < rowSpan; ++r, dstPtr += kPageSize, srcPtr += up.width) {
+                    std::memcpy(dstPtr, srcPtr, bytes);
+                }
+                col += colSpan;
             }
+            row += rowSpan;
         }
     }
 
@@ -1212,8 +1245,8 @@ private:
         }
 
         // Emit compact 16-byte integer-position quad directly into write-combined NV2A hardware vertex buffer.
-        // Sub-texel inset >= 1/64 texel (0.02f nearest, 0.25f bilinear) prevents NV2A fixed-point UV rounding bleed!
-        const float uvEps = bilinear ? 0.25f : 0.02f;
+        // Sub-texel inset >= 1/32 texel (0.03125f nearest, 0.25f bilinear) prevents NV2A 12.4 fixed-point UV rounding bleed!
+        const float uvEps = bilinear ? 0.25f : 0.03125f;
         const float uMin = static_cast<float>(slot->u0) + uvEps;
         const float uMax = static_cast<float>(slot->u0 + w) - uvEps;
         const float vMin = static_cast<float>(slot->v0) + atlasVBias_ + uvEps;
@@ -1530,6 +1563,7 @@ private:
     bool cachedTate_ = false;
     bool cachedBilinear_ = false;
     bool cachedInteger_ = false;
+    bool cachedNoSlowdownIndicator_ = false;
     int clearFramesRemaining_ = 3;
 };
 

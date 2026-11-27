@@ -63,6 +63,7 @@ public:
     static constexpr uint64_t kCpuHz = 102400000;
     static constexpr uint64_t kFrameCycles = 262ull * 407 * 16; // (the CPU's clock is 16 times the pixel clock)
     uint64_t frame = 0;
+    bool noSlowdown = false; // Disable simulated Cave blitter slowdown (instant blitter, zero stolen CPU cycles)
 
     // Per-frame RDTSC breakdown (populated inside RunFrame/Write for Xbox profiling)
     uint64_t profSh3Tsc = 0;
@@ -123,6 +124,7 @@ private:
     uint32_t m_keptPathsClock[2] = {}, m_keptPathsGeneration[2] = {}; // (the timing model's paths as they were: PutBack)
     uint8_t m_soundRegister = 0;
     uint64_t m_blitterDone = 0; // the CPU cycle the blitter is ready again at
+    uint32_t m_busyPollCount = 0;
     bool m_pollSeen = false;    // (SPELUNK_BLIT_LOG only: not state)
     uint64_t m_firstPoll = 0;
     uint64_t m_frameEnd = 0;

@@ -50,6 +50,7 @@ void Cv1000::Reset() {
     }
     sound.Reset();
     m_blitterDone = 0;
+    m_busyPollCount = 0;
     m_frameEnd = 0;
     frame = 0;
     cpu.eventAt = ~0ull;
@@ -130,8 +131,22 @@ uint32 Cv1000::Read(uint32 address, unsigned size) {
             m_pollSeen = true;
             m_firstPoll = cpu.cycles;
         }
-        if (offset == 0x10 && blitter.busy && cpu.cycles >= m_blitterDone) {
-            blitter.busy = false;
+        if (offset == 0x10 && blitter.busy) {
+            if (cpu.cycles >= m_blitterDone) {
+                blitter.busy = false;
+                m_busyPollCount = 0;
+            } else if (++m_busyPollCount >= 2u && !cpu.interruptReady) {
+                // O(1) blitter busy-wait fast-forward: skips tight SH-3 poll spinloop while
+                // preserving exact CV1000 slowdown timing (stops at min(m_blitterDone, blockStop)).
+                const uint64_t target = (m_blitterDone < cpu.blockStop) ? m_blitterDone : cpu.blockStop;
+                if (target > cpu.cycles) {
+                    cpu.cycles = target;
+                }
+                if (cpu.cycles >= m_blitterDone) {
+                    blitter.busy = false;
+                    m_busyPollCount = 0;
+                }
+            }
         }
         const uint32 v = blitter.Read(offset);
         // (a narrower read takes its bytes from the 32-bit register, high byte first)
@@ -155,17 +170,26 @@ void Cv1000::Write(uint32 address, uint32 value, unsigned size) {
         const uint32_t regOff = (address - 0x18000000u) & ~3u;
         blitter.started = false;
         const bool starting = (regOff == 0x04u) && ((value & 1u) != 0);
+        if (starting) {
+            blitter.simulateSlowdown = !noSlowdown;
+        }
         const uint64_t tBlit0 = starting ? ReadTsc() : 0;
         blitter.Write(regOff, value);
         if (starting) {
             profBlitterTsc += ReadTsc() - tBlit0;
         }
         if (blitter.started) {
+            m_busyPollCount = 0;
             // (its uploads took the bus from the CPU; it is busy for the time the list takes)
-            cpu.cycles += blitter.lastStolenCpuCycles;
-            const uint64_t busyNs = blitter.lastBusyNs + (cpu.timing ? Blitter::kListStartNs : 0);
             const uint64_t prevDone = m_blitterDone;
-            m_blitterDone = cpu.cycles + busyNs * kCpuHz / 1000000000ull;
+            if (noSlowdown) {
+                m_blitterDone = cpu.cycles;
+                blitter.busy = false;
+            } else {
+                cpu.cycles += blitter.lastStolenCpuCycles;
+                const uint64_t busyNs = blitter.lastBusyNs + (cpu.timing ? Blitter::kListStartNs : 0);
+                m_blitterDone = cpu.cycles + busyNs * kCpuHz / 1000000000ull;
+            }
             // (the blitter raises IRQ1 when it has run the list's end: with "Slowdown as the board" on, as the board
             // does; docs/SLOWDOWN.md, "The blitter's interrupt")
             if (cpu.timing) {
